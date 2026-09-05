@@ -17,6 +17,10 @@ const native_sdk = @import("native_sdk");
 const config = @import("config.zig");
 const env = @import("env.zig");
 const bootstrap = @import("bootstrap.zig");
+const db = @import("db.zig");
+const repos = @import("repos.zig");
+
+const canvas = native_sdk.canvas;
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -41,6 +45,13 @@ var boot_username: []const u8 = "developer";
 const key_stat_config: u64 = 100;
 const key_write_config: u64 = 101;
 const key_write_keep: u64 = 102;
+const key_git_check: u64 = 110;
+const key_repo_insert: u64 = 111;
+const key_repos_list: u64 = 112;
+const key_repo_delete: u64 = 113;
+
+/// Capacity of the repo-path input field.
+const path_input_capacity = repos.max_path_bytes;
 
 const app_permissions = [_][]const u8{
     native_sdk.security.permission_command,
@@ -81,8 +92,51 @@ pub const Model = struct {
     /// Settings for backup. Borrowed from the boot arena.
     data_dir: []const u8 = "",
 
+    // ---- Watched repositories (Task 3) ----
+    /// The repo-path input field buffer (model-owned inline storage).
+    repo_input: canvas.TextBuffer(path_input_capacity) = .{},
+    /// Loaded watched repos, refreshed from the DB after each change.
+    repo_list: [repos.max_repos]repos.RepoEntry = undefined,
+    repo_count: usize = 0,
+    /// True while a git-validation spawn is in flight for a pending add.
+    adding_repo: bool = false,
+    /// Last add error, shown under the input ("" when none).
+    repo_error_buf: [256]u8 = undefined,
+    repo_error_len: usize = 0,
+    /// The path being validated/added (held across the git-check spawn).
+    pending_path_buf: [repos.max_path_bytes]u8 = undefined,
+    pending_path_len: usize = 0,
+
     pub fn usernameText(self: *const Model) []const u8 {
         return self.username;
+    }
+
+    pub fn repoError(self: *const Model) []const u8 {
+        return self.repo_error_buf[0..self.repo_error_len];
+    }
+    fn setRepoError(self: *Model, msg: []const u8) void {
+        self.repo_error_len = @min(msg.len, self.repo_error_buf.len);
+        @memcpy(self.repo_error_buf[0..self.repo_error_len], msg[0..self.repo_error_len]);
+    }
+    fn clearRepoError(self: *Model) void {
+        self.repo_error_len = 0;
+    }
+    fn pendingPath(self: *const Model) []const u8 {
+        return self.pending_path_buf[0..self.pending_path_len];
+    }
+    fn setPendingPath(self: *Model, p: []const u8) void {
+        self.pending_path_len = @min(p.len, self.pending_path_buf.len);
+        @memcpy(self.pending_path_buf[0..self.pending_path_len], p[0..self.pending_path_len]);
+    }
+    /// Repos as a slice for the view's `<for each>`.
+    pub fn reposSlice(self: *const Model) []const repos.RepoEntry {
+        return self.repo_list[0..self.repo_count];
+    }
+    pub fn hasRepos(self: *const Model) bool {
+        return self.repo_count > 0;
+    }
+    pub fn isAddingRepo(self: *const Model) bool {
+        return self.adding_repo;
     }
     /// The app-data directory path, surfaced in the Settings modal.
     pub fn dataDirText(self: *const Model) []const u8 {
@@ -92,7 +146,11 @@ pub const Model = struct {
     // These fields are read by update/effect logic or via accessor
     // functions (usernameText/dataDirText/statusText), not bound directly
     // in markup, so they are intentionally exempt from the dead-state lint.
-    pub const view_unbound = .{ "stage", "data_dir_ready", "onboarded", "username", "data_dir" };
+    pub const view_unbound = .{
+        "stage",           "data_dir_ready", "onboarded",   "username",
+        "data_dir",        "repo_list",      "repo_count",  "adding_repo",
+        "repo_error_buf",  "repo_error_len", "pending_path_buf", "pending_path_len",
+    };
     pub fn statusText(self: *const Model) []const u8 {
         return switch (self.stage) {
             .booting => "Starting Blocks…",
@@ -106,7 +164,20 @@ pub const Msg = union(enum) {
     wrote_config: native_sdk.EffectFileResult,
     wrote_keep: native_sdk.EffectFileResult,
 
-    pub const view_unbound = .{ "stat_config", "wrote_config", "wrote_keep" };
+    // Watched repositories (Task 3)
+    repo_input_edit: canvas.TextInputEvent, // typing in the path field
+    add_repo_clicked, // "Add" pressed (or field submitted)
+    git_check_done: native_sdk.EffectExit, // git rev-parse validation result
+    repo_inserted: native_sdk.EffectDbResult, // insert transaction result
+    repos_listed: native_sdk.EffectDbResult, // list query result page/done
+    remove_repo: i64, // delete a repo by id
+    repo_removed: native_sdk.EffectDbResult, // delete transaction result
+
+    // Delivered by effects/host, never bound as markup handlers.
+    pub const view_unbound = .{
+        "stat_config", "wrote_config",  "wrote_keep",
+        "git_check_done", "repo_inserted", "repos_listed", "repo_removed",
+    };
 };
 
 pub const Effects = native_sdk.Effects(Msg);
@@ -131,6 +202,15 @@ fn writeAnchors(model: *const Model, fx: *Effects) void {
         .path = keep_path,
         .bytes = bootstrap.models_keep_contents,
         .on_result = Effects.fileMsg(.wrote_keep),
+    });
+}
+
+/// Query the watched-repos list into the model (fires after every change).
+fn listRepos(fx: *Effects) void {
+    fx.dbQuery(.{
+        .key = key_repos_list,
+        .sql = repos.list_sql,
+        .on_result = Effects.dbMsg(.repos_listed),
     });
 }
 
@@ -168,6 +248,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // First run: create the directory tree + default config.
                 writeAnchors(model, fx);
             }
+            // Either way the DB is ready — load the watched-repo list.
+            listRepos(fx);
         },
         .wrote_config => |res| {
             if (res.outcome == .ok) {
@@ -180,6 +262,114 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // Directory anchor created; no state change needed. Kept as a
             // distinct arm so a future models UI can react to it.
         },
+
+        // ---- Watched repositories ----
+        .repo_input_edit => |event| {
+            model.repo_input.apply(event);
+            model.clearRepoError();
+        },
+        .add_repo_clicked => addRepoClicked(model, fx),
+        .git_check_done => |exit| gitCheckDone(model, exit, fx),
+        .repo_inserted => |res| {
+            model.adding_repo = false;
+            if (res.outcome == .ok) {
+                model.repo_input.clear();
+                model.pending_path_len = 0;
+                model.clearRepoError();
+                listRepos(fx);
+            } else if (res.outcome == .constraint) {
+                model.setRepoError("That repository is already being watched.");
+            } else {
+                model.setRepoError("Could not save the repository.");
+            }
+        },
+        .repos_listed => |res| loadReposPage(model, res),
+        .remove_repo => |id| {
+            var params: [1]db.Value = undefined;
+            fx.dbExec(.{
+                .key = key_repo_delete,
+                .statements = &.{repos.deleteStatement(&params, id)},
+                .on_result = Effects.dbMsg(.repo_removed),
+            });
+        },
+        .repo_removed => |res| {
+            if (res.outcome == .ok) listRepos(fx);
+        },
+    }
+}
+
+/// Validate the input path's shape, then spawn `git -C <path> rev-parse`
+/// to confirm it is a real git repository before inserting it.
+fn addRepoClicked(model: *Model, fx: *Effects) void {
+    if (model.adding_repo) return; // ignore double clicks while validating
+    const raw = model.repo_input.text();
+    const normalized = repos.normalizePath(raw);
+
+    switch (repos.checkPathShape(normalized)) {
+        .empty => {
+            model.setRepoError("Enter a repository path.");
+            return;
+        },
+        .not_absolute => {
+            model.setRepoError("Enter an absolute path (starting with / or ~).");
+            return;
+        },
+        .ok => {},
+    }
+
+    model.setPendingPath(normalized);
+    model.adding_repo = true;
+    model.clearRepoError();
+
+    // `git -C <path> rev-parse --is-inside-work-tree` exits 0 for a repo.
+    fx.spawn(.{
+        .key = key_git_check,
+        .argv = &.{ "git", "-C", model.pendingPath(), "rev-parse", "--is-inside-work-tree" },
+        .output = .collect,
+        .on_exit = Effects.exitMsg(.git_check_done),
+    });
+}
+
+fn gitCheckDone(model: *Model, exit: native_sdk.EffectExit, fx: *Effects) void {
+    const is_repo = (exit.reason == .exited and exit.code == 0);
+    if (!is_repo) {
+        model.adding_repo = false;
+        if (exit.reason == .spawn_failed) {
+            model.setRepoError("Could not run git — is it installed?");
+        } else {
+            model.setRepoError("That folder is not a git repository.");
+        }
+        return;
+    }
+    // Valid repo — insert it. Name defaults to the trailing path component.
+    // The params buffer lives on this frame; dbExec copies params at call.
+    const path = model.pendingPath();
+    const name = repos.defaultName(path);
+    var params: [3]db.Value = undefined;
+    fx.dbExec(.{
+        .key = key_repo_insert,
+        .statements = &.{repos.insertStatement(&params, path, name, fx.wallMs())},
+        .on_result = Effects.dbMsg(.repo_inserted),
+    });
+}
+
+/// Copy a `repos_listed` query result page into the model's owned list.
+/// The query returns a single page for our modest repo counts; a `.done`
+/// terminal simply ends the list.
+fn loadReposPage(model: *Model, res: native_sdk.EffectDbResult) void {
+    switch (res.kind) {
+        .page => {
+            var reader = db.PageReader.init(res.bytes) catch return;
+            model.repo_count = 0;
+            var row: [8]db.ColumnValue = undefined;
+            while (reader.next(&row) catch null) |cols| {
+                if (model.repo_count >= repos.max_repos) break;
+                const r = repos.Repo.fromRow(cols) orelse continue;
+                model.repo_list[model.repo_count] = repos.RepoEntry.fromRepo(r);
+                model.repo_count += 1;
+            }
+        },
+        .done, .exec => {},
     }
 }
 

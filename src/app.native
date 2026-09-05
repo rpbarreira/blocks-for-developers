@@ -1,9 +1,40 @@
-<!-- Task 1 shell: a minimal centered view proving the app boots, the
-     `~/blocks` bootstrap ran, and the OS username was detected. The real
-     screens (welcome / chat / materials / settings) replace this in later
-     tasks. -->
-<column gap="10" main="center" cross="center" grow="1" padding="24">
-  <text size="display">Blocks for Developers</text>
-  <text>{statusText}</text>
-  <status-bar>{usernameText} · {dataDirText}</status-bar>
+<!-- Task 3 shell: the Watched Repositories management section. This will
+     move into the Settings modal in Task 13; for now it is the main view
+     so the add/list/remove flow is demoable. Data lives in the repos
+     table; adding validates the folder is a git repo via `git rev-parse`. -->
+<column gap="14" padding="20" grow="1">
+  <row cross="center" gap="8">
+    <text size="heading" grow="1">Watched Repositories</text>
+    <text>{usernameText}</text>
+  </row>
+  <text>Blocks indexes the git history and file changes of the repositories you watch.</text>
+
+  <row gap="8" cross="center">
+    <text-field
+      placeholder="/path/to/your/repo"
+      on-input="repo_input_edit"
+      on-submit="add_repo_clicked"
+      grow="1" />
+    <button variant="primary" on-press="add_repo_clicked" disabled="{isAddingRepo}">Add</button>
+  </row>
+
+  <if test="{repoError}">
+    <text>{repoError}</text>
+  </if>
+
+  <scroll grow="1">
+    <column gap="4">
+      <for each="reposSlice" key="id" as="r">
+        <row gap="8" padding="8" cross="center">
+          <column grow="1" gap="2">
+            <text>{r.name}</text>
+            <status-bar>{r.path}</status-bar>
+          </column>
+          <button size="sm" variant="ghost" on-press="remove_repo:{r.id}">Remove</button>
+        </row>
+      </for>
+    </column>
+  </scroll>
+
+  <status-bar>{dataDirText}</status-bar>
 </column>

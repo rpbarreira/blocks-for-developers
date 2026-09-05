@@ -9,6 +9,7 @@ comptime {
     _ = @import("bootstrap.zig");
     _ = @import("env.zig");
     _ = @import("db.zig");
+    _ = @import("repos.zig");
 }
 
 const canvas = native_sdk.canvas;
