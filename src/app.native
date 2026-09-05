@@ -1,0 +1,9 @@
+<!-- Task 1 shell: a minimal centered view proving the app boots, the
+     `~/blocks` bootstrap ran, and the OS username was detected. The real
+     screens (welcome / chat / materials / settings) replace this in later
+     tasks. -->
+<column gap="10" main="center" cross="center" grow="1" padding="24">
+  <text size="display">Blocks for Developers</text>
+  <text>{statusText}</text>
+  <status-bar>{usernameText} · {rootText}</status-bar>
+</column>

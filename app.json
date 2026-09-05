@@ -1,0 +1,38 @@
+{
+    "$schema": "https://schema.native-sdk.dev/app/v1.json",
+    "id": "dev.blocks.app",
+    "name": "blocks",
+    "display_name": "Blocks for Developers",
+    "description": "A searchable memory of your local git history, with a local-LLM chat and code snippets.",
+    "version": "0.1.0",
+    "icons": ["assets/icon.png"],
+    "platforms": ["macos"],
+    "theme": "geist",
+    "permissions": ["view", "command", "filesystem", "network"],
+    "capabilities": ["native_views", "gpu_surfaces", "sqlite", "filesystem", "network", "tray", "dialog"],
+    "shell": {
+        "windows": [
+            {
+                "label": "main",
+                "title": "Blocks for Developers",
+                "width": 1024,
+                "height": 680,
+                "min_width": 860,
+                "min_height": 560,
+                "titlebar": "hidden_inset",
+                "close_policy": "hide",
+                "views": [
+                    { "label": "main-canvas", "kind": "gpu_surface", "fill": true, "role": "Blocks canvas", "accessibility_label": "Blocks for Developers", "gpu_backend": "metal", "gpu_pixel_format": "bgra8_unorm", "gpu_present_mode": "timer", "gpu_alpha_mode": "opaque", "gpu_color_space": "srgb", "gpu_vsync": true }
+                ]
+            }
+        ]
+    },
+    "security": {
+        "navigation": {
+            "allowed_origins": ["zero://app", "zero://inline"],
+            "external_links": { "action": "deny" }
+        }
+    },
+    "web_engine": "system",
+    "cef": { "dir": "third_party/cef/macos", "auto_install": false }
+}
