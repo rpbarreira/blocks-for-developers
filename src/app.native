@@ -5,5 +5,5 @@
 <column gap="10" main="center" cross="center" grow="1" padding="24">
   <text size="display">Blocks for Developers</text>
   <text>{statusText}</text>
-  <status-bar>{usernameText} · {rootText}</status-bar>
+  <status-bar>{usernameText} · {dataDirText}</status-bar>
 </column>

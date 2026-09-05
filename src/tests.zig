@@ -8,6 +8,7 @@ comptime {
     _ = @import("config.zig");
     _ = @import("bootstrap.zig");
     _ = @import("env.zig");
+    _ = @import("db.zig");
 }
 
 const canvas = native_sdk.canvas;
@@ -34,7 +35,7 @@ test "the boot shell view builds against the model" {
     var model = main.Model{
         .stage = .ready,
         .username = "rui",
-        .root_path = "/Users/rui/blocks",
+        .data_dir = "/Users/rui/Library/Application Support/dev.blocks.app",
         .onboarded = true,
     };
     const tree = try buildTree(arena, &model);

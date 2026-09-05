@@ -26,6 +26,10 @@ const window_width: f32 = 1024;
 const window_height: f32 = 680;
 
 const app_version = "0.1.0";
+/// Must match app.json `id` and the runner's `bundle_id` below so our
+/// resolved data dir points at the same folder the engine-owned app.db
+/// is opened in.
+const bundle_id = "dev.blocks.app";
 
 // A process-lifetime arena for resolved paths + username. These outlive
 // every update call and are read by effects and the view.
@@ -66,22 +70,29 @@ pub const Stage = enum { booting, ready };
 
 pub const Model = struct {
     stage: Stage = .booting,
-    /// True once bootstrap has confirmed (or created) `~/blocks`.
+    /// True once bootstrap has confirmed (or created) the app-data dir.
     data_dir_ready: bool = false,
     /// True when the config file already existed at boot (returning user).
     onboarded: bool = false,
     /// Detected OS username, shown next to the avatar. Borrowed from the
     /// process-lifetime boot arena.
     username: []const u8 = "developer",
-    /// Absolute `~/blocks` root, for display/diagnostics. Borrowed.
-    root_path: []const u8 = "",
+    /// Absolute app-data directory (all data lives here), shown in
+    /// Settings for backup. Borrowed from the boot arena.
+    data_dir: []const u8 = "",
 
     pub fn usernameText(self: *const Model) []const u8 {
         return self.username;
     }
-    pub fn rootText(self: *const Model) []const u8 {
-        return self.root_path;
+    /// The app-data directory path, surfaced in the Settings modal.
+    pub fn dataDirText(self: *const Model) []const u8 {
+        return self.data_dir;
     }
+
+    // These fields are read by update/effect logic or via accessor
+    // functions (usernameText/dataDirText/statusText), not bound directly
+    // in markup, so they are intentionally exempt from the dead-state lint.
+    pub const view_unbound = .{ "stage", "data_dir_ready", "onboarded", "username", "data_dir" };
     pub fn statusText(self: *const Model) []const u8 {
         return switch (self.stage) {
             .booting => "Starting Blocks…",
@@ -100,8 +111,8 @@ pub const Msg = union(enum) {
 
 pub const Effects = native_sdk.Effects(Msg);
 
-/// Write the two anchor files that materialize `~/blocks`. Called on a
-/// first run (config absent).
+/// Write the two anchor files (config.json + models/.keep) on a first
+/// run (config absent).
 fn writeAnchors(model: *const Model, fx: *Effects) void {
     const paths = boot_paths orelse return;
     const arena = boot_arena.allocator();
@@ -124,25 +135,25 @@ fn writeAnchors(model: *const Model, fx: *Effects) void {
 }
 
 pub fn initFx(model: *Model, fx: *Effects) void {
-    // Resolve home + username from the real environment.
-    const home = config.detectHome(env.lookup) orelse "";
     model.username = boot_username;
-    if (home.len > 0) {
-        const paths = config.Paths.resolve(boot_arena.allocator(), home) catch {
-            // Without a home dir we cannot bootstrap; stay in booting and
-            // surface it. (macOS GUI apps always have HOME in practice.)
-            return;
-        };
-        boot_paths = paths;
-        model.root_path = paths.root;
 
-        // Learn whether this is a first run by stat-ing the config file.
-        fx.statFile(.{
-            .key = key_stat_config,
-            .path = paths.config,
-            .on_result = Effects.fileMsg(.stat_config),
-        });
-    }
+    // Resolve the app-data directory (all data lives here) from the real
+    // environment. The SDK runner has already created it and opened the
+    // engine-owned app.db inside it.
+    const paths = config.Paths.resolve(boot_arena.allocator(), bundle_id, env.lookup) catch {
+        // Without HOME we cannot resolve the data dir; stay in booting.
+        // (macOS GUI apps always have HOME in practice.)
+        return;
+    };
+    boot_paths = paths;
+    model.data_dir = paths.data_dir;
+
+    // Learn whether this is a first run by stat-ing the config file.
+    fx.statFile(.{
+        .key = key_stat_config,
+        .path = paths.config,
+        .on_result = Effects.fileMsg(.stat_config),
+    });
 }
 
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
@@ -203,7 +214,7 @@ pub fn main(init: std.process.Init) !void {
     try runner.runWithOptions(app_state.app(), .{
         .app_name = "blocks",
         .window_title = "Blocks for Developers",
-        .bundle_id = "dev.blocks.app",
+        .bundle_id = bundle_id,
         .icon_path = "assets/icon.png",
         .default_frame = geometry.RectF.init(0, 0, window_width, window_height),
         .js_window_api = false,

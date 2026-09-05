@@ -1,5 +1,7 @@
 {
-  "version": 0,
-  "hashes": [],
-  "schema_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  "version": 1,
+  "hashes": [
+    "f631e7508e8e81a00e2317470517d9cec6cd55b32fc9c91cc11e8d4965d2a1c3"
+  ],
+  "schema_hash": "e5aac16a620739b19eba9bb843720264c62abe766c6069ed7bf6fae4f01cbf36"
 }

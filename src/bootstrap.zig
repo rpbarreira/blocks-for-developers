@@ -1,10 +1,12 @@
-//! First-run bootstrap of the `~/blocks` data directory.
+//! First-run bootstrap of the app-data directory
+//! (`~/Library/Application Support/<bundle_id>/`).
 //!
-//! The SDK has no dedicated `mkdir` effect, but `writeFile` creates any
-//! missing parent directories (verified in the spike). So we materialize
-//! the layout by writing two anchor files:
-//!   - `~/blocks/config.json`     (creates `~/blocks/`)
-//!   - `~/blocks/models/.keep`    (creates `~/blocks/models/`)
+//! The SDK runner already creates the data dir and opens the engine-owned
+//! `app.db` there. The SDK has no dedicated `mkdir` effect, but `writeFile`
+//! creates any missing parent directories (verified in the spike). So we
+//! materialize the rest of the layout by writing two anchor files:
+//!   - `<data_dir>/config.json`   (the app's own settings file)
+//!   - `<data_dir>/models/.keep`  (creates the models/ subdirectory)
 //!
 //! Writes are idempotent-by-intent: we only write the config when it is
 //! absent (checked via `statFile`), so re-running never clobbers user
@@ -57,10 +59,20 @@ test "defaultConfigJson embeds username and version and marks not-onboarded" {
     try testing.expect(std.mem.indexOf(u8, json, "\"onboarded\": false") != null);
 }
 
-test "modelsKeepPath sits under <root>/models" {
+const EnvStub = struct {
+    fn lookup(name: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, name, "HOME")) return "/Users/rui";
+        return null;
+    }
+};
+
+test "modelsKeepPath sits under <data_dir>/models" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const paths = try config.Paths.resolve(arena.allocator(), "/Users/rui");
+    const paths = try config.Paths.resolve(arena.allocator(), "dev.blocks.app", EnvStub.lookup);
     const keep = try modelsKeepPath(arena.allocator(), paths);
-    try testing.expectEqualStrings("/Users/rui/blocks/models/.keep", keep);
+    try testing.expectEqualStrings(
+        "/Users/rui/Library/Application Support/dev.blocks.app/models/.keep",
+        keep,
+    );
 }
