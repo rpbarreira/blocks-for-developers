@@ -13,6 +13,7 @@ comptime {
     _ = @import("git.zig");
     _ = @import("snapshots.zig");
     _ = @import("tray.zig");
+    _ = @import("embeddings.zig");
 }
 
 const canvas = native_sdk.canvas;

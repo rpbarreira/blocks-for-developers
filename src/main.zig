@@ -22,6 +22,7 @@ const repos = @import("repos.zig");
 const git = @import("git.zig");
 const snapshots = @import("snapshots.zig");
 const tray = @import("tray.zig");
+const embeddings = @import("embeddings.zig");
 
 const canvas = native_sdk.canvas;
 
@@ -65,6 +66,16 @@ const key_snap_write: u64 = 134; // insert the snapshot row
 // Launch-at-login host requests (Task 6). Share the spawn/fetch/file key space.
 const key_login_status: u64 = 140; // query current launch-at-login state
 const key_login_set: u64 = 141; // enable/disable launch-at-login
+// Embedding generation (Task 7).
+const key_embed_events: u64 = 150; // query un-embedded events
+const key_embed_snaps: u64 = 151; // query un-embedded file snapshots
+const key_embed_write: u64 = 152; // insert embeddings + fts rows
+
+/// How many source rows to embed per query batch. Each row contributes a
+/// 256-f32 vector + an FTS insert; two statements/row, all frame-local.
+const embed_batch = 16;
+/// Text length embedded per row (subject+body / path+content, truncated).
+const embed_text_bytes = 4096;
 
 // Launch-at-login host-service names (see SDK effects: native host requests).
 const host_login_status = "native-sdk.launch-at-login.status";
@@ -120,6 +131,10 @@ const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 /// Which onboarding/app stage the UI is in. Task 1 only distinguishes
 /// "still booting" from "ready"; later tasks add welcome/chat/materials.
 pub const Stage = enum { booting, ready };
+
+/// Which source table an embedding pass is currently draining. A pass
+/// embeds all un-embedded events, then all un-embedded file snapshots.
+pub const EmbedPhase = enum { events, snapshots };
 
 /// A changed working-tree path copied into owned inline storage, since the
 /// `git status` output bytes it came from only live during one update.
@@ -220,6 +235,18 @@ pub const Model = struct {
     /// host says otherwise (a `.set`/`.status` "unsupported" result).
     login_supported: bool = true,
 
+    // ---- Embedding generation (Task 7) ----
+    /// True while an embedding pass is running (coalesces triggers).
+    embedding: bool = false,
+    /// Which source table the current pass is draining.
+    embed_phase: EmbedPhase = .events,
+    /// Rows embedded in the batch currently being written. Continuation is
+    /// driven STRICTLY from the write result (so the write has committed
+    /// before the next query runs, avoiding re-embedding the same rows):
+    /// a full batch => more may remain, query again; a short/empty batch
+    /// => this phase is drained. The query's own `.done` is a no-op.
+    embed_last_rows: usize = 0,
+
     pub fn capturePath(self: *const Model) []const u8 {
         return self.capture_path_buf[0..self.capture_path_len];
     }
@@ -310,6 +337,8 @@ pub const Model = struct {
         "scan_last_hash_buf", "scan_last_hash_len", "scanRepoPath",
         // Tray + launch-at-login (Task 6).
         "login_enabled",      "login_supported",
+        // Embedding generation (Task 7).
+        "embedding",          "embed_phase",       "embed_last_rows",
     };
     pub fn statusText(self: *const Model) []const u8 {
         return switch (self.stage) {
@@ -353,6 +382,11 @@ pub const Msg = union(enum) {
     login_status_done: native_sdk.EffectHostResult, // launch-at-login status query
     login_set_done: native_sdk.EffectHostResult, // launch-at-login set result
 
+    // Embedding generation (Task 7)
+    embed_events_page: native_sdk.EffectDbResult, // un-embedded events query
+    embed_snaps_page: native_sdk.EffectDbResult, // un-embedded snapshots query
+    embed_write_done: native_sdk.EffectDbResult, // embeddings+fts insert result
+
     // Delivered by effects/host, never bound as markup handlers.
     pub const view_unbound = .{
         "stat_config",         "wrote_config",       "wrote_keep",
@@ -362,6 +396,7 @@ pub const Msg = union(enum) {
         "snap_lasthash_done",  "snap_content_done",  "snap_diff_done",
         "snap_write_done",     "open_window",        "quit_app",
         "toggle_login",        "login_status_done",  "login_set_done",
+        "embed_events_page",   "embed_snaps_page",   "embed_write_done",
     };
 };
 
@@ -543,7 +578,123 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .login_status_done => |res| applyLoginResult(model, res),
         .login_set_done => |res| applyLoginResult(model, res),
+
+        // ---- Embedding generation (Task 7) ----
+        .embed_events_page => |res| embedEventsPage(model, res, fx),
+        .embed_snaps_page => |res| embedSnapsPage(model, res, fx),
+        .embed_write_done => |res| embedWriteDone(model, res, fx),
     }
+}
+
+// ----------------------------------------------------- embedding generation
+
+/// Begin an embedding pass: drain un-embedded events, then snapshots. A
+/// pass already in flight is left alone (its own loop will pick up anything
+/// new on the next trigger).
+fn startEmbedPass(model: *Model, fx: *Effects) void {
+    if (model.embedding) return;
+    model.embedding = true;
+    model.embed_phase = .events;
+    queryUnembedded(model, fx);
+}
+
+/// Query the next batch of un-embedded rows for the current phase.
+fn queryUnembedded(model: *Model, fx: *Effects) void {
+    model.embed_last_rows = 0;
+    var params: [2]db.Value = .{ db.val.text(embeddings.model_id), db.val.int(embed_batch) };
+    switch (model.embed_phase) {
+        .events => fx.dbQuery(.{
+            .key = key_embed_events,
+            .sql = embeddings.select_unembedded_events_sql,
+            .params = &params,
+            .on_result = Effects.dbMsg(.embed_events_page),
+        }),
+        .snapshots => fx.dbQuery(.{
+            .key = key_embed_snaps,
+            .sql = embeddings.select_unembedded_snapshots_sql,
+            .params = &params,
+            .on_result = Effects.dbMsg(.embed_snaps_page),
+        }),
+    }
+}
+
+/// A page of un-embedded events (id, subject, body): embed + write it.
+/// Continuation is driven from the write result, NOT this `.done` (so the
+/// write commits before the next query runs — no re-embedding).
+fn embedEventsPage(model: *Model, res: native_sdk.EffectDbResult, fx: *Effects) void {
+    if (res.kind == .page) model.embed_last_rows += embedPageRows(res, .event, fx);
+    // A batch that yields ZERO rows (drained) won't produce a write, so its
+    // `.done` is where we advance the phase.
+    if (res.kind == .done and model.embedding and model.embed_last_rows == 0) {
+        model.embed_phase = .snapshots;
+        queryUnembedded(model, fx);
+    }
+}
+
+/// A page of un-embedded snapshots (id, rel_path, content).
+fn embedSnapsPage(model: *Model, res: native_sdk.EffectDbResult, fx: *Effects) void {
+    if (res.kind == .page) model.embed_last_rows += embedPageRows(res, .file_snapshot, fx);
+    if (res.kind == .done and model.embedding and model.embed_last_rows == 0) {
+        model.embedding = false; // snapshots drained -> pass complete
+    }
+}
+
+/// Shared page handler: embed up to `embed_batch` rows and issue ONE
+/// dbExec of (embedding insert + fts insert) per row. All backing storage
+/// (vectors, text, params) is frame-local — dbExec copies params at call
+/// time, and the query page bytes we read from are valid for this update.
+/// Returns the number of rows embedded (a write is issued iff > 0).
+fn embedPageRows(res: native_sdk.EffectDbResult, kind: embeddings.SourceKind, fx: *Effects) usize {
+    var reader = db.PageReader.init(res.bytes) catch return 0;
+
+    // Frame-local batch storage.
+    var vectors: [embed_batch]embeddings.Vector = undefined;
+    var text_bufs: [embed_batch][embed_text_bytes]u8 = undefined;
+    var emb_params: [embed_batch][embeddings.insert_param_count]db.Value = undefined;
+    var fts_params: [embed_batch][3]db.Value = undefined;
+    var statements: [embed_batch * 2]db.Statement = undefined;
+
+    const now = fx.wallMs();
+    var rows: usize = 0;
+    var stmt_n: usize = 0;
+    var row: [3]db.ColumnValue = undefined;
+    while (rows < embed_batch) {
+        const cols = (reader.next(&row) catch null) orelse break;
+        const source_id = cols[0].asInt() orelse continue;
+        const a = cols[1].asText() orelse "";
+        const b = cols[2].asText() orelse "";
+        const text = switch (kind) {
+            .file_snapshot => embeddings.fileSnapshotText(&text_bufs[rows], a, b),
+            else => embeddings.eventText(&text_bufs[rows], a, b),
+        };
+        embeddings.embed(text, &vectors[rows]);
+        const vbytes = embeddings.vectorBytes(&vectors[rows]);
+        statements[stmt_n] = embeddings.insertStatement(&emb_params[rows], kind, source_id, vbytes, now);
+        stmt_n += 1;
+        // FTS body is the same text (valid: it lives in text_bufs[rows]).
+        statements[stmt_n] = embeddings.ftsInsertStatement(&fts_params[rows], kind, source_id, text);
+        stmt_n += 1;
+        rows += 1;
+    }
+
+    if (rows == 0) return 0;
+
+    fx.dbExec(.{
+        .key = key_embed_write,
+        .statements = statements[0..stmt_n],
+        .on_result = Effects.dbMsg(.embed_write_done),
+    });
+    return rows;
+}
+
+/// A batch write finished. If the batch was full there may be more rows in
+/// this phase — query again (the write has committed, so those rows now
+/// count as embedded). A short batch means the phase is nearly drained; we
+/// still query once more so the terminal empty `.done` can advance/finish.
+fn embedWriteDone(model: *Model, res: native_sdk.EffectDbResult, fx: *Effects) void {
+    _ = res; // ok or constraint alike: continue (dup embeddings are harmless)
+    if (!model.embedding) return;
+    queryUnembedded(model, fx);
 }
 
 /// Interpret a launch-at-login host result (from either the status query or
@@ -618,8 +769,10 @@ fn captureNext(model: *Model, fx: *Effects) void {
         });
         return;
     }
-    // No more repos to index.
+    // No more repos to index — git history is up to date, so (re)embed any
+    // new commit events.
     model.capturing = false;
+    startEmbedPass(model, fx);
 }
 
 /// Received the repo's stored `last_indexed_oid`; spawn `git log` from
@@ -814,6 +967,9 @@ fn scanNextRepo(model: *Model, fx: *Effects) void {
         return;
     }
     model.scanning = false;
+    // The working tree is snapshotted; embed any new snapshots (and any new
+    // commit events too — the pass drains both tables).
+    startEmbedPass(model, fx);
 }
 
 /// Parse `git status` output into the model's changed-path list, then start

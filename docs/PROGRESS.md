@@ -1,10 +1,10 @@
 # Blocks for Developers — Progress & Resumption Notes
 
-Last updated: end of Task 6 (tray + auto-start on login; not yet committed).
-Committed so far: Task 4 (`01969e5`), Task 5 (`56ae2a2`). Read this first when
-resuming. To continue: open the IDE on this repo folder
+Last updated: end of Task 7 (embeddings + vector search; not yet committed).
+Committed so far: Task 4 (`01969e5`), Task 5 (`56ae2a2`), Task 6 (`c2afa1b`). Read
+this first when resuming. To continue: open the IDE on this repo folder
 (`/Users/rpbarreira/Projects/GitHub/rpbarreira/blocks-for-developers`) and say
-"read docs/PROGRESS.md and continue from Task 7."
+"read docs/PROGRESS.md and continue from Task 8."
 
 ---
 
@@ -96,13 +96,17 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
 - [x] **Task 5 — Working-tree file-change capture (debounced snapshots).**
   (commit `56ae2a2`). Module `src/snapshots.zig` + timer-driven scan wiring in
   `main.zig`. Verified end-to-end via the automation GUI (see the Task 5 section).
-- [x] **Task 6 — Always-on tray + auto-start on login.** DONE (not yet committed).
-  New module `src/tray.zig` + declarative tray wiring in `main.zig`. 61 tests pass;
-  VERIFIED END-TO-END via automation (tray-action Quit logged `blocks.quit` → `stop`
-  → app exited). The "OPEN ARCHITECTURAL ITEM" below is RESOLVED — no Runtime
-  rewrite was needed.
-- [ ] **Task 7 — Embeddings generation + vector search.** ← NEXT
-- [ ] Task 8 — MCP server (spawned child) exposing memory tools.
+- [x] **Task 6 — Always-on tray + auto-start on login.** (commit `c2afa1b`).
+  Module `src/tray.zig` + declarative tray wiring in `main.zig`. Verified E2E via
+  automation. The "OPEN ARCHITECTURAL ITEM" is RESOLVED (see the resolved-item
+  section) — no Runtime rewrite was needed.
+- [x] **Task 7 — Embeddings generation + vector search.** DONE (not yet committed).
+  New module `src/embeddings.zig` + a generation pass + search helpers wired into
+  `main.zig`. 74 tests pass; VERIFIED END-TO-END via automation (7 events + 3
+  snapshots embedded, 10 vectors + 10 FTS rows, dedup held, live search returned
+  the right memory). v1 uses a DETERMINISTIC in-process hashing embedder — llama.cpp
+  is deferred to Task 9 (see the Task 7 section).
+- [ ] **Task 8 — MCP server (spawned child) exposing memory tools.** ← NEXT
 - [ ] Task 9 — Local model management + llama.cpp runtime.
 - [ ] Task 10 — Chat experience wired to model + MCP.
 - [ ] Task 11 — Single-click summaries.
@@ -169,6 +173,22 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
   Login / — / Quit); `loginToggleLabel(enabled)` prefixes a ✓ when on. The tray
   ITSELF is declarative (see the Task 6 section) — this module only builds the
   menu and (via the shared consts) names the commands.
+- **embeddings.zig** — embeddings + vector search, PURE (Task 7). `dim = 256`,
+  `model_id = "hash-v1"`, `Vector = [256]f32`. `vectorBytes`/`vectorFromBytes`
+  pack a vector to/from the raw LE-f32 `embeddings.vector` BLOB; `normalize`/`dot`/
+  `cosine`. `Tokenizer` splits text/code into lowercased sub-words (non-alnum +
+  camelCase + underscores); `embed(text, *Vector)` is the deterministic HASHING
+  embedder (Wyhash → bucket + sign bit, L2-normalized), `embedValue` returns by
+  value. `SourceKind{event,file_snapshot,message,snippet}` + `name()`/`kindFromName`.
+  Text builders `eventText(buf, subject, body)` / `fileSnapshotText(buf, rel_path,
+  content)`. Statement builders (caller-owned bufs): `insertStatement`
+  (embeddings row: kind, id, model, dim, vector blob, now) + `ftsInsertStatement`
+  (memory_fts row). Queries: `select_unembedded_events_sql` /
+  `select_unembedded_snapshots_sql` (rows lacking a `hash-v1` embedding, oldest
+  first, `?1`=model `?2`=limit), `select_vectors_sql` (`?1`=model → kind,id,vector),
+  `fts_search_sql` (memory_fts MATCH `?1` ORDER BY rank LIMIT `?2`). Ranking:
+  `Hit{kind,source_id,score}`, `considerTopK` (alloc-free top-k), and `rankPage`
+  (decode + score a `select_vectors_sql` page against a query vector).
 - **repos.zig** — watched-repos data layer. `Repo{id,path,name,active,added_at}`
   `.fromRow(cols)`; `RepoEntry` (owned inline path/name copy) `.fromRepo/.path()/.name()`;
   `insert_sql/delete_sql/list_sql/exists_sql`; `insertStatement(*[3]Value, path, name, now_ms)`,
@@ -229,7 +249,8 @@ allowed; multi-statement files OK. FK cascades work (the writer sets foreign_key
    - Effect keys share ONE namespace across spawn/fetch/file; timer keys are separate.
      Current spawn/fetch/file/host keys: 100-102 (bootstrap), 110-113 (repos),
      120-122 (git capture), 130-134 (snapshot scan), 140-141 (launch-at-login host
-     requests). TIMER keys (own namespace): 1 = the repeating working-tree scan tick.
+     requests), 150-152 (embedding generation). TIMER keys (own namespace):
+     1 = the repeating working-tree scan tick.
 2. **ZIG LIFETIME TRAP (will recur!):** a function returning a struct with
    `.params = &.{ runtimeValue, ... }` DANGLES (temporary array dies at return) →
    causes `.rejected` exec and crashes. FIX: builder takes a caller-owned
@@ -471,15 +492,79 @@ isn't an installed `.app` bundle SMAppService can register (host returns
 - **Packaged-build login item** — verify the enabled toggle actually registers via
   SMAppService when running the packaged `.app` (dev can't exercise this).
 
-## NEXT: Task 7 — Embeddings generation + vector search
+## Task 7 — Embeddings generation + vector search (DONE — what was built)
 
-Goal: embed the captured memory (events, file_snapshots, later messages/snippets)
-with ONE fixed small embedding model and store vectors in the `embeddings` table
-(raw LE f32 BLOB + `dim`, UNIQUE(source_kind, source_id, model) already exists), so
-`search_memory` can do vector similarity + FTS5 hybrid search. Decide the embedding
-runtime (bundled llama.cpp subprocess first, per the locked decisions; Zig FFI
-later). Keep the module split: a pure module (vector encode/decode, cosine, maybe
-chunking) + effectful embedding generation wired into `main.zig` (likely piggybacks
-the same post-capture points as Task 4/5, or its own timer pass). The `embeddings`
-schema + `idx_embeddings_source` are ready. Consider batching and only embedding
-new/changed rows (mirror the incremental discipline of Tasks 4/5).
+Captured memory (git commit events + working-tree file snapshots) is embedded into
+the `embeddings` table and mirrored into `memory_fts`, and there is a vector-search
++ FTS hybrid retrieval path ready for Task 8's MCP tools.
+
+**KEY DECISION — the embedder (read this before Task 9):** the locked decision is
+"bundled llama.cpp embeddings," but that runtime is Task 9. Rather than block Task 7
+on it, v1 uses a DETERMINISTIC in-process HASHING embedder (feature hashing, model
+id `hash-v1`, `dim = 256`) in `embeddings.zig` — no model download, no subprocess,
+fast, and one fixed function so the index never needs re-embedding (matches the
+"ONE fixed embedding model" decision). It gives real lexical/semantic-ish retrieval
+now. When Task 9 lands a neural embedder, register it under a NEW `model` id (e.g.
+`llama-<name>-v1`); `UNIQUE(source_kind, source_id, model)` lets both coexist and a
+query picks which model's vectors to search — so the swap is localized and clean.
+This is an honest v1 stand-in, NOT the final embedding quality.
+
+Generation pass (`main.zig`, keys 150-152), triggered when a git-capture pass or a
+snapshot scan finishes (`startEmbedPass` at the end of `captureNext`/`scanNextRepo`):
+1. `startEmbedPass` (coalesced by an `embedding` flag) → `queryUnembedded(.events)`.
+2. `queryUnembedded` runs `select_unembedded_events_sql`/`_snapshots_sql` (rows with
+   no `hash-v1` embedding, `LIMIT embed_batch = 16`), resetting `embed_last_rows`.
+3. On a `.page`, `embedPageRows` embeds up to 16 rows IN-PROCESS and issues ONE
+   `dbExec` batch of (embedding insert + memory_fts insert) per row — all backing
+   storage (vectors, text, params) frame-local (dbExec copies params at call; the
+   page bytes are valid this update).
+4. Continuation is driven STRICTLY from `embed_write_done` → `queryUnembedded`
+   again, so each write commits before the next query runs (no re-embedding). The
+   query's terminal `.done` advances the phase / ends the pass ONLY when the batch
+   came back empty (`embed_last_rows == 0`). Events drain first, then snapshots,
+   then `embedding = false`. (Relies on the runtime's FIFO effect delivery: a
+   query's `.done` is enqueued before the write it spawned.)
+
+Search / retrieval (in `embeddings.zig`, consumed by Task 8):
+- Vector: `embed(query)` → `select_vectors_sql` (all vectors for the model) →
+  `rankPage(hits, count, &query, page_bytes)` decodes each stored vector and
+  top-k ranks by dot product (== cosine for the normalized vectors).
+- Keyword/hybrid: `fts_search_sql` (`memory_fts MATCH ?1 ORDER BY rank`).
+
+Tests (74 total pass): `embeddings.zig` unit tests (blob round-trip, normalize,
+deterministic + normalized embed, camelCase tokenizer, similar>unrelated cosine,
+top-k, statement params) + TWO real in-memory-DB integration tests (vector search
+ranks the most-similar memory first; FTS keyword arm finds the right row).
+
+**Verified END-TO-END via automation** (added THIS repo, waited for capture+embed,
+inspected `app.db`): 7 commit events → 7 event embeddings, 3 file snapshots → 3
+file_snapshot embeddings; 10 embeddings == 10 `memory_fts` rows, all `model=hash-v1
+dim=256` with 1024-byte (256×f32) vectors; a second scan tick added NOTHING (dedup
+via the NOT-EXISTS query + UNIQUE index); live FTS `MATCH 'tray'` surfaced the
+Task 6 tray commit and the `tray.zig` snapshot. Test data cleared from `app.db`
+afterward.
+
+### Deferred / follow-ups
+- **Neural embedder (Task 9)**: swap in bundled llama.cpp under a new `model` id;
+  the schema + the model-parameterized queries already support coexistence.
+- **Chunking**: long files/commits are embedded as ONE truncated
+  (`embed_text_bytes = 4096`) vector. Per-chunk embeddings (with an offset column)
+  would improve recall on large files — later.
+- **Hybrid fusion**: vector and FTS arms exist independently; blending them (e.g.
+  reciprocal-rank fusion) into one ranked list is a Task 8 concern once the MCP
+  `search_memory` tool defines its output contract.
+- **Re-embed on model change**: not automated yet — when a new `model` id ships,
+  the un-embedded queries naturally pick every row up (they filter by model), so a
+  pass simply re-runs; no migration needed.
+
+## NEXT: Task 8 — MCP server (spawned child) exposing memory tools
+
+Per the locked decisions the MCP server runs as a SPAWNED CHILD PROCESS (the SDK
+has no in-process socket-listener effect, only a `fetch` client), and the app's LLM
+reaches it over HTTP. Expose the memory tools — `search_memory` (vector + FTS
+hybrid, built on `embeddings.rankPage` + `fts_search_sql`), `get_activity`,
+`get_commits` — reading the same `app.db`. Decide the child's language/runtime and
+how it opens the DB (the runner owns `app.db`; the child likely opens it read-only
+or via a shared path). Keep the tool logic thin and lean on the queries already in
+`git.zig`/`snapshots.zig`/`embeddings.zig`. The spike proved subprocess spawn +
+localhost HTTP fetch, so the transport is known-good.
