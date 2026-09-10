@@ -1,10 +1,10 @@
 # Blocks for Developers — Progress & Resumption Notes
 
-Last updated: end of Task 5 (working-tree file-change capture; not yet committed).
-Task 4 is committed (`01969e5`). Read this first when resuming. To continue: open
-the IDE on this repo folder
+Last updated: end of Task 6 (tray + auto-start on login; not yet committed).
+Committed so far: Task 4 (`01969e5`), Task 5 (`56ae2a2`). Read this first when
+resuming. To continue: open the IDE on this repo folder
 (`/Users/rpbarreira/Projects/GitHub/rpbarreira/blocks-for-developers`) and say
-"read docs/PROGRESS.md and continue from Task 6."
+"read docs/PROGRESS.md and continue from Task 7."
 
 ---
 
@@ -93,14 +93,15 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
 - [x] **Task 3 — Watched Repositories management.** (commit cef9fb1)
 - [x] **Task 4 — Git history capture.** (commit `01969e5`). Module `src/git.zig`
   + capture wiring in `main.zig`. Format verified against real `git log` output.
-- [x] **Task 5 — Working-tree file-change capture (debounced snapshots).** DONE
-  (not yet committed). New module `src/snapshots.zig` + timer-driven scan wiring
-  in `main.zig`. 50 tests pass; VERIFIED END-TO-END via the automation GUI (see
-  the Task 5 section below).
-- [ ] **Task 6 — Always-on tray + auto-start on login.** ← NEXT (NOTE: tray needs
-  Runtime
-  access — see "Open architectural item" below.)
-- [ ] Task 7 — Embeddings generation + vector search.
+- [x] **Task 5 — Working-tree file-change capture (debounced snapshots).**
+  (commit `56ae2a2`). Module `src/snapshots.zig` + timer-driven scan wiring in
+  `main.zig`. Verified end-to-end via the automation GUI (see the Task 5 section).
+- [x] **Task 6 — Always-on tray + auto-start on login.** DONE (not yet committed).
+  New module `src/tray.zig` + declarative tray wiring in `main.zig`. 61 tests pass;
+  VERIFIED END-TO-END via automation (tray-action Quit logged `blocks.quit` → `stop`
+  → app exited). The "OPEN ARCHITECTURAL ITEM" below is RESOLVED — no Runtime
+  rewrite was needed.
+- [ ] **Task 7 — Embeddings generation + vector search.** ← NEXT
 - [ ] Task 8 — MCP server (spawned child) exposing memory tools.
 - [ ] Task 9 — Local model management + llama.cpp runtime.
 - [ ] Task 10 — Chat experience wired to model + MCP.
@@ -161,6 +162,13 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
   now_ms)` inserts a `file_snapshots` row (byte_len = content.len); `select_last_
   hash_sql` + `lastHashParams(*[2]Value, repo_id, rel_path)` fetch the newest
   stored hash so unchanged saves are skipped. Caller-owned param buffers throughout.
+- **tray.zig** — menu-bar (status item) menu definition, PURE (Task 6).
+  Command-name consts `cmd_open`/`cmd_toggle_login`/`cmd_quit` (shared with
+  main.zig's `on_command`). `buildMenu(buf []TrayMenuItem, login_enabled,
+  login_supported) []const TrayMenuItem` lays out the rows (Open / — / Start at
+  Login / — / Quit); `loginToggleLabel(enabled)` prefixes a ✓ when on. The tray
+  ITSELF is declarative (see the Task 6 section) — this module only builds the
+  menu and (via the shared consts) names the commands.
 - **repos.zig** — watched-repos data layer. `Repo{id,path,name,active,added_at}`
   `.fromRow(cols)`; `RepoEntry` (owned inline path/name copy) `.fromRepo/.path()/.name()`;
   `insert_sql/delete_sql/list_sql/exists_sql`; `insertStatement(*[3]Value, path, name, now_ms)`,
@@ -219,9 +227,9 @@ allowed; multi-statement files OK. FK cascades work (the writer sets foreign_key
    - `fx.startTimer/cancelTimer` — repeating/one-shot timers (for debounce/polling later).
    - Msg constructors: `Effects.lineMsg/exitMsg/fileMsg/responseMsg/dbMsg/timerMsg`.
    - Effect keys share ONE namespace across spawn/fetch/file; timer keys are separate.
-     Current spawn/fetch/file keys: 100-102 (bootstrap), 110-113 (repos),
-     120-122 (git capture), 130-134 (snapshot scan). TIMER keys (own namespace):
-     1 = the repeating working-tree scan tick.
+     Current spawn/fetch/file/host keys: 100-102 (bootstrap), 110-113 (repos),
+     120-122 (git capture), 130-134 (snapshot scan), 140-141 (launch-at-login host
+     requests). TIMER keys (own namespace): 1 = the repeating working-tree scan tick.
 2. **ZIG LIFETIME TRAP (will recur!):** a function returning a struct with
    `.params = &.{ runtimeValue, ... }` DANGLES (temporary array dies at return) →
    causes `.rejected` exec and crashes. FIX: builder takes a caller-owned
@@ -252,19 +260,29 @@ allowed; multi-statement files OK. FK cascades work (the writer sets foreign_key
    db.binding())`; drive `dbExec/dbQuery`; drain via `fx.takeMsg()`. Fake executor:
    `fx.executor = .fake` with `feedLine/feedExit/feedDbResult` for wiring-only tests.
 
-## OPEN ARCHITECTURAL ITEM (blocks Task 6, affects a Task 3 nicety)
+## RESOLVED architectural item (was: "tray needs Runtime access")
 
-Native dialogs (`showOpenDialog`) and the tray (`createTray`) are **Runtime
-methods** (see `core.zig` `SystemServiceMethods`), but the pure model core's
-`update(model, msg, fx)` never receives a `Runtime`, and the UiApp Options hooks
-(`on_command/on_lifecycle/on_frame/on_key`) only return `?Msg`. The bridge dialog
-path is WebView/JS only. So:
-- Task 3 used a TEXT-INPUT path field instead of a native folder picker (works
-  fine, verified).
-- Task 6 (tray, always-on) WILL need Runtime access. Plan: drop down to the
-  lower-level App/Runtime layer (the App Model doc's "dropping down" section:
-  `UiApp is a layer over the lower-level App/Runtime pair`). Solve it there, and
-  optionally restore a native folder picker for Watched Repositories at the same time.
+The earlier worry was that the tray (`createTray`) and native dialogs are
+**Runtime methods** unreachable from the pure `update(model, msg, fx)` core. Task 6
+proved that WRONG for the tray: `UiApp` exposes the tray DECLARATIVELY, and reaches
+system services through the effects channel the core already has. No drop-down to
+the App/Runtime layer was needed. Specifically:
+- **Tray:** `UiApp.Options` has `status_item`/`status_item_fn`/`status_items_fn`.
+  We use `status_item_fn(model, scratch) StatusItemState` (builds the menu into the
+  provided scratch each rebuild) + `on_command(name) ?Msg`. The runtime calls the
+  Runtime-level `createStatusItem`/`updateStatusItem*` for us. Menu selections and
+  activation/open commands all arrive through `on_command`.
+- **Window control / quit from the core:** `fx.showWindow(label)`,
+  `fx.hideWindow`, `fx.closeWindow`, `fx.quitApp()` (all on the Effects handle,
+  all mirrored by the fake executor via `fx.windowActionState()`). Also
+  `fx.setDockPresence(visible)` for accessory-app mode later if wanted.
+- **Launch-at-login:** a native host request on the same `fx` — no Runtime and no
+  manifest capability. See the Task 6 section.
+
+STILL OPEN (Task 3 nicety only): a **native folder picker** for Watched
+Repositories (`showOpenDialog`) is a Runtime/WebView-bridge path; Task 3's
+text-input path field remains in place. If we ever want the native picker we can
+revisit whether a UiApp seam exposes it, or use the JS bridge — low priority.
 
 ---
 
@@ -396,12 +414,72 @@ exactly ONE new snapshot version (row count 4 → 5). Test data was cleared from
   memory").
 - **Large files (>256K)**: skipped entirely (no partial snapshots).
 
-## NEXT: Task 6 — Always-on tray + auto-start on login
+## Task 6 — Always-on tray + auto-start on login (DONE — what was built)
 
-See the "OPEN ARCHITECTURAL ITEM" above: the tray (`createTray`) and native
-dialogs are Runtime methods not reachable from the pure `update(model, msg, fx)`
-core. Plan: drop down to the lower-level App/Runtime layer to get Runtime access,
-add the tray + login-item (auto-start), and optionally restore a native folder
-picker for Watched Repositories. The capture loops (Task 4 git, Task 5 snapshots)
-already run continuously while the process is alive, so "always-on" is mostly about
-keeping the process alive in the tray and starting it at login.
+The app now installs a menu-bar (status item) tray and can register itself as a
+login item. This is entirely on top of the existing `UiApp` — NO drop-down to the
+App/Runtime layer (see "RESOLVED architectural item" above). The capture loops
+(Task 4 git, Task 5 snapshots) already run while the process is alive, so
+"always-on" is: keep the process reachable from the tray + start it at login.
+
+Tray (declarative, in `main.zig` on the `BlocksApp.create(...)` Options):
+- `.status_item_fn = statusItem` — `statusItem(model, scratch)` calls
+  `tray.buildMenu(&scratch.items, model.login_enabled, model.login_supported)` and
+  returns `StatusItemState{ .title = "Blocks", .tooltip = ..., .items = ... }`. The
+  menu is model-derived, so the "Start at Login" row reflects live state and the
+  runtime re-applies it on rebuild.
+- `.on_command = onTrayCommand` — maps the menu command strings (from `tray.zig`)
+  to `Msg`s: `blocks.open_window` → `.open_window`, `blocks.toggle_login` →
+  `.toggle_login`, `blocks.quit` → `.quit_app`.
+- Update arms: `.open_window` → `fx.showWindow("main")`; `.quit_app` →
+  `fx.quitApp()`.
+
+Launch-at-login (native host request on `fx`, keys 140/141):
+- On boot, `initFx` fires `fx.hostRequest(.{ .name = "native-sdk.launch-at-login.
+  status", .on_result = Effects.hostMsg(.login_status_done) })`.
+- `.toggle_login` (guarded by `login_supported`) sends
+  `"native-sdk.launch-at-login.set"` with a one-byte payload
+  (`@intFromBool(enable)`), result → `.login_set_done`.
+- `applyLoginResult` decodes `EffectHostResult`: on `ok`, bytes `"enabled"`/
+  `"requires_approval"` → `login_enabled = true`; `"disabled"`/`"not_found"` →
+  false; on `!ok`, `"unsupported"` → `login_supported = false` (toggle shown
+  disabled). Model fields: `login_enabled`, `login_supported`.
+
+Tests (61 total pass): `tray.zig` unit tests for `buildMenu`/`loginToggleLabel`/
+row ids; plus fake-executor `update` tests in `tests.zig` — tray Open bumps
+`fx.windowActionState().show_count` with label "main", Quit bumps `quit_count`,
+and the login result arms flip `login_enabled`/`login_supported` for each bytes
+case (enabled/disabled/requires_approval/unsupported) incl. the unsupported-toggle
+no-op.
+
+**Verified END-TO-END via automation:** the snapshot showed
+`tray #1 title="Blocks" visible=true items=5` with the exact rows/commands;
+`tray-action 1` (Open) delivered and the window stayed present; `tray-action 5`
+(Quit) drove the runtime log `event="blocks.quit"` → `event="stop"` →
+`native dev: app exited` — definitive proof the tray→command→effect chain works.
+The timer ticks in the same log confirm the Task 5 scan runs alongside the tray.
+NOTE: under `native dev` the "Start at Login" row is DISABLED because the dev build
+isn't an installed `.app` bundle SMAppService can register (host returns
+"unsupported"/"not_found") — expected; it becomes enabled in a packaged build.
+
+### Deferred / follow-ups
+- **Native folder picker** for Watched Repositories (Task 3 nicety) — still the
+  text-input path; a Runtime/bridge dialog, low priority.
+- **Dock presence** — the app currently shows a normal Dock icon + window
+  (matches the mockups). `fx.setDockPresence(false)` could make it an
+  accessory/menu-bar-only app later if desired.
+- **Packaged-build login item** — verify the enabled toggle actually registers via
+  SMAppService when running the packaged `.app` (dev can't exercise this).
+
+## NEXT: Task 7 — Embeddings generation + vector search
+
+Goal: embed the captured memory (events, file_snapshots, later messages/snippets)
+with ONE fixed small embedding model and store vectors in the `embeddings` table
+(raw LE f32 BLOB + `dim`, UNIQUE(source_kind, source_id, model) already exists), so
+`search_memory` can do vector similarity + FTS5 hybrid search. Decide the embedding
+runtime (bundled llama.cpp subprocess first, per the locked decisions; Zig FFI
+later). Keep the module split: a pure module (vector encode/decode, cosine, maybe
+chunking) + effectful embedding generation wired into `main.zig` (likely piggybacks
+the same post-capture points as Task 4/5, or its own timer pass). The `embeddings`
+schema + `idx_embeddings_source` are ready. Consider batching and only embedding
+new/changed rows (mirror the incremental discipline of Tasks 4/5).

@@ -21,6 +21,7 @@ const db = @import("db.zig");
 const repos = @import("repos.zig");
 const git = @import("git.zig");
 const snapshots = @import("snapshots.zig");
+const tray = @import("tray.zig");
 
 const canvas = native_sdk.canvas;
 
@@ -61,6 +62,17 @@ const key_snap_lasthash: u64 = 131; // query a file's last content_hash
 const key_snap_content: u64 = 132; // readFile a changed file's content
 const key_snap_diff: u64 = 133; // spawn `git diff -- <path>`
 const key_snap_write: u64 = 134; // insert the snapshot row
+// Launch-at-login host requests (Task 6). Share the spawn/fetch/file key space.
+const key_login_status: u64 = 140; // query current launch-at-login state
+const key_login_set: u64 = 141; // enable/disable launch-at-login
+
+// Launch-at-login host-service names (see SDK effects: native host requests).
+const host_login_status = "native-sdk.launch-at-login.status";
+const host_login_set = "native-sdk.launch-at-login.set";
+
+/// The window label the tray "Open Blocks" action reveals. Matches the
+/// `shell_windows` entry below.
+const main_window_label = "main";
 // Timer keys live in their OWN namespace (never collide with the above).
 const key_snap_timer: u64 = 1; // the repeating scan/debounce tick
 
@@ -199,6 +211,15 @@ pub const Model = struct {
     scan_last_hash_buf: [snapshots.hash_hex_len]u8 = undefined,
     scan_last_hash_len: usize = 0,
 
+    // ---- Tray + launch-at-login (Task 6) ----
+    /// Whether "start at login" is currently enabled (drives the tray
+    /// toggle's check mark). Learned from the host on boot.
+    login_enabled: bool = false,
+    /// Whether the platform/build supports launch-at-login at all. When
+    /// false the tray toggle is shown disabled. Assume supported until the
+    /// host says otherwise (a `.set`/`.status` "unsupported" result).
+    login_supported: bool = true,
+
     pub fn capturePath(self: *const Model) []const u8 {
         return self.capture_path_buf[0..self.capture_path_len];
     }
@@ -287,6 +308,8 @@ pub const Model = struct {
         "scan_repo_path_buf", "scan_repo_path_len", "scan_paths",      "scan_path_count",
         "scan_file_idx",      "scan_content_buf",   "scan_content_len", "scan_hash_buf",
         "scan_last_hash_buf", "scan_last_hash_len", "scanRepoPath",
+        // Tray + launch-at-login (Task 6).
+        "login_enabled",      "login_supported",
     };
     pub fn statusText(self: *const Model) []const u8 {
         return switch (self.stage) {
@@ -323,6 +346,13 @@ pub const Msg = union(enum) {
     snap_diff_done: native_sdk.EffectExit, // `git diff` output (collected)
     snap_write_done: native_sdk.EffectDbResult, // snapshot insert result
 
+    // Tray + launch-at-login (Task 6)
+    open_window, // tray "Open Blocks" — reveal the main window
+    quit_app, // tray "Quit Blocks"
+    toggle_login, // tray "Start at Login" toggle
+    login_status_done: native_sdk.EffectHostResult, // launch-at-login status query
+    login_set_done: native_sdk.EffectHostResult, // launch-at-login set result
+
     // Delivered by effects/host, never bound as markup handlers.
     pub const view_unbound = .{
         "stat_config",         "wrote_config",       "wrote_keep",
@@ -330,7 +360,8 @@ pub const Msg = union(enum) {
         "repo_removed",        "capture_since_done", "capture_log_done",
         "capture_write_done",  "snapshot_tick",      "snap_status_done",
         "snap_lasthash_done",  "snap_content_done",  "snap_diff_done",
-        "snap_write_done",
+        "snap_write_done",     "open_window",        "quit_app",
+        "toggle_login",        "login_status_done",  "login_set_done",
     };
 };
 
@@ -387,6 +418,14 @@ pub fn initFx(model: *Model, fx: *Effects) void {
         .key = key_stat_config,
         .path = paths.config,
         .on_result = Effects.fileMsg(.stat_config),
+    });
+
+    // Query the current launch-at-login state so the tray toggle reflects
+    // reality (empty payload = a status read).
+    fx.hostRequest(.{
+        .key = key_login_status,
+        .name = host_login_status,
+        .on_result = Effects.hostMsg(.login_status_done),
     });
 }
 
@@ -486,7 +525,67 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.scan_file_idx += 1;
             scanNextFile(model, fx);
         },
+
+        // ---- Tray + launch-at-login (Task 6) ----
+        .open_window => fx.showWindow(main_window_label),
+        .quit_app => fx.quitApp(),
+        .toggle_login => {
+            if (!model.login_supported) return;
+            // Optimistically flip; the host result confirms/corrects it.
+            const enable = !model.login_enabled;
+            const payload = [_]u8{@intFromBool(enable)};
+            fx.hostRequest(.{
+                .key = key_login_set,
+                .name = host_login_set,
+                .payload = &payload,
+                .on_result = Effects.hostMsg(.login_set_done),
+            });
+        },
+        .login_status_done => |res| applyLoginResult(model, res),
+        .login_set_done => |res| applyLoginResult(model, res),
     }
+}
+
+/// Interpret a launch-at-login host result (from either the status query or
+/// a set request) and update the model's login flags. The result bytes are
+/// the status name on success, or an error tag on failure.
+fn applyLoginResult(model: *Model, res: native_sdk.EffectHostResult) void {
+    if (!res.ok) {
+        // "unsupported" means the platform/build has no launch-at-login;
+        // disable the toggle. "failed"/"rejected" leave state unchanged.
+        if (std.mem.eql(u8, res.bytes, "unsupported")) model.login_supported = false;
+        return;
+    }
+    model.login_supported = true;
+    if (std.mem.eql(u8, res.bytes, "enabled")) {
+        model.login_enabled = true;
+    } else if (std.mem.eql(u8, res.bytes, "disabled") or std.mem.eql(u8, res.bytes, "not_found")) {
+        model.login_enabled = false;
+    } else if (std.mem.eql(u8, res.bytes, "requires_approval")) {
+        // macOS SMAppService: registered but pending the user's approval in
+        // System Settings. Treat as "on" for the toggle — the item exists.
+        model.login_enabled = true;
+    }
+}
+
+/// Tray menu state, derived from the model each rebuild. The runtime calls
+/// this and applies the returned status item; menu selections come back
+/// through `onTrayCommand`.
+fn statusItem(model: *const Model, scratch: *BlocksApp.StatusItemScratch) BlocksApp.StatusItemState {
+    const items = tray.buildMenu(&scratch.items, model.login_enabled, model.login_supported);
+    return .{
+        .title = "Blocks",
+        .tooltip = "Blocks for Developers",
+        .items = items,
+    };
+}
+
+/// Map a tray/menu command name to a Msg (or null to ignore it).
+fn onTrayCommand(name: []const u8) ?Msg {
+    if (std.mem.eql(u8, name, tray.cmd_open)) return .open_window;
+    if (std.mem.eql(u8, name, tray.cmd_toggle_login)) return .toggle_login;
+    if (std.mem.eql(u8, name, tray.cmd_quit)) return .quit_app;
+    return null;
 }
 
 // -------------------------------------------------- git history capture
@@ -913,6 +1012,9 @@ pub fn main(init: std.process.Init) !void {
         .update_fx = update,
         .init_fx = initFx,
         .markup = .{ .source = app_markup, .watch_path = "src/app.native", .io = init.io },
+        // Menu-bar tray: a model-derived menu (Open / Start at Login / Quit).
+        .status_item_fn = statusItem,
+        .on_command = onTrayCommand,
     });
     defer app_state.destroy();
     app_state.model = initialModel();

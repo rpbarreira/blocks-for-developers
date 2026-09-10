@@ -12,6 +12,7 @@ comptime {
     _ = @import("repos.zig");
     _ = @import("git.zig");
     _ = @import("snapshots.zig");
+    _ = @import("tray.zig");
 }
 
 const canvas = native_sdk.canvas;
@@ -87,4 +88,80 @@ test "update: a successful config write leaves a first-run user ready but not on
     try std.testing.expect(m.data_dir_ready);
     try std.testing.expect(!m.onboarded);
     try std.testing.expectEqual(main.Stage.ready, m.stage);
+}
+
+// ---- Tray + launch-at-login (Task 6) ----
+
+test "update: tray Open reveals the main window" {
+    var m = main.Model{};
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .open_window, &fx);
+    const s = fx.windowActionState();
+    try std.testing.expectEqual(@as(u32, 1), s.show_count);
+    try std.testing.expectEqualStrings("main", s.lastLabel());
+}
+
+test "update: tray Quit asks the app to quit" {
+    var m = main.Model{};
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .quit_app, &fx);
+    try std.testing.expectEqual(@as(u32, 1), fx.windowActionState().quit_count);
+}
+
+test "update: login status result 'enabled' turns the toggle on" {
+    var m = main.Model{};
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .login_status_done = .{ .key = 140, .ok = true, .bytes = "enabled" } }, &fx);
+    try std.testing.expect(m.login_enabled);
+    try std.testing.expect(m.login_supported);
+}
+
+test "update: login result 'disabled' turns the toggle off" {
+    var m = main.Model{ .login_enabled = true };
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .login_set_done = .{ .key = 141, .ok = true, .bytes = "disabled" } }, &fx);
+    try std.testing.expect(!m.login_enabled);
+}
+
+test "update: 'requires_approval' counts as enabled (item registered)" {
+    var m = main.Model{};
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .login_status_done = .{ .key = 140, .ok = true, .bytes = "requires_approval" } }, &fx);
+    try std.testing.expect(m.login_enabled);
+}
+
+test "update: an 'unsupported' failure disables the toggle" {
+    var m = main.Model{ .login_supported = true };
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .login_set_done = .{ .key = 141, .ok = false, .bytes = "unsupported" } }, &fx);
+    try std.testing.expect(!m.login_supported);
+}
+
+test "update: toggling login while unsupported is a no-op" {
+    var m = main.Model{ .login_supported = false, .login_enabled = false };
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    // Should not flip the model or crash; the host is never asked.
+    main.update(&m, .toggle_login, &fx);
+    try std.testing.expect(!m.login_enabled);
 }
