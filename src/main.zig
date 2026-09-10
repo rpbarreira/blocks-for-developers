@@ -20,6 +20,7 @@ const bootstrap = @import("bootstrap.zig");
 const db = @import("db.zig");
 const repos = @import("repos.zig");
 const git = @import("git.zig");
+const snapshots = @import("snapshots.zig");
 
 const canvas = native_sdk.canvas;
 
@@ -54,6 +55,24 @@ const key_repo_delete: u64 = 113;
 const key_capture_since: u64 = 120; // query a repo's last_indexed_oid
 const key_capture_log: u64 = 121; // spawn `git log` for a repo
 const key_capture_write: u64 = 122; // insert events + update bookkeeping
+// Working-tree file-change capture (Task 5). spawn/file keys:
+const key_snap_status: u64 = 130; // spawn `git status --porcelain -z`
+const key_snap_lasthash: u64 = 131; // query a file's last content_hash
+const key_snap_content: u64 = 132; // readFile a changed file's content
+const key_snap_diff: u64 = 133; // spawn `git diff -- <path>`
+const key_snap_write: u64 = 134; // insert the snapshot row
+// Timer keys live in their OWN namespace (never collide with the above).
+const key_snap_timer: u64 = 1; // the repeating scan/debounce tick
+
+/// How often the working-tree scan runs. This interval IS the debounce /
+/// coalesce window: edits made between ticks collapse into the single
+/// snapshot taken at the next tick.
+const snapshot_interval_ms: u64 = 15_000;
+
+/// Bounds for the snapshot scan (fixed inline model storage, no allocator).
+const max_changed_files = 64; // changed paths tracked per repo per scan
+const max_content_bytes = 256 * 1024; // skip snapshotting files larger than this
+const max_diff_bytes = 256 * 1024; // stored diff cap
 
 /// Capacity of the repo-path input field.
 const path_input_capacity = repos.max_path_bytes;
@@ -89,6 +108,25 @@ const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 /// Which onboarding/app stage the UI is in. Task 1 only distinguishes
 /// "still booting" from "ready"; later tasks add welcome/chat/materials.
 pub const Stage = enum { booting, ready };
+
+/// A changed working-tree path copied into owned inline storage, since the
+/// `git status` output bytes it came from only live during one update.
+pub const ChangedPath = struct {
+    buf: [repos.max_path_bytes]u8 = undefined,
+    len: usize = 0,
+    /// True for an untracked file (its diff is empty — git diff skips it).
+    untracked: bool = false,
+
+    pub fn path(self: *const ChangedPath) []const u8 {
+        return self.buf[0..self.len];
+    }
+    pub fn fromChange(c: snapshots.Change) ChangedPath {
+        var e = ChangedPath{ .untracked = c.isUntracked() };
+        e.len = @min(c.rel_path.len, repos.max_path_bytes);
+        @memcpy(e.buf[0..e.len], c.rel_path[0..e.len]);
+        return e;
+    }
+};
 
 pub const Model = struct {
     stage: Stage = .booting,
@@ -134,6 +172,33 @@ pub const Model = struct {
     capture_since_buf: [64]u8 = undefined,
     capture_since_len: usize = 0,
 
+    // ---- Working-tree snapshot scan (Task 5) ----
+    /// True while a scan pass is walking repos/files (coalesces ticks: a
+    /// tick that arrives mid-scan is ignored).
+    scanning: bool = false,
+    /// True once the repeating scan timer has been armed.
+    scan_timer_started: bool = false,
+    /// Index into `repo_list` of the repo currently being scanned.
+    scan_repo_idx: usize = 0,
+    /// The current scan repo's id + path (held across the effect chain).
+    scan_repo_id: i64 = 0,
+    scan_repo_path_buf: [repos.max_path_bytes]u8 = undefined,
+    scan_repo_path_len: usize = 0,
+    /// Changed relative paths for the current repo (copied out of the
+    /// `git status` output, which does not survive the update).
+    scan_paths: [max_changed_files]ChangedPath = undefined,
+    scan_path_count: usize = 0,
+    /// Index of the file currently being processed within `scan_paths`.
+    scan_file_idx: usize = 0,
+    /// The current file's content (copied out of the readFile result so it
+    /// survives the diff spawn + insert), and its computed hash.
+    scan_content_buf: [max_content_bytes]u8 = undefined,
+    scan_content_len: usize = 0,
+    scan_hash_buf: [snapshots.hash_hex_len]u8 = undefined,
+    /// The last stored hash for the current file ("" when never stored).
+    scan_last_hash_buf: [snapshots.hash_hex_len]u8 = undefined,
+    scan_last_hash_len: usize = 0,
+
     pub fn capturePath(self: *const Model) []const u8 {
         return self.capture_path_buf[0..self.capture_path_len];
     }
@@ -147,6 +212,28 @@ pub const Model = struct {
     fn setCaptureSince(self: *Model, oid: []const u8) void {
         self.capture_since_len = @min(oid.len, self.capture_since_buf.len);
         @memcpy(self.capture_since_buf[0..self.capture_since_len], oid[0..self.capture_since_len]);
+    }
+
+    pub fn scanRepoPath(self: *const Model) []const u8 {
+        return self.scan_repo_path_buf[0..self.scan_repo_path_len];
+    }
+    fn setScanRepoPath(self: *Model, p: []const u8) void {
+        self.scan_repo_path_len = @min(p.len, self.scan_repo_path_buf.len);
+        @memcpy(self.scan_repo_path_buf[0..self.scan_repo_path_len], p[0..self.scan_repo_path_len]);
+    }
+    fn currentScanPath(self: *const Model) []const u8 {
+        if (self.scan_file_idx >= self.scan_path_count) return "";
+        return self.scan_paths[self.scan_file_idx].path();
+    }
+    fn scanContent(self: *const Model) []const u8 {
+        return self.scan_content_buf[0..self.scan_content_len];
+    }
+    fn scanLastHash(self: *const Model) []const u8 {
+        return self.scan_last_hash_buf[0..self.scan_last_hash_len];
+    }
+    fn setScanLastHash(self: *Model, h: []const u8) void {
+        self.scan_last_hash_len = @min(h.len, self.scan_last_hash_buf.len);
+        @memcpy(self.scan_last_hash_buf[0..self.scan_last_hash_len], h[0..self.scan_last_hash_len]);
     }
 
     pub fn usernameText(self: *const Model) []const u8 {
@@ -195,6 +282,11 @@ pub const Model = struct {
         "capturing",        "capture_idx",      "capture_repo_id",  "capture_path_buf",
         "capture_path_len", "capture_since_buf", "capture_since_len",
         "capturePath",      "captureSince",
+        // Working-tree snapshot scan (Task 5).
+        "scanning",           "scan_timer_started", "scan_repo_idx",   "scan_repo_id",
+        "scan_repo_path_buf", "scan_repo_path_len", "scan_paths",      "scan_path_count",
+        "scan_file_idx",      "scan_content_buf",   "scan_content_len", "scan_hash_buf",
+        "scan_last_hash_buf", "scan_last_hash_len", "scanRepoPath",
     };
     pub fn statusText(self: *const Model) []const u8 {
         return switch (self.stage) {
@@ -223,12 +315,22 @@ pub const Msg = union(enum) {
     capture_log_done: native_sdk.EffectExit, // `git log` output (collected)
     capture_write_done: native_sdk.EffectDbResult, // insert+bookkeeping result
 
+    // Working-tree snapshot scan (Task 5)
+    snapshot_tick: native_sdk.EffectTimer, // repeating scan timer fired
+    snap_status_done: native_sdk.EffectExit, // `git status` output (collected)
+    snap_lasthash_done: native_sdk.EffectDbResult, // last content_hash query
+    snap_content_done: native_sdk.EffectFileResult, // readFile current content
+    snap_diff_done: native_sdk.EffectExit, // `git diff` output (collected)
+    snap_write_done: native_sdk.EffectDbResult, // snapshot insert result
+
     // Delivered by effects/host, never bound as markup handlers.
     pub const view_unbound = .{
-        "stat_config",         "wrote_config",     "wrote_keep",
-        "git_check_done",      "repo_inserted",    "repos_listed",
+        "stat_config",         "wrote_config",       "wrote_keep",
+        "git_check_done",      "repo_inserted",      "repos_listed",
         "repo_removed",        "capture_since_done", "capture_log_done",
-        "capture_write_done",
+        "capture_write_done",  "snapshot_tick",      "snap_status_done",
+        "snap_lasthash_done",  "snap_content_done",  "snap_diff_done",
+        "snap_write_done",
     };
 };
 
@@ -341,6 +443,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // pass is already running, start indexing git history from the
             // top of the list.
             if (res.kind == .done and !model.capturing) startCapture(model, fx);
+            // Arm the repeating working-tree scan timer once the app is up.
+            if (res.kind == .done) armSnapshotTimer(model, fx);
         },
         .remove_repo => |id| {
             var params: [1]db.Value = undefined;
@@ -363,6 +467,24 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // the pass). Advance to the next repo.
             model.capture_idx += 1;
             captureNext(model, fx);
+        },
+
+        // ---- Working-tree snapshot scan (Task 5) ----
+        .snapshot_tick => |timer| {
+            // Ignore a rejected timer or a tick that lands mid-scan (the
+            // interval is the debounce/coalesce window).
+            if (timer.outcome == .rejected) return;
+            if (model.scanning) return;
+            startScan(model, fx);
+        },
+        .snap_status_done => |exit| snapStatusDone(model, exit, fx),
+        .snap_lasthash_done => |res| snapLastHashDone(model, res, fx),
+        .snap_content_done => |res| snapContentDone(model, res, fx),
+        .snap_diff_done => |exit| snapDiffDone(model, exit, fx),
+        .snap_write_done => {
+            // Snapshot committed (or failed) — either way, next file.
+            model.scan_file_idx += 1;
+            scanNextFile(model, fx);
         },
     }
 }
@@ -545,6 +667,205 @@ fn gitCheckDone(model: *Model, exit: native_sdk.EffectExit, fx: *Effects) void {
         .key = key_repo_insert,
         .statements = &.{repos.insertStatement(&params, path, name, fx.wallMs())},
         .on_result = Effects.dbMsg(.repo_inserted),
+    });
+}
+
+// --------------------------------------------- working-tree snapshot scan
+
+/// Arm the repeating scan timer exactly once. The interval is the
+/// debounce/coalesce window; each fire delivers `snapshot_tick`.
+fn armSnapshotTimer(model: *Model, fx: *Effects) void {
+    if (model.scan_timer_started) return;
+    model.scan_timer_started = true;
+    fx.startTimer(.{
+        .key = key_snap_timer,
+        .interval_ms = snapshot_interval_ms,
+        .mode = .repeating,
+        .on_fire = Effects.timerMsg(.snapshot_tick),
+    });
+}
+
+/// Begin a scan pass over the loaded repo list from the top.
+fn startScan(model: *Model, fx: *Effects) void {
+    if (model.scanning) return;
+    if (model.repo_count == 0) return;
+    model.scanning = true;
+    model.scan_repo_idx = 0;
+    scanNextRepo(model, fx);
+}
+
+/// Advance to the next active repo and spawn `git status` for it, or end
+/// the pass when the repo list is exhausted.
+fn scanNextRepo(model: *Model, fx: *Effects) void {
+    while (model.scan_repo_idx < model.repo_count) : (model.scan_repo_idx += 1) {
+        const entry = &model.repo_list[model.scan_repo_idx];
+        if (!entry.active) continue;
+        model.scan_repo_id = entry.id;
+        model.setScanRepoPath(entry.path());
+        model.scan_path_count = 0;
+        model.scan_file_idx = 0;
+        var argv_buf: [snapshots.max_argv][]const u8 = undefined;
+        const argv = snapshots.statusArgv(&argv_buf, model.scanRepoPath());
+        fx.spawn(.{
+            .key = key_snap_status,
+            .argv = argv,
+            .output = .collect,
+            .on_exit = Effects.exitMsg(.snap_status_done),
+        });
+        return;
+    }
+    model.scanning = false;
+}
+
+/// Parse `git status` output into the model's changed-path list, then start
+/// processing files one at a time.
+fn snapStatusDone(model: *Model, exit: native_sdk.EffectExit, fx: *Effects) void {
+    // A failed status (repo moved/removed) — skip this repo.
+    if (exit.reason != .exited or exit.code != 0) {
+        model.scan_repo_idx += 1;
+        scanNextRepo(model, fx);
+        return;
+    }
+    var changes_buf: [max_changed_files]snapshots.Change = undefined;
+    const changes = snapshots.parseStatus(&changes_buf, exit.output) catch {
+        model.scan_repo_idx += 1;
+        scanNextRepo(model, fx);
+        return;
+    };
+    model.scan_path_count = 0;
+    for (changes) |c| {
+        if (model.scan_path_count >= max_changed_files) break;
+        model.scan_paths[model.scan_path_count] = ChangedPath.fromChange(c);
+        model.scan_path_count += 1;
+    }
+    model.scan_file_idx = 0;
+    scanNextFile(model, fx);
+}
+
+/// Process the current file: query its last stored content hash. When the
+/// file list is exhausted, move on to the next repo.
+fn scanNextFile(model: *Model, fx: *Effects) void {
+    if (model.scan_file_idx >= model.scan_path_count) {
+        model.scan_repo_idx += 1;
+        scanNextRepo(model, fx);
+        return;
+    }
+    model.scan_last_hash_len = 0;
+    var params: [2]db.Value = undefined;
+    fx.dbQuery(.{
+        .key = key_snap_lasthash,
+        .sql = snapshots.select_last_hash_sql,
+        .params = snapshots.lastHashParams(&params, model.scan_repo_id, model.currentScanPath()),
+        .on_result = Effects.dbMsg(.snap_lasthash_done),
+    });
+}
+
+/// Received the file's last stored hash; on the query's terminal `.done`,
+/// read the file's current content.
+fn snapLastHashDone(model: *Model, res: native_sdk.EffectDbResult, fx: *Effects) void {
+    switch (res.kind) {
+        .page => {
+            var reader = db.PageReader.init(res.bytes) catch return;
+            var row: [1]db.ColumnValue = undefined;
+            if ((reader.next(&row) catch null)) |cols| {
+                if (cols.len > 0) {
+                    if (cols[0].asText()) |h| model.setScanLastHash(h);
+                }
+            }
+        },
+        .done => readCurrentFile(model, fx),
+        .exec => {},
+    }
+}
+
+/// Read the current changed file's content (absolute path = repo + rel).
+/// The joined path lives on this frame; readFile copies the path string at
+/// call time (like all effect string params), so a stack buffer is safe.
+fn readCurrentFile(model: *Model, fx: *Effects) void {
+    var abs_buf: [repos.max_path_bytes * 2 + 1]u8 = undefined;
+    const abs = std.fmt.bufPrint(&abs_buf, "{s}/{s}", .{ model.scanRepoPath(), model.currentScanPath() }) catch {
+        // Path too long to join — skip this file.
+        model.scan_file_idx += 1;
+        scanNextFile(model, fx);
+        return;
+    };
+    fx.readFile(.{
+        .key = key_snap_content,
+        .path = abs,
+        .on_result = Effects.fileMsg(.snap_content_done),
+    });
+}
+
+/// Got the file content. Hash it, compare to the last stored hash, and
+/// either skip (unchanged / too large / unreadable) or spawn `git diff`.
+fn snapContentDone(model: *Model, res: native_sdk.EffectFileResult, fx: *Effects) void {
+    // Skip anything we can't fully read: unreadable (deleted between
+    // status and read, permissions), truncated (over the SDK's file cap),
+    // or over our own content bound. This keeps stored content honest —
+    // we never snapshot a partial file.
+    if (res.outcome != .ok or res.bytes.len > max_content_bytes) {
+        model.scan_file_idx += 1;
+        scanNextFile(model, fx);
+        return;
+    }
+
+    // Copy content into owned storage (the result bytes don't survive the
+    // upcoming diff spawn + insert).
+    model.scan_content_len = @min(res.bytes.len, max_content_bytes);
+    @memcpy(model.scan_content_buf[0..model.scan_content_len], res.bytes[0..model.scan_content_len]);
+    snapshots.sha256Hex(model.scanContent(), &model.scan_hash_buf);
+
+    // Unchanged since the last snapshot? Skip (the core dedup rule).
+    if (model.scan_last_hash_len == snapshots.hash_hex_len and
+        std.mem.eql(u8, model.scanLastHash(), &model.scan_hash_buf))
+    {
+        model.scan_file_idx += 1;
+        scanNextFile(model, fx);
+        return;
+    }
+
+    // Untracked files have no git diff; snapshot them with an empty diff.
+    if (model.scan_paths[model.scan_file_idx].untracked) {
+        writeSnapshot(model, "", fx);
+        return;
+    }
+
+    var argv_buf: [snapshots.max_argv][]const u8 = undefined;
+    const argv = snapshots.diffArgv(&argv_buf, model.scanRepoPath(), model.currentScanPath());
+    fx.spawn(.{
+        .key = key_snap_diff,
+        .argv = argv,
+        .output = .collect,
+        .on_exit = Effects.exitMsg(.snap_diff_done),
+    });
+}
+
+/// Got the `git diff` output; write the snapshot with it (capped).
+fn snapDiffDone(model: *Model, exit: native_sdk.EffectExit, fx: *Effects) void {
+    const diff = if (exit.reason == .exited)
+        exit.output[0..@min(exit.output.len, max_diff_bytes)]
+    else
+        "";
+    writeSnapshot(model, diff, fx);
+}
+
+/// Insert one `file_snapshots` row for the current file. Params live on
+/// this frame (dbExec copies them at call time).
+fn writeSnapshot(model: *Model, diff: []const u8, fx: *Effects) void {
+    var params: [snapshots.insert_param_count]db.Value = undefined;
+    const stmt = snapshots.insertStatement(
+        &params,
+        model.scan_repo_id,
+        model.currentScanPath(),
+        model.scanContent(),
+        diff,
+        &model.scan_hash_buf,
+        fx.wallMs(),
+    );
+    fx.dbExec(.{
+        .key = key_snap_write,
+        .statements = &.{stmt},
+        .on_result = Effects.dbMsg(.snap_write_done),
     });
 }
 

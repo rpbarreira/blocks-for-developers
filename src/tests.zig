@@ -11,6 +11,7 @@ comptime {
     _ = @import("db.zig");
     _ = @import("repos.zig");
     _ = @import("git.zig");
+    _ = @import("snapshots.zig");
 }
 
 const canvas = native_sdk.canvas;

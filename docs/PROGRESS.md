@@ -1,9 +1,10 @@
 # Blocks for Developers — Progress & Resumption Notes
 
-Last updated: end of Task 4 (git history capture; not yet committed). Read this
-first when resuming. To continue: open the IDE on this repo folder
+Last updated: end of Task 5 (working-tree file-change capture; not yet committed).
+Task 4 is committed (`01969e5`). Read this first when resuming. To continue: open
+the IDE on this repo folder
 (`/Users/rpbarreira/Projects/GitHub/rpbarreira/blocks-for-developers`) and say
-"read docs/PROGRESS.md and continue from Task 5."
+"read docs/PROGRESS.md and continue from Task 6."
 
 ---
 
@@ -90,11 +91,14 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
 - [x] **Task 1 — Skeleton + data-dir bootstrap + username detection.**
 - [x] **Task 2 — SQLite schema + migrations.** (commit 33413f5)
 - [x] **Task 3 — Watched Repositories management.** (commit cef9fb1)
-- [x] **Task 4 — Git history capture.** DONE (not yet committed). New module
-  `src/git.zig` + capture wiring in `main.zig`. 40 tests pass; format verified
-  against real `git log` output from this repo.
-- [ ] **Task 5 — Working-tree file-change capture (debounced snapshots).** ← NEXT
-- [ ] Task 6 — Always-on tray + auto-start on login. (NOTE: tray needs Runtime
+- [x] **Task 4 — Git history capture.** (commit `01969e5`). Module `src/git.zig`
+  + capture wiring in `main.zig`. Format verified against real `git log` output.
+- [x] **Task 5 — Working-tree file-change capture (debounced snapshots).** DONE
+  (not yet committed). New module `src/snapshots.zig` + timer-driven scan wiring
+  in `main.zig`. 50 tests pass; VERIFIED END-TO-END via the automation GUI (see
+  the Task 5 section below).
+- [ ] **Task 6 — Always-on tray + auto-start on login.** ← NEXT (NOTE: tray needs
+  Runtime
   access — see "Open architectural item" below.)
 - [ ] Task 7 — Embeddings generation + vector search.
 - [ ] Task 8 — MCP server (spawned child) exposing memory tools.
@@ -144,6 +148,19 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
   `updateIndexedStatement(*[3]Value, repo_id, last_oid, now_ms)` +
   `select_last_indexed_sql` maintain `repos.last_indexed_oid/last_indexed_at`.
   All statement builders use the caller-owned param-buffer pattern (lifetime trap).
+- **snapshots.zig** — working-tree file capture, PURE builders + parsers (Task 5).
+  `statusArgv(argv, path)` -> `git -C <path> status --porcelain=v1 -z
+  --untracked-files=all`; `diffArgv(argv, path, rel)` -> `git -C <path> diff --
+  <rel>`. `StatusParser`/`parseStatus(out, bytes)` -> `[]Change{x, y, rel_path}`
+  over the NUL-delimited porcelain -z stream: each entry is `XY<space>path\0`; a
+  rename/copy (`R`/`C`) carries a SECOND NUL field (the original path) that the
+  parser consumes/discards (we snapshot the CURRENT path); deletions and empty
+  paths are skipped. `Change.isUntracked()/isDelete()/isRenameOrCopy()`.
+  `sha256Hex(content, *[64]u8)` writes the lowercase hex digest (KAT-tested).
+  `insertStatement(*[7]Value, repo_id, rel_path, content, diff, content_hash,
+  now_ms)` inserts a `file_snapshots` row (byte_len = content.len); `select_last_
+  hash_sql` + `lastHashParams(*[2]Value, repo_id, rel_path)` fetch the newest
+  stored hash so unchanged saves are skipped. Caller-owned param buffers throughout.
 - **repos.zig** — watched-repos data layer. `Repo{id,path,name,active,added_at}`
   `.fromRow(cols)`; `RepoEntry` (owned inline path/name copy) `.fromRepo/.path()/.name()`;
   `insert_sql/delete_sql/list_sql/exists_sql`; `insertStatement(*[3]Value, path, name, now_ms)`,
@@ -202,7 +219,9 @@ allowed; multi-statement files OK. FK cascades work (the writer sets foreign_key
    - `fx.startTimer/cancelTimer` — repeating/one-shot timers (for debounce/polling later).
    - Msg constructors: `Effects.lineMsg/exitMsg/fileMsg/responseMsg/dbMsg/timerMsg`.
    - Effect keys share ONE namespace across spawn/fetch/file; timer keys are separate.
-     Current keys used: 100-102 (bootstrap), 110-113 (repos), 120-122 (git capture).
+     Current spawn/fetch/file keys: 100-102 (bootstrap), 110-113 (repos),
+     120-122 (git capture), 130-134 (snapshot scan). TIMER keys (own namespace):
+     1 = the repeating working-tree scan tick.
 2. **ZIG LIFETIME TRAP (will recur!):** a function returning a struct with
    `.params = &.{ runtimeValue, ... }` DANGLES (temporary array dies at return) →
    causes `.rejected` exec and crashes. FIX: builder takes a caller-owned
@@ -306,15 +325,83 @@ lines parse correctly).
 - **Capture is only triggered on boot + after add** (no live polling yet). A timer
   (`fx.startTimer`) or the Task 6 always-on tray can drive periodic re-capture.
 
-## NEXT: Task 5 — Working-tree file-change capture (debounced snapshots)
+## Task 5 — Working-tree file-change capture (DONE — what was built)
 
-Goal: watch each active repo's working tree for file saves and record debounced,
-coalesced snapshots (full content + diff vs the previous snapshot) into
-`file_snapshots`. Use `fx.startTimer` for debounce/coalescing; SHA-256 the content
-to skip unchanged saves (schema `content_hash`). The `file_snapshots` table +
-`idx_snapshots_repo_path_time` index already exist. Keep the same shape as Task 4:
-a pure module (hashing/diff/path helpers, unit-tested) + thin effectful wiring in
-`main.zig`. Note: there is no built-in FS-watch effect surfaced yet — check the SDK
-effects surface (`src/runtime/effects.zig`) for a watch/notify effect; if none, a
-periodic timer that stats/scans tracked files (or `git status --porcelain` +
-`git diff`) is the fallback.
+**Design decision:** there is NO filesystem-watch effect in the SDK (confirmed by
+scanning `src/runtime/effects.zig` — no watch/notify/fs_event surface). So capture
+is POLL-based: a repeating `fx.startTimer` (interval `snapshot_interval_ms =
+15_000`) IS the debounce/coalesce window. Each tick asks git which working-tree
+files changed, reads each one's current content, and stores a snapshot into
+`file_snapshots` ONLY when the content hash differs from the last stored snapshot
+for that path (unchanged saves are skipped — the core dedup rule).
+
+Scan pipeline (all in `main.zig`, driven by the pure builders/parsers in
+`snapshots.zig`):
+1. `armSnapshotTimer` (once, on the first `repos_listed` `.done`) starts the
+   repeating timer (timer key 1, its OWN namespace) delivering `snapshot_tick`.
+2. `snapshot_tick`: ignored if `.rejected` or if a scan is already running (a tick
+   mid-scan is dropped — that IS the coalescing). Else `startScan` → `scanNextRepo`.
+3. `scanNextRepo` walks `repo_list`, skips inactive repos, and spawns
+   `snapshots.statusArgv` (`git status --porcelain=v1 -z`, key 130, `.collect`).
+4. `snapStatusDone` parses the NUL-delimited output with `parseStatus` into the
+   model-owned `scan_paths` list (copied out — the output bytes don't survive),
+   then `scanNextFile`.
+5. `scanNextFile` queries the file's last stored hash (`select_last_hash_sql`,
+   key 131). When the file list is exhausted, advances to the next repo.
+6. `snapLastHashDone` copies the last hash; on the query `.done`, `readCurrentFile`
+   reads the file (key 132, absolute path joined into a STACK buffer — readFile
+   copies the path at call time, so no arena leak).
+7. `snapContentDone`: skips if `outcome != .ok` (unreadable / deleted between
+   status and read) or the content is `.truncated`/over `max_content_bytes` (256K)
+   — we never store a partial file. Otherwise copies content into owned storage,
+   SHA-256s it; if the hash equals the last stored hash, SKIP. Untracked files get
+   an empty diff; tracked files spawn `snapshots.diffArgv` (`git diff -- <path>`,
+   key 133, `.collect`).
+8. `snapDiffDone` caps the diff at `max_diff_bytes` (256K) and `writeSnapshot`
+   inserts the `file_snapshots` row (key 134, frame-local params).
+9. `snap_write_done` advances the file index and continues.
+
+Bounds/state: `max_changed_files = 64` per repo per scan; content/diff capped at
+256K each. Model state: `scanning`, `scan_timer_started`, `scan_repo_idx`,
+`scan_repo_id`, `scan_repo_path_*` (+ `scanRepoPath`), `scan_paths[]` +
+`scan_path_count`, `scan_file_idx`, `scan_content_*`, `scan_hash_buf`,
+`scan_last_hash_*`. New type `ChangedPath` (inline path copy + `untracked` flag).
+NOTE (Zig): all Model FIELDS must precede all Model METHODS — interleaving a new
+field block after existing accessor fns fails with "declarations are not allowed
+between container fields." Group new fields with the other fields.
+
+Tests (50 total pass): `snapshots.zig` unit tests for `statusArgv`/`diffArgv`,
+`parseStatus` (modified+untracked, rename 2nd-field skip, deletion skip, empty),
+`sha256Hex` (KATs for "abc"/""), and `insertStatement`; plus a REAL in-memory-DB
+integration test (two snapshots of one file → last-hash query returns the newest,
+both versions retained, byte_len stored). The porcelain `-z` format was verified
+against a real repo (`XY path\0`, rename `R  new\0orig\0`).
+
+**Verified END-TO-END via the automation GUI:** added THIS repo as a watched repo,
+made working-tree changes, and confirmed against `app.db`: 4 changed files each got
+one snapshot (tracked files carried a real `diff`, untracked files an empty diff);
+a second tick added NOTHING (unchanged files skipped); editing one file produced
+exactly ONE new snapshot version (row count 4 → 5). Test data was cleared from
+`app.db` afterward.
+
+### Deferred / follow-ups
+- **Deletions**: a deleted working-tree file is skipped (no content to snapshot).
+  Recording a "file deleted" marker is a later concern.
+- **Rename provenance**: renames are snapshotted at the NEW path; the old path is
+  discarded (not linked as "renamed from"). Fine for content memory.
+- **Poll cadence**: fixed 15s. Could adapt (faster right after a save, idle-backoff)
+  or, if the SDK later exposes an FS-watch effect, switch off polling entirely.
+- **Non-git-tracked dirs**: capture is scoped to `git status` output, so files
+  ignored by `.gitignore` are NOT captured (intentional — matches "git-scoped
+  memory").
+- **Large files (>256K)**: skipped entirely (no partial snapshots).
+
+## NEXT: Task 6 — Always-on tray + auto-start on login
+
+See the "OPEN ARCHITECTURAL ITEM" above: the tray (`createTray`) and native
+dialogs are Runtime methods not reachable from the pure `update(model, msg, fx)`
+core. Plan: drop down to the lower-level App/Runtime layer to get Runtime access,
+add the tray + login-item (auto-start), and optionally restore a native folder
+picker for Watched Repositories. The capture loops (Task 4 git, Task 5 snapshots)
+already run continuously while the process is alive, so "always-on" is mostly about
+keeping the process alive in the tray and starting it at login.
