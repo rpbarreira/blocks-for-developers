@@ -1,9 +1,9 @@
 # Blocks for Developers — Progress & Resumption Notes
 
-Last updated: end of Task 3 (commit `cef9fb1`). Read this first when resuming.
-To continue: open the IDE on this repo folder
+Last updated: end of Task 4 (git history capture; not yet committed). Read this
+first when resuming. To continue: open the IDE on this repo folder
 (`/Users/rpbarreira/Projects/GitHub/rpbarreira/blocks-for-developers`) and say
-"read docs/PROGRESS.md and continue from Task 4."
+"read docs/PROGRESS.md and continue from Task 5."
 
 ---
 
@@ -90,8 +90,10 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
 - [x] **Task 1 — Skeleton + data-dir bootstrap + username detection.**
 - [x] **Task 2 — SQLite schema + migrations.** (commit 33413f5)
 - [x] **Task 3 — Watched Repositories management.** (commit cef9fb1)
-- [ ] **Task 4 — Git history capture.** ← NEXT (not started; only sketched a plan).
-- [ ] Task 5 — Working-tree file-change capture (debounced snapshots).
+- [x] **Task 4 — Git history capture.** DONE (not yet committed). New module
+  `src/git.zig` + capture wiring in `main.zig`. 40 tests pass; format verified
+  against real `git log` output from this repo.
+- [ ] **Task 5 — Working-tree file-change capture (debounced snapshots).** ← NEXT
 - [ ] Task 6 — Always-on tray + auto-start on login. (NOTE: tray needs Runtime
   access — see "Open architectural item" below.)
 - [ ] Task 7 — Embeddings generation + vector search.
@@ -127,6 +129,21 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
   (`init(bytes)` -> `rowCount()`/`columnCount()`/`next(out []ColumnValue)`;
   `ColumnValue.asInt/asText/asBlob/isNull`). Page bytes are valid ONLY during the
   update that received the EffectDbResult — copy anything kept.
+- **git.zig** — git history capture, PURE builders + parsers (Task 4).
+  `logArgv(argv, fmt_buf, range_buf, path, since_oid)` builds
+  `git -C <path> log --reverse --numstat --format=<log_format> [<since>..HEAD]`.
+  `log_format` frames each commit with control chars: RS `0x1e` starts a record,
+  US `0x1f` between the six fields (`%H %an %ae %aI %s %b`), trailing US closes the
+  body; `--numstat` lines (`add<TAB>del<TAB>path`, `-` for binary) follow until the
+  next RS. `LogParser`/`parseLog(out, bytes)` -> `[]Commit`
+  `{oid, author_name, author_email, author_date_iso, subject, body, files_changed,
+  insertions, deletions}` (slices borrow the input — copy what's kept).
+  `isoToUnixMs(iso, fallback)` converts `%aI` to Unix-ms (civil-days algorithm,
+  handles `Z` and `+HH:MM`/`+HHMM`). `insertStatement(*[11]Value, repo_id, commit,
+  occurred_ms, now_ms)` builds the `events` INSERT (kind='commit'), and
+  `updateIndexedStatement(*[3]Value, repo_id, last_oid, now_ms)` +
+  `select_last_indexed_sql` maintain `repos.last_indexed_oid/last_indexed_at`.
+  All statement builders use the caller-owned param-buffer pattern (lifetime trap).
 - **repos.zig** — watched-repos data layer. `Repo{id,path,name,active,added_at}`
   `.fromRow(cols)`; `RepoEntry` (owned inline path/name copy) `.fromRepo/.path()/.name()`;
   `insert_sql/delete_sql/list_sql/exists_sql`; `insertStatement(*[3]Value, path, name, now_ms)`,
@@ -185,7 +202,7 @@ allowed; multi-statement files OK. FK cascades work (the writer sets foreign_key
    - `fx.startTimer/cancelTimer` — repeating/one-shot timers (for debounce/polling later).
    - Msg constructors: `Effects.lineMsg/exitMsg/fileMsg/responseMsg/dbMsg/timerMsg`.
    - Effect keys share ONE namespace across spawn/fetch/file; timer keys are separate.
-     Current keys used: 100-102 (bootstrap), 110-113 (repos).
+     Current keys used: 100-102 (bootstrap), 110-113 (repos), 120-122 (git capture).
 2. **ZIG LIFETIME TRAP (will recur!):** a function returning a struct with
    `.params = &.{ runtimeValue, ... }` DANGLES (temporary array dies at return) →
    causes `.rejected` exec and crashes. FIX: builder takes a caller-owned
@@ -232,38 +249,72 @@ path is WebView/JS only. So:
 
 ---
 
-## NEXT: Task 4 — Git history capture (plan)
+## Task 4 — Git history capture (DONE — what was built)
 
-Goal: for each watched repo, read commit history + diffs + branch/checkout events
-into the `events` table INCREMENTALLY (only new activity since last index), using
-`fx.spawn` of `git` (proven in the spike). Track progress with
-`repos.last_indexed_oid` (and `last_indexed_at`).
+Commit history for each active watched repo is indexed INCREMENTALLY into the
+`events` table (kind='commit') via `fx.spawn` of `git`. Progress is tracked in
+`repos.last_indexed_oid` + `last_indexed_at`. Diffs/branch/checkout events were
+DEFERRED (schema allows NULL diff; branch/checkout is lower priority for v1) —
+see "Deferred / follow-ups" below.
 
-Suggested approach:
-- New module `src/git.zig`: PURE argv builders + PURE output PARSERS (unit-testable
-  without spawning), keeping the effectful spawn wiring thin in main.zig.
-- Commits: `git -C <path> log --reverse --format=<fmt> [<since>..HEAD]` (oldest-first
-  so `last_indexed_oid` advances correctly; `<since>` = last_indexed_oid when present,
-  else full history). Use control-char delimiters to parse robustly regardless of
-  message content, e.g. fields separated by `%x1f` (unit sep) and records by `%x1e`
-  (record sep). Suggested format fields: `%H` (hash) `%an` `%ae` `%aI` (author ISO
-  date) `%s` (subject) `%b` (body). Consider adding `--numstat` (or a `--shortstat`
-  pass) to fill files_changed/insertions/deletions.
-- Per-commit full diff (`diff` column) can be fetched lazily/separately
-  (`git show <oid>`), or deferred — the schema allows NULL diff; decide during impl.
-- Branch/checkout events: lower priority for v1; commits are the core. Can capture
-  current branches via `git branch` / reflog later if time allows.
-- Insert parsed commits with `insertStatement`-style caller-owned param buffers
-  (remember the lifetime trap!). Respect the UNIQUE(repo_id, commit_oid) index —
-  inserting a duplicate should be avoided (query max indexed, or ignore constraint).
-- After indexing a repo, UPDATE repos.last_indexed_oid + last_indexed_at.
-- Trigger: index each active repo on boot after the repo list loads, and after a
-  repo is added (Task 3's add flow already knows when a repo is added).
+Capture pipeline (all in `main.zig`, driven by the pure builders/parsers in
+`git.zig`):
+1. `repos_listed` terminal `.done` (on boot after the list loads, and again after
+   a repo is added) calls `startCapture` → `captureNext`.
+2. `captureNext` walks `repo_list` from `capture_idx`, skips inactive repos, and
+   for the current repo `dbQuery`s `select_last_indexed_sql` (key 120) to learn
+   where it left off.
+3. `captureSinceDone` copies the `last_indexed_oid` (empty = never indexed), then
+   on the query's terminal `.done` calls `spawnCaptureLog`.
+4. `spawnCaptureLog` (key 121) spawns `git.logArgv(...)` with `.output = .collect`.
+5. `captureLogDone` parses the collected stdout with `git.parseLog` (up to
+   `max_commits_per_pass = 128` commits), builds ONE `dbExec` batch (key 122) of an
+   INSERT per commit + a final `updateIndexedStatement` setting `last_indexed_oid`
+   to the newest (last, since `--reverse`) commit's oid, all params in
+   frame-local buffers (lifetime trap). A non-zero git exit or empty result just
+   advances to the next repo.
+6. `capture_write_done` advances `capture_idx` and calls `captureNext`; when the
+   list is exhausted, `capturing` is cleared.
 
-Tests: build a fixture git repo with known commits (create in a tmp dir inside the
-test, or a helper), run the parser over real `git log` output captured as a fixture
-string, assert the parsed commits. Also a real-DB integration test: insert parsed
-commits and query them back; verify incremental re-run adds nothing new.
+Idempotency: a re-run asks git only for `<since>..HEAD`, so already-indexed repos
+return nothing and are skipped. The UNIQUE(repo_id, commit_oid) partial index is
+the backstop (a duplicate insert → `.constraint`), which the integration test
+exercises.
 
-I had started only by creating a throwaway fixture at /tmp/blocks_t4_repo to design
-the parser format — no code written yet. That tmp dir may be gone; recreate as needed.
+Model state added: `capturing`, `capture_idx`, `capture_repo_id`,
+`capture_path_buf/len` (+ `capturePath`), `capture_since_buf/len` (+ `captureSince`).
+Msg arms: `capture_since_done`, `capture_log_done`, `capture_write_done`.
+
+Tests (40 total pass): `git.zig` unit tests for `logArgv` (with/without range),
+`parseLog` (single, multi + multi-line body, empty, binary `-` counts, no-change
+commit), `isoToUnixMs` (UTC / `+HH:MM` offset / malformed fallback), and the two
+statement builders; plus two REAL in-memory-DB integration tests (parse→insert→
+read-back with correct numstat totals + bookkeeping oid, and the duplicate-commit
+constraint). The exact `--format` string was also verified against real
+`git log` output from THIS repo (multi-line bodies and binary-file `-\t-` numstat
+lines parse correctly).
+
+### Deferred / follow-ups (candidates for later polish)
+- **Per-commit full diff** (`events.diff`): still NULL. Fetch lazily (`git show
+  <oid>`) when a commit is opened, or add a `--patch` pass — decide when the chat/
+  retrieval UI needs it.
+- **Branch/checkout events**: not captured yet (commits are the core for v1).
+- **>128 new commits in one pass**: bookkeeping advances to the last written oid,
+  so the REST is captured on the NEXT pass (boot/add) — full history is still
+  captured, just across passes. If a repo import needs to complete in one go,
+  loop the log spawn until `parseLog` returns fewer than the cap.
+- **Capture is only triggered on boot + after add** (no live polling yet). A timer
+  (`fx.startTimer`) or the Task 6 always-on tray can drive periodic re-capture.
+
+## NEXT: Task 5 — Working-tree file-change capture (debounced snapshots)
+
+Goal: watch each active repo's working tree for file saves and record debounced,
+coalesced snapshots (full content + diff vs the previous snapshot) into
+`file_snapshots`. Use `fx.startTimer` for debounce/coalescing; SHA-256 the content
+to skip unchanged saves (schema `content_hash`). The `file_snapshots` table +
+`idx_snapshots_repo_path_time` index already exist. Keep the same shape as Task 4:
+a pure module (hashing/diff/path helpers, unit-tested) + thin effectful wiring in
+`main.zig`. Note: there is no built-in FS-watch effect surfaced yet — check the SDK
+effects surface (`src/runtime/effects.zig`) for a watch/notify effect; if none, a
+periodic timer that stats/scans tracked files (or `git status --porcelain` +
+`git diff`) is the fallback.
