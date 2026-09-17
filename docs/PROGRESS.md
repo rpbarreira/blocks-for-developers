@@ -1,10 +1,11 @@
 # Blocks for Developers — Progress & Resumption Notes
 
-Last updated: end of Task 7 (embeddings + vector search; not yet committed).
-Committed so far: Task 4 (`01969e5`), Task 5 (`56ae2a2`), Task 6 (`c2afa1b`). Read
-this first when resuming. To continue: open the IDE on this repo folder
+Last updated: end of Task 8 (MCP server child; not yet committed).
+Committed so far: Task 4 (`01969e5`), Task 5 (`56ae2a2`), Task 6 (`c2afa1b`),
+Task 7 (`e27eb0a`). Read this first when resuming. To continue: open the IDE on
+this repo folder
 (`/Users/rpbarreira/Projects/GitHub/rpbarreira/blocks-for-developers`) and say
-"read docs/PROGRESS.md and continue from Task 8."
+"read docs/PROGRESS.md and continue from Task 9."
 
 ---
 
@@ -100,14 +101,20 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
   Module `src/tray.zig` + declarative tray wiring in `main.zig`. Verified E2E via
   automation. The "OPEN ARCHITECTURAL ITEM" is RESOLVED (see the resolved-item
   section) — no Runtime rewrite was needed.
-- [x] **Task 7 — Embeddings generation + vector search.** DONE (not yet committed).
+- [x] **Task 7 — Embeddings generation + vector search.** (commit `e27eb0a`).
   New module `src/embeddings.zig` + a generation pass + search helpers wired into
-  `main.zig`. 74 tests pass; VERIFIED END-TO-END via automation (7 events + 3
-  snapshots embedded, 10 vectors + 10 FTS rows, dedup held, live search returned
-  the right memory). v1 uses a DETERMINISTIC in-process hashing embedder — llama.cpp
-  is deferred to Task 9 (see the Task 7 section).
-- [ ] **Task 8 — MCP server (spawned child) exposing memory tools.** ← NEXT
-- [ ] Task 9 — Local model management + llama.cpp runtime.
+  `main.zig`. VERIFIED END-TO-END via automation (7 events + 3 snapshots embedded,
+  10 vectors + 10 FTS rows, dedup held, live search returned the right memory).
+  v1 uses a DETERMINISTIC in-process hashing embedder — llama.cpp is deferred to
+  Task 9 (see the Task 7 section). NOTE: in Task 8 the pure embedder was extracted
+  into `src/embed_core.zig`; `embeddings.zig` now re-exports it.
+- [x] **Task 8 — MCP server (spawned child) exposing memory tools.** DONE (not yet
+  committed). New standalone binary `src/mcp_server.zig` (+ `mcp/build.zig`) and a
+  pure core `src/mcp/` (protocol + tools) + `src/embed_core.zig`; spawn/health wired
+  into `main.zig`. 100 tests pass; VERIFIED END-TO-END (app spawned the child, added
+  this repo, and `get_commits`/`get_activity`/`search_memory` returned correct real
+  data over HTTP). See the Task 8 section.
+- [ ] **Task 9 — Local model management + llama.cpp runtime.** ← NEXT
 - [ ] Task 10 — Chat experience wired to model + MCP.
 - [ ] Task 11 — Single-click summaries.
 - [ ] Task 12 — Materials (snippets) screen + chat cross-linking.
@@ -189,6 +196,36 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
   `fts_search_sql` (memory_fts MATCH `?1` ORDER BY rank LIMIT `?2`). Ranking:
   `Hit{kind,source_id,score}`, `considerTopK` (alloc-free top-k), and `rankPage`
   (decode + score a `select_vectors_sql` page against a query vector).
+- **embed_core.zig** — SDK-FREE embedding core (Task 8), std-only. The vector math
+  (`vectorBytes`/`vectorFromBytes`/`normalize`/`dot`/`cosine`), the `hash-v1` hashing
+  `embed`/`embedValue`, the `Tokenizer`, `SourceKind`/`kindFromName`, the text
+  builders (`eventText`/`fileSnapshotText`), the top-k `Hit`/`considerTopK`, and
+  `model_id`/`dim`/`select_vectors_sql`. Extracted OUT of `embeddings.zig` so the
+  standalone MCP server (which links libsqlite3, never `native_sdk`) shares the EXACT
+  same embedder — the index is never re-embedded across the process boundary.
+  `embeddings.zig` re-exports every symbol here, so app-side call sites are unchanged.
+- **mcp/protocol.zig** — PURE MCP/JSON-RPC core (Task 8), std-only. `parseRequest`
+  (id + method + raw `params`), `isNotification`; a hand-rolled `JsonWriter` (exact
+  escaping/field order, works in both builds); response builders `writeError`,
+  `writeInitializeResult` (protocol `2025-06-18`, server `blocks-memory`),
+  `writeToolsListResult` (the 3 tool descriptors + JSON Schemas), `writeToolResult`
+  (wraps text as MCP `content`). `tools` table + `findTool`.
+- **mcp/tools.zig** — PURE memory-tool query builders + JSON shapers (Task 8). Arg
+  parsing (`parseCallArguments`, `parseCommitsArgs`/`parseActivityArgs`/
+  `parseSearchArgs` with clamped limits + sentinel time bounds); the SQL
+  (`commits_sql_all`/`_by_repo`, `activity_sql` = commits∪snapshots, `search_event_
+  row_sql`/`search_snapshot_row_sql`); row→JSON writers (`writeCommitRow`/
+  `writeActivityRow`/`writeSearchHit` + `begin*`/`endList`); `excerpt()` for snippets.
+- **mcp/mcp_tools.zig** — SDK-side (test-only) integration harness for the tools:
+  drives each tool's SQL through a REAL in-memory SQLite via the effects channel,
+  decodes with `db.PageReader`, and shapes with the pure writers — the authoritative
+  correctness check the standalone binary mirrors. Not imported by the app or sidecar.
+- **mcp_server.zig** — the STANDALONE MCP server binary (Task 8), NO `native_sdk`.
+  Minimal libsqlite3 `extern "c"` bindings + a `Db.openReadOnly`/`query` shell; an
+  HTTP accept loop (`std.Io.net` + `std.http.Server`) on `127.0.0.1`; a JSON-RPC
+  dispatcher (`handleRpc`) routing `initialize`/`tools/list`/`tools/call`/`ping` into
+  the pure core; `runGetCommits`/`runGetActivity`/`runSearchMemory`. Built by
+  `mcp/build.zig` (plain `zig build`, OUTSIDE the SDK graph). See the Task 8 section.
 - **repos.zig** — watched-repos data layer. `Repo{id,path,name,active,added_at}`
   `.fromRow(cols)`; `RepoEntry` (owned inline path/name copy) `.fromRepo/.path()/.name()`;
   `insert_sql/delete_sql/list_sql/exists_sql`; `insertStatement(*[3]Value, path, name, now_ms)`,
@@ -249,8 +286,9 @@ allowed; multi-statement files OK. FK cascades work (the writer sets foreign_key
    - Effect keys share ONE namespace across spawn/fetch/file; timer keys are separate.
      Current spawn/fetch/file/host keys: 100-102 (bootstrap), 110-113 (repos),
      120-122 (git capture), 130-134 (snapshot scan), 140-141 (launch-at-login host
-     requests), 150-152 (embedding generation). TIMER keys (own namespace):
-     1 = the repeating working-tree scan tick.
+     requests), 150-152 (embedding generation), 160-161 (MCP child spawn + health
+     fetch). TIMER keys (own namespace): 1 = the repeating working-tree scan tick,
+     2 = the one-shot MCP health-check delay.
 2. **ZIG LIFETIME TRAP (will recur!):** a function returning a struct with
    `.params = &.{ runtimeValue, ... }` DANGLES (temporary array dies at return) →
    causes `.rejected` exec and crashes. FIX: builder takes a caller-owned
@@ -557,14 +595,103 @@ afterward.
   the un-embedded queries naturally pick every row up (they filter by model), so a
   pass simply re-runs; no migration needed.
 
-## NEXT: Task 8 — MCP server (spawned child) exposing memory tools
+## Task 8 — MCP server (spawned child) exposing memory tools (DONE — what was built)
 
-Per the locked decisions the MCP server runs as a SPAWNED CHILD PROCESS (the SDK
-has no in-process socket-listener effect, only a `fetch` client), and the app's LLM
-reaches it over HTTP. Expose the memory tools — `search_memory` (vector + FTS
-hybrid, built on `embeddings.rankPage` + `fts_search_sql`), `get_activity`,
-`get_commits` — reading the same `app.db`. Decide the child's language/runtime and
-how it opens the DB (the runner owns `app.db`; the child likely opens it read-only
-or via a shared path). Keep the tool logic thin and lean on the queries already in
-`git.zig`/`snapshots.zig`/`embeddings.zig`. The spike proved subprocess spawn +
-localhost HTTP fetch, so the transport is known-good.
+The developer memory is now exposed to an LLM over MCP. The server is a SPAWNED
+CHILD PROCESS (locked decision: the SDK has a `fetch` CLIENT but NO in-process
+socket-listener effect), it opens the same `app.db` READ-ONLY, and speaks JSON-RPC
+2.0 over HTTP on `127.0.0.1`. Three tools: `search_memory` (vector + keyword),
+`get_activity` (commits ∪ file snapshots), `get_commits`.
+
+**KEY DECISION — the child's runtime + how it opens the DB (read before Task 9/10):**
+- The child is a STANDALONE Zig binary (`src/mcp_server.zig`) with NO `native_sdk`
+  dependency, built by its OWN `mcp/build.zig` via plain `zig build` — deliberately
+  OUTSIDE the SDK's generated/ejected build graph. Why not the SDK's sidecar seam?
+  The SDK's `{app}_services` child is TypeScript-core only (`ts_stage` in the
+  framework `build/app.zig`); a zig-core app can't use it without ejecting the whole
+  build. Why not import the SDK's relational store? It's only wired into the
+  app-runtime build graph. So the child links the SYSTEM **libsqlite3** (ships on
+  every macOS) and opens `app.db` with `sqlite3_open_v2(..., SQLITE_OPEN_READONLY)`.
+  The app runtime remains the SOLE WRITER; the child only reads. `app.db` is a plain
+  SQLite file (the spike confirmed this), so this is clean.
+- To keep the SAME embedder on both sides of the process boundary (so the index is
+  never re-embedded), the pure embedding math was extracted into `src/embed_core.zig`
+  (std-only); both `embeddings.zig` (app) and `mcp_server.zig` (child) use it. Same
+  `hash-v1`, same vectors.
+- **Transport shape:** Streamable HTTP, v1 subset — a POST carries one JSON-RPC
+  request and the response body is the JSON-RPC reply (no SSE/GET stream yet; a GET
+  returns 405). Protocol version advertised: `2025-06-18`. The app's own LLM is the
+  only v1 consumer, over loopback.
+
+Layering (all tool LOGIC is PURE and unit-tested; only I/O lives in the binary):
+- `mcp/protocol.zig` — JSON-RPC parse + a hand-rolled `JsonWriter` + the
+  `initialize`/`tools/list`/tool-result payloads. `mcp/tools.zig` — arg parsing +
+  SQL + row→JSON shapers. Both are std-only and exercised by `native test`
+  (`mcp/mcp_tools.zig` runs them against a REAL in-memory SQLite via the effects
+  channel). `mcp_server.zig` re-runs the IDENTICAL SQL through its libsqlite3 shell.
+
+The binary (`mcp/zig-out/bin/blocks-mcp`), usage
+`blocks-mcp --db <app.db> [--port N] [--endpoint <file>]`:
+1. Opens the DB read-only; builds an `Io` from `std.process.Init` (Zig 0.16).
+2. Binds `127.0.0.1` — the requested port (default `39017`), scanning up to 32
+   ports on `AddressInUse` — and writes `{"port":N,"pid":P}` to
+   `<db-dir>/mcp-endpoint.json` so the parent can discover it.
+3. Accept loop: each POST body is parsed once, dispatched, and answered.
+   `initialize` → capabilities + serverInfo; `tools/list` → the 3 descriptors;
+   `tools/call` → run the tool's SQL, shape rows to JSON, wrap as MCP text content;
+   `ping` → `{}`; notifications → 202; unknown method → JSON-RPC -32601.
+   `search_memory` embeds the query with `embed_core`, ranks ALL stored vectors for
+   `hash-v1` (top-k `considerTopK`), then fetches each hit's display row.
+
+App wiring (`main.zig`, keys 160/161, timer key 2): on the first `repos_listed`
+`.done` (app.db exists + migrations applied), `startMcpServer` spawns the child with
+`--db <paths.db> --port 39017` (`.collect`; a child exit delivers `mcp_exit` →
+`mcp_failed`, non-fatal — the app keeps running). A one-shot 400 ms timer then fires
+`healthCheckMcp`, which POSTs a `tools/list` to `http://127.0.0.1:39017/`; a 200
+sets `model.mcp_ready`. Model flags: `mcp_started`/`mcp_ready`/`mcp_failed`.
+
+Tests (100 total pass): pure `protocol.zig` tests (envelope parse, escaping, each
+payload is valid JSON, error shape) + pure `tools.zig` tests (arg clamping, SQL
+selection, each shaper round-trips through `std.json`) + `mcp_tools.zig` real-DB
+integration tests (get_commits newest-first + repo filter, get_activity union +
+time window, search_memory vector ranking + FTS arm) + `embed_core.zig` unit tests
++ four `main.zig` update-arm tests (health 200 → ready; failed health → not ready
+non-fatal; child exit → failed; rejected timer tick ignored).
+
+**Verified END-TO-END** against the real running app: `native dev -Dautomation=true`
+spawned the child (endpoint file written with pid+port); added THIS repo via the
+automation GUI; after capture+embed (`app.db`: 1 repo, 8 events, 18 embeddings, 18
+FTS rows) a `curl` POST to the app-spawned child returned real `get_commits` (Task
+7/6/5 with correct OIDs/authors/stats), and `search_memory "embeddings vector
+search"` ranked the "Task 7: Embeddings…" commit first (0.20) then the
+`src/embed_core.zig` snapshot. Also confirmed the raw protocol: `initialize`,
+`tools/list`, `notifications/initialized`→202, unknown→-32601, `ping`→`{}`, GET→405.
+Test data cleared from `app.db` and the endpoint file removed afterward.
+
+### Deferred / follow-ups
+- **Packaged-build binary path**: the app spawns the child by the repo-relative
+  path `mcp/zig-out/bin/blocks-mcp` (works under `native dev`, whose cwd is the repo
+  root). A packaged `.app` ships the binary in the bundle; locating it there needs
+  the bundle/executable dir, and the SDK effects channel has NO self-path/exe-dir
+  helper today. Options for later: add a UiApp seam for it, pass the path via env at
+  package time, or have the app write a launcher. `fx.spawn` argv[0] resolves via
+  the child's PATH, so a bare name won't do — an absolute path is required.
+- **Build integration**: the sidecar is built with a SEPARATE `zig build --build-file
+  mcp/build.zig` step; it is NOT hooked into `native build`/`native package` yet, so
+  packaging must invoke it (and copy the binary into the bundle). Wire this when
+  Task 13 does packaging/polish.
+- **Health-check retry/backoff**: a failed first health check leaves `mcp_ready`
+  false with no retry (the 400 ms delay is usually enough). Task 10 (chat) should add
+  retry/backoff and surface `mcp_ready`/`mcp_failed` in the UI, and restart the child
+  if it dies (`mcp_exit`).
+- **search_memory hybrid fusion**: v1 ranks by VECTOR similarity only (the FTS arm
+  exists in `embeddings`/`embed_core` + is integration-tested, but the tool doesn't
+  yet blend FTS into the ranked list). Reciprocal-rank fusion is the natural next
+  step once real neural embeddings (Task 9) raise the bar.
+- **Streamable-HTTP GET/SSE**: not implemented (v1 is POST-only; GET→405). Only
+  needed if a non-app MCP client wants server-initiated streaming.
+- **Auth**: none — the server binds loopback only and is single-user. If it ever
+  binds beyond `127.0.0.1`, add a token (e.g. written next to the endpoint file).
+- **get_commits diff/body**: commits expose subject + stats, not the full diff
+  (still NULL in `events.diff`, a Task 4 deferral). Add a `get_commit_diff` tool or a
+  `diff` field once capture stores diffs.

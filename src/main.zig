@@ -70,6 +70,24 @@ const key_login_set: u64 = 141; // enable/disable launch-at-login
 const key_embed_events: u64 = 150; // query un-embedded events
 const key_embed_snaps: u64 = 151; // query un-embedded file snapshots
 const key_embed_write: u64 = 152; // insert embeddings + fts rows
+// MCP server child process (Task 8). Share the spawn/fetch/file key space.
+const key_mcp_spawn: u64 = 160; // spawn the blocks-mcp child
+const key_mcp_health: u64 = 161; // fetch tools/list to confirm it's up
+
+/// The loopback port the MCP child binds (passed explicitly so the app
+/// knows where to reach it without first reading the endpoint file).
+const mcp_port: u16 = 39_017;
+/// argv[0] for the MCP child. Under `native dev` the app's cwd is the repo
+/// root, so this repo-relative path resolves. A packaged build ships the
+/// binary beside the app; locating it there needs the bundle path (no
+/// self-path effect exists yet) and is a documented Task 8 follow-up.
+const mcp_binary_path = "mcp/zig-out/bin/blocks-mcp";
+/// The MCP tools/list request body used as a health check once the child
+/// has had a moment to bind its port.
+const mcp_health_body =
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}";
+/// One-shot delay before the health check, giving the child time to bind.
+const mcp_health_delay_ms: u64 = 400;
 
 /// How many source rows to embed per query batch. Each row contributes a
 /// 256-f32 vector + an FTS insert; two statements/row, all frame-local.
@@ -86,6 +104,7 @@ const host_login_set = "native-sdk.launch-at-login.set";
 const main_window_label = "main";
 // Timer keys live in their OWN namespace (never collide with the above).
 const key_snap_timer: u64 = 1; // the repeating scan/debounce tick
+const key_mcp_health_timer: u64 = 2; // one-shot delay before the MCP health check
 
 /// How often the working-tree scan runs. This interval IS the debounce /
 /// coalesce window: edits made between ticks collapse into the single
@@ -247,6 +266,17 @@ pub const Model = struct {
     /// => this phase is drained. The query's own `.done` is a no-op.
     embed_last_rows: usize = 0,
 
+    // ---- MCP server child process (Task 8) ----
+    /// True once the MCP child has been spawned this session (so we spawn
+    /// it exactly once, on boot).
+    mcp_started: bool = false,
+    /// True after a health-check fetch confirmed the child answers
+    /// `tools/list` — the memory tools are reachable over HTTP.
+    mcp_ready: bool = false,
+    /// True if the child exited or failed to spawn. Surfaced for later UI;
+    /// the app still runs (the MCP server is optional for the core UX).
+    mcp_failed: bool = false,
+
     pub fn capturePath(self: *const Model) []const u8 {
         return self.capture_path_buf[0..self.capture_path_len];
     }
@@ -339,6 +369,8 @@ pub const Model = struct {
         "login_enabled",      "login_supported",
         // Embedding generation (Task 7).
         "embedding",          "embed_phase",       "embed_last_rows",
+        // MCP server child process (Task 8).
+        "mcp_started",        "mcp_ready",         "mcp_failed",
     };
     pub fn statusText(self: *const Model) []const u8 {
         return switch (self.stage) {
@@ -387,6 +419,11 @@ pub const Msg = union(enum) {
     embed_snaps_page: native_sdk.EffectDbResult, // un-embedded snapshots query
     embed_write_done: native_sdk.EffectDbResult, // embeddings+fts insert result
 
+    // MCP server child process (Task 8)
+    mcp_exit: native_sdk.EffectExit, // the child process exited/failed to spawn
+    mcp_health_tick: native_sdk.EffectTimer, // delay elapsed -> run the health check
+    mcp_health_done: native_sdk.EffectResponse, // tools/list health-check response
+
     // Delivered by effects/host, never bound as markup handlers.
     pub const view_unbound = .{
         "stat_config",         "wrote_config",       "wrote_keep",
@@ -397,6 +434,7 @@ pub const Msg = union(enum) {
         "snap_write_done",     "open_window",        "quit_app",
         "toggle_login",        "login_status_done",  "login_set_done",
         "embed_events_page",   "embed_snaps_page",   "embed_write_done",
+        "mcp_exit",            "mcp_health_tick",    "mcp_health_done",
     };
 };
 
@@ -519,6 +557,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (res.kind == .done and !model.capturing) startCapture(model, fx);
             // Arm the repeating working-tree scan timer once the app is up.
             if (res.kind == .done) armSnapshotTimer(model, fx);
+            // Start the MCP server child once, now that app.db exists and
+            // the runner has applied migrations (the list query proves it).
+            if (res.kind == .done) startMcpServer(model, fx);
         },
         .remove_repo => |id| {
             var params: [1]db.Value = undefined;
@@ -583,6 +624,29 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .embed_events_page => |res| embedEventsPage(model, res, fx),
         .embed_snaps_page => |res| embedSnapsPage(model, res, fx),
         .embed_write_done => |res| embedWriteDone(model, res, fx),
+
+        // ---- MCP server child process (Task 8) ----
+        .mcp_exit => |exit| {
+            // The child exited or failed to spawn. Mark it down; the app
+            // keeps running (the MCP server is optional for the core UX,
+            // and Task 10's chat will surface/retry it).
+            _ = exit;
+            model.mcp_ready = false;
+            model.mcp_failed = true;
+        },
+        .mcp_health_tick => |timer| {
+            if (timer.outcome == .rejected) return;
+            healthCheckMcp(fx);
+        },
+        .mcp_health_done => |res| {
+            // A 200 with a JSON-RPC result means the tools are reachable.
+            if (res.outcome == .ok and res.status == 200) {
+                model.mcp_ready = true;
+                model.mcp_failed = false;
+            }
+            // A failure is not fatal: the child may still be binding. We
+            // leave mcp_ready false; Task 10 will add retry/backoff.
+        },
     }
 }
 
@@ -695,6 +759,55 @@ fn embedWriteDone(model: *Model, res: native_sdk.EffectDbResult, fx: *Effects) v
     _ = res; // ok or constraint alike: continue (dup embeddings are harmless)
     if (!model.embedding) return;
     queryUnembedded(model, fx);
+}
+
+// ----------------------------------------------------- MCP server child
+
+/// Spawn the MCP server child exactly once. It opens `app.db` (read-only)
+/// and serves the memory tools over HTTP on `127.0.0.1:mcp_port`. We pass
+/// the db path and an explicit port so we know where to reach it, then arm
+/// a short one-shot timer before health-checking (giving it time to bind).
+fn startMcpServer(model: *Model, fx: *Effects) void {
+    if (model.mcp_started) return;
+    const paths = boot_paths orelse return;
+    model.mcp_started = true;
+
+    var port_buf: [8]u8 = undefined;
+    const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{mcp_port}) catch return;
+
+    // `.collect` output: we don't stream the child's stdout; we only care
+    // that it stays alive (an exit delivers `mcp_exit`). The child logs to
+    // its own stderr, surfaced in the exit Msg's stderr_tail if it dies.
+    fx.spawn(.{
+        .key = key_mcp_spawn,
+        .argv = &.{ mcp_binary_path, "--db", paths.db, "--port", port_str },
+        .output = .collect,
+        .on_exit = Effects.exitMsg(.mcp_exit),
+    });
+
+    // Give the child a moment to bind before the first health check.
+    fx.startTimer(.{
+        .key = key_mcp_health_timer,
+        .interval_ms = mcp_health_delay_ms,
+        .mode = .one_shot,
+        .on_fire = Effects.timerMsg(.mcp_health_tick),
+    });
+}
+
+/// Health-check the MCP child: POST a `tools/list` to its loopback port and
+/// confirm a 200 response. Reachability sets `mcp_ready`.
+fn healthCheckMcp(fx: *Effects) void {
+    var url_buf: [64]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{mcp_port}) catch return;
+    fx.fetch(.{
+        .key = key_mcp_health,
+        .method = .POST,
+        .url = url,
+        .headers = &.{.{ .name = "content-type", .value = "application/json" }},
+        .body = mcp_health_body,
+        .timeout_ms = 3_000,
+        .on_response = Effects.responseMsg(.mcp_health_done),
+    });
 }
 
 /// Interpret a launch-at-login host result (from either the status query or

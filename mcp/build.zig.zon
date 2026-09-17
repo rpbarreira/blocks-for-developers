@@ -1,0 +1,15 @@
+.{
+    .name = .blocks_mcp,
+    .version = "0.1.0",
+    .fingerprint = 0x2eaf41bdc80f2ff0,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "../src/mcp_server.zig",
+        "../src/embed_core.zig",
+        "../src/mcp/protocol.zig",
+        "../src/mcp/tools.zig",
+    },
+}

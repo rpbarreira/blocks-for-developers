@@ -13,7 +13,13 @@ comptime {
     _ = @import("git.zig");
     _ = @import("snapshots.zig");
     _ = @import("tray.zig");
+    _ = @import("embed_core.zig");
     _ = @import("embeddings.zig");
+    // MCP server core (Task 8): pure protocol + tool builders, plus the
+    // real-DB integration tests for each tool's SQL + JSON shaping.
+    _ = @import("mcp/protocol.zig");
+    _ = @import("mcp/tools.zig");
+    _ = @import("mcp/mcp_tools.zig");
 }
 
 const canvas = native_sdk.canvas;
@@ -165,4 +171,52 @@ test "update: toggling login while unsupported is a no-op" {
     // Should not flip the model or crash; the host is never asked.
     main.update(&m, .toggle_login, &fx);
     try std.testing.expect(!m.login_enabled);
+}
+
+// ---- MCP server child process (Task 8) ----
+
+test "update: a 200 tools/list health response marks the MCP server ready" {
+    var m = main.Model{};
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .mcp_health_done = .{ .key = 161, .outcome = .ok, .status = 200, .body = "{\"jsonrpc\":\"2.0\"}" } }, &fx);
+    try std.testing.expect(m.mcp_ready);
+    try std.testing.expect(!m.mcp_failed);
+}
+
+test "update: a failed health response leaves the MCP server not-ready (non-fatal)" {
+    var m = main.Model{};
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    // A connection failure while the child is still binding: not ready,
+    // but not marked failed either (Task 10 adds retry/backoff).
+    main.update(&m, .{ .mcp_health_done = .{ .key = 161, .outcome = .rejected, .status = 0, .body = "" } }, &fx);
+    try std.testing.expect(!m.mcp_ready);
+}
+
+test "update: the MCP child exiting marks it failed but does not crash" {
+    var m = main.Model{ .mcp_ready = true };
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .mcp_exit = .{ .key = 160, .code = 1, .reason = .exited } }, &fx);
+    try std.testing.expect(!m.mcp_ready);
+    try std.testing.expect(m.mcp_failed);
+}
+
+test "update: a rejected health-check timer tick is ignored" {
+    var m = main.Model{};
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    // A rejected timer must not fire a fetch or change state.
+    main.update(&m, .{ .mcp_health_tick = .{ .key = 2, .outcome = .rejected } }, &fx);
+    try std.testing.expect(!m.mcp_ready);
+    try std.testing.expect(!m.mcp_failed);
 }
