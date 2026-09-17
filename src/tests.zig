@@ -359,3 +359,40 @@ test "update: a rejected llama health tick is ignored" {
     try std.testing.expect(!m.llama_ready);
     try std.testing.expect(!m.llama_failed);
 }
+
+test "update: a non-200 llama health response retries while under the cap" {
+    var m = main.initialModel();
+    m.llama_health_attempts = 1; // one attempt made, far below the cap
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    // Connection refused while the model is still loading: not ready, not
+    // failed — a retry timer should be armed (still under the attempt cap).
+    main.update(&m, .{ .llama_health_done = .{ .key = 175, .outcome = .connect_failed, .status = 0, .body = "" } }, &fx);
+    try std.testing.expect(!m.llama_ready);
+    try std.testing.expect(!m.llama_failed);
+}
+
+test "update: llama health gives up (failed) once the attempt cap is reached" {
+    var m = main.initialModel();
+    m.llama_health_attempts = 40; // == llama_health_max_attempts
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .llama_health_done = .{ .key = 175, .outcome = .connect_failed, .status = 0, .body = "" } }, &fx);
+    try std.testing.expect(!m.llama_ready);
+    try std.testing.expect(m.llama_failed);
+}
+
+test "update: a health tick increments the attempt counter" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    try std.testing.expectEqual(@as(u32, 0), m.llama_health_attempts);
+    main.update(&m, .{ .llama_health_tick = .{ .key = 3, .outcome = .fired } }, &fx);
+    try std.testing.expectEqual(@as(u32, 1), m.llama_health_attempts);
+}

@@ -101,8 +101,15 @@ const mcp_health_delay_ms: u64 = 400;
 /// its OpenAI-compatible endpoint here; for now we only health-check it.
 const llama_port: u16 = 39_018;
 /// Delay before the FIRST llama health check. Model load (mmap + warmup)
-/// takes noticeably longer than the MCP child's bind, so this is generous.
+/// takes noticeably longer than the MCP child's bind.
 const llama_health_delay_ms: u64 = 1_500;
+/// Delay between subsequent llama health checks while the model is still
+/// loading. A fresh multi-GB GGUF can take 10-30s to become ready, so we
+/// poll until it answers (or we give up after `llama_health_max_attempts`).
+const llama_health_retry_ms: u64 = 1_500;
+/// How many health checks to attempt before declaring the runtime failed.
+/// `1500 + 40*1500 ≈ 60s` of grace covers a cold load of a large model.
+const llama_health_max_attempts: u32 = 40;
 /// Max curl progress lines we bother to process per download (each just
 /// updates a float; this is a sanity bound, not a hard limit).
 const download_progress_line_cap: usize = 100_000;
@@ -329,6 +336,10 @@ pub const Model = struct {
     /// llama-server binary isn't installed). Non-fatal: the app still runs;
     /// Task 10's chat surfaces this and offers a retry.
     llama_failed: bool = false,
+    /// How many llama `/health` checks have been attempted for the current
+    /// runtime spawn. Resets on each `startLlama`; caps at
+    /// `llama_health_max_attempts` before we declare the runtime failed.
+    llama_health_attempts: u32 = 0,
     /// Picker rows, rebuilt from the catalog + selection (see
     /// refreshModelChoices). Inline storage so the view slice survives.
     model_choices: [models.catalog.len]ModelChoice = undefined,
@@ -481,7 +492,7 @@ pub const Model = struct {
         "selected_model_buf", "selected_model_len", "model_present",  "downloading",
         "download_progress",  "download_failed",    "llama_started",  "llama_ready",
         "llama_failed",       "selectedModel",       "model_choices",
-        "selectedModelName",  "downloadPercent",
+        "selectedModelName",  "downloadPercent",     "llama_health_attempts",
     };
     pub fn statusText(self: *const Model) []const u8 {
         return switch (self.stage) {
@@ -697,12 +708,24 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .llama_health_tick => |timer| {
             if (timer.outcome == .rejected) return;
+            model.llama_health_attempts += 1;
             healthCheckLlama(fx);
         },
         .llama_health_done => |res| {
             if (res.outcome == .ok and res.status == 200) {
+                // The runtime is serving — memory + chat tools are reachable.
                 model.llama_ready = true;
                 model.llama_failed = false;
+            } else if (!model.llama_ready) {
+                // Still loading (connection refused while the model warms up)
+                // or a transient error: retry with a fixed backoff until the
+                // attempt cap, then give up (non-fatal — the UI can offer a
+                // manual retry, and Task 10 wires that).
+                if (model.llama_health_attempts < llama_health_max_attempts) {
+                    armLlamaHealth(llama_health_retry_ms, fx);
+                } else {
+                    model.llama_failed = true;
+                }
             }
         },
         .wrote_keep => {
@@ -1108,6 +1131,7 @@ fn startLlama(model: *Model, fx: *Effects) void {
     const paths = boot_paths orelse return;
     const m = models.findModel(model.selectedModel()) orelse return;
     model.llama_started = true;
+    model.llama_health_attempts = 0;
 
     var model_buf: [models.max_path_bytes]u8 = undefined;
     const model_path = models.modelFilePath(&model_buf, paths.models, m.file_name) catch return;
@@ -1127,9 +1151,16 @@ fn startLlama(model: *Model, fx: *Effects) void {
         .on_exit = Effects.exitMsg(.llama_exit),
     });
 
+    // Arm the first health check after a short delay (the child needs a
+    // moment to bind + start loading the model).
+    armLlamaHealth(llama_health_delay_ms, fx);
+}
+
+/// Arm a one-shot timer that will fire the next llama health check.
+fn armLlamaHealth(delay_ms: u64, fx: *Effects) void {
     fx.startTimer(.{
         .key = key_llama_health_timer,
-        .interval_ms = llama_health_delay_ms,
+        .interval_ms = delay_ms,
         .mode = .one_shot,
         .on_fire = Effects.timerMsg(.llama_health_tick),
     });

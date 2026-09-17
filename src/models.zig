@@ -81,7 +81,7 @@ pub const catalog = [_]CatalogModel{
         .blurb = "1.5B params · Q4_K_M · lightest, lowest RAM",
         .url = "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf",
         .file_name = "qwen2.5-1.5b-instruct-q4_k_m.gguf",
-        .size_bytes = 1_117_320_224,
+        .size_bytes = 1_117_320_736, // verified against the real download
         .context_length = 8192,
     },
 };
@@ -204,7 +204,7 @@ pub const server_argv_len = 10;
 
 /// Build the `llama-server` argv that serves `model_path` on
 /// `127.0.0.1:<port>` with the given context length.
-///   <bin> -m <model> --host 127.0.0.1 --port <port> -c <ctx> --no-webui
+///   <bin> -m <model> --host 127.0.0.1 --port <port> -c <ctx> --no-ui
 /// `binary` is the resolved path to the llama.cpp server executable.
 /// `port_str`/`ctx_str` are caller-formatted decimal strings (so this stays
 /// allocation-free and pure). The caller owns `buf`.
@@ -221,7 +221,7 @@ pub fn serverArgv(
         "--host",     "127.0.0.1",
         "--port",     port_str,
         "-c",         ctx_str,
-        "--no-webui",
+        "--no-ui",
     };
     return buf[0..];
 }

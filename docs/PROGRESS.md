@@ -1,8 +1,10 @@
 # Blocks for Developers — Progress & Resumption Notes
 
-Last updated: end of Task 9 (local model management + llama.cpp runtime).
+Last updated: end of Task 9 (local model management + llama.cpp runtime), now
+VERIFIED END-TO-END live + a health-retry fix (see the Task 9 section).
 Committed so far: Task 4 (`01969e5`), Task 5 (`56ae2a2`), Task 6 (`c2afa1b`),
-Task 7 (`e27eb0a`), Task 8 (`887480e`). Read this first when resuming. To continue: open the IDE on
+Task 7 (`e27eb0a`), Task 8 (`887480e`), Task 9 (`7a6961d`; the live-verify fix is a
+follow-up commit). Read this first when resuming. To continue: open the IDE on
 this repo folder
 (`/Users/rpbarreira/Projects/GitHub/rpbarreira/blocks-for-developers`) and say
 "read docs/PROGRESS.md and continue from Task 10."
@@ -793,27 +795,38 @@ chat (Task 10) / settings modal (Task 13); this is enough to drive the flow now.
 Tests (123 total pass, was 100): `models.zig` unit tests (catalog lookup, path +
 argv builders, `parseProgress` incl. multi-percent + clamp + null, `resolveServer
 Binary` env precedence, `parseSelectedModel` present/absent), `bootstrap.zig` config
-round-trip (default + chosen model), and eleven `main.zig` update-arm tests via the
-fake executor (config adoption, model present/absent, select + out-of-range, a curl
+round-trip (default + chosen model), and `main.zig` update-arm tests via the fake
+executor (config adoption, model present/absent, select + out-of-range, a curl
 progress line → `downloadPercent`, failed download/rename, `/health` 200 → ready,
-child exit → failed non-fatal, rejected health tick ignored). `native check` is
-clean (`app.native: ok`, app.json valid; the only warnings — `hasRepos`,
-`statusText`, `repo_input` — pre-date Task 9).
+child exit → failed non-fatal, rejected health tick ignored, and the health
+retry/backoff arms — retry under the cap, give-up at the cap, attempt counter).
+`native check` is clean (`app.native: ok`, app.json valid; the only warnings —
+`hasRepos`, `statusText`, `repo_input` — pre-date Task 9).
 
-**NOT verified end-to-end at runtime:** unlike Tasks 3-8, the download + runtime
-were NOT exercised against a live `native dev` app — a real run would fetch a ~2 GB
-GGUF and needs the `llama-server` binary (not installed on this machine yet). The
-logic is covered by the unit + update-arm tests; a live smoke test is a Task 10
-prerequisite (below).
+**VERIFIED END-TO-END via automation** (post-commit, on this machine): installed
+`llama-server` (`brew install llama.cpp`, v0.4.1) and set `$BLOCKS_LLAMA_SERVER=
+/opt/homebrew/bin/llama-server`. First, a STANDALONE smoke test confirmed the
+catalog URL resolves, the exact `downloadArgv` curl + `mv` produce a valid GGUF, and
+the exact `serverArgv` starts a server whose `GET /health` → 200 `{"status":"ok"}`
+and `POST /v1/chat/completions` returns a real completion (buffered AND SSE
+`data:`-framed streaming + `[DONE]`). Then a full FIRST-RUN app run (`native dev
+--yes -Dautomation=true`, config + model deleted first): the app wrote fresh config
+(default 3B selected), the Local-model picker rendered, clicking Choose on the 1.5B
+row persisted `selected_model` to `config.json`, clicking Download spawned curl (a
+`.part` appeared, status → "Downloading model…"), the app `mv`d it to the final
+`.gguf`, spawned `llama-server` with the expected argv, and after the health
+retries the status reached **"Model ready."** — and a `curl` to the app-spawned
+runtime answered a real chat completion. The downloaded 1.5B GGUF was LEFT in the
+app data dir as the real model for Task 10.
+
+**Fix that fell out of the live run (in this same change):** the first health check
+fired at 1.5 s but a cold GGUF load takes ~10-30 s, so the single check missed and
+`llama_ready` never flipped. `main.zig` now RETRIES `/health` on a fixed
+`llama_health_retry_ms = 1500` backoff up to `llama_health_max_attempts = 40`
+(~60 s grace), tracked by `llama_health_attempts` (reset each `startLlama`); only
+after the cap is `llama_failed` set. Verified: the status now reaches "Model ready."
 
 ### Deferred / follow-ups
-- **LIVE end-to-end run.** Before/with Task 10: install a `llama-server` (e.g.
-  `brew install llama.cpp`, or vendor a build to `vendor/llama/bin/`), set
-  `$BLOCKS_LLAMA_SERVER` if needed, run `native dev -Dautomation=true`, press
-  Download for the lightest model (`qwen2.5-1.5b-instruct-q4`, ~1.1 GB), and confirm:
-  the `.part` file appears then is `mv`d to the final name, `llama_ready` flips on the
-  `/health` 200, and a manual `curl` to `http://127.0.0.1:39018/v1/chat/completions`
-  returns a completion. This mirrors how Tasks 5-8 were signed off.
 - **Bundling `llama-server` + Metal.** v1 expects the binary on `PATH`/env or vendored;
   packaging (Task 13) must ship a Metal-enabled `llama-server` (and its `.metallib`)
   in the bundle and resolve its path (same bundle-exe-dir gap noted for the MCP child).
@@ -822,9 +835,11 @@ prerequisite (below).
   spawned `shasum -a 256` before the `mv` when we lock exact catalog builds. Also:
   no resume (`curl -C -`), no cancel button (wire `fx.cancel(key_model_download)`),
   and `download_progress` is fraction-only (no bytes/ETA) — all easy follow-ups.
-- **Runtime supervision.** A crashed `llama-server` sets `llama_failed` but is not
-  auto-restarted, and `llama_started` latches (no restart on model change without a
-  relaunch). Task 10 should add restart/backoff and re-spawn on `select_model`.
+- **Runtime supervision.** Health-check retry/backoff is now DONE (see above). Still
+  open: a crashed `llama-server` sets `llama_failed` but is not auto-restarted, and
+  `llama_started` latches (selecting a new model persists + re-stats but does NOT
+  re-spawn the runtime for it without a relaunch). Task 10 should add crash-restart
+  and re-spawn on `select_model` (stop the old child, spawn the new model).
 - **Model deletion / disk management.** No UI to delete a downloaded GGUF or show
   disk usage yet (Settings, Task 13).
 - **Chat wiring (Task 10).** The OpenAI-compatible endpoint is up but nothing calls
