@@ -18,6 +18,8 @@ comptime {
     // Local model management + llama.cpp runtime (Task 9): pure catalog,
     // path/argv builders, progress + config parsing.
     _ = @import("models.zig");
+    // Chat data layer + local-LLM protocol shaping (Task 10).
+    _ = @import("chat.zig");
     // MCP server core (Task 8): pure protocol + tool builders, plus the
     // real-DB integration tests for each tool's SQL + JSON shaping.
     _ = @import("mcp/protocol.zig");
@@ -47,7 +49,6 @@ test "the boot shell view builds against the model" {
     const arena = arena_state.allocator();
 
     var model = main.Model{
-        .stage = .ready,
         .username = "rui",
         .data_dir = "/Users/rui/Library/Application Support/dev.blocks.app",
         .onboarded = true,
@@ -65,17 +66,7 @@ test "the boot shell view builds against the model" {
     try std.testing.expect(found_username);
 }
 
-test "statusText reflects onboarding state" {
-    var m = main.Model{ .stage = .booting };
-    try std.testing.expectEqualStrings("Starting Blocks…", m.statusText());
-    m.stage = .ready;
-    m.onboarded = false;
-    try std.testing.expectEqualStrings("Welcome — let's get set up", m.statusText());
-    m.onboarded = true;
-    try std.testing.expectEqualStrings("Ready", m.statusText());
-}
-
-test "update: existing config marks the user onboarded and ready" {
+test "update: existing config marks the user onboarded" {
     var m = main.Model{};
     var fx = main.Effects.init(std.testing.allocator);
     defer fx.deinit();
@@ -84,20 +75,16 @@ test "update: existing config marks the user onboarded and ready" {
     // A successful stat with exists=true = returning user.
     main.update(&m, .{ .stat_config = .{ .key = 100, .op = .stat, .outcome = .ok, .exists = true } }, &fx);
     try std.testing.expect(m.onboarded);
-    try std.testing.expect(m.data_dir_ready);
-    try std.testing.expectEqual(main.Stage.ready, m.stage);
 }
 
-test "update: a successful config write leaves a first-run user ready but not onboarded" {
+test "update: a successful first-run config write leaves the user not onboarded" {
     var m = main.Model{};
     var fx = main.Effects.init(std.testing.allocator);
     defer fx.deinit();
     fx.executor = .fake;
 
     main.update(&m, .{ .wrote_config = .{ .key = 101, .op = .write, .outcome = .ok } }, &fx);
-    try std.testing.expect(m.data_dir_ready);
     try std.testing.expect(!m.onboarded);
-    try std.testing.expectEqual(main.Stage.ready, m.stage);
 }
 
 // ---- Tray + launch-at-login (Task 6) ----
@@ -395,4 +382,205 @@ test "update: a health tick increments the attempt counter" {
     try std.testing.expectEqual(@as(u32, 0), m.llama_health_attempts);
     main.update(&m, .{ .llama_health_tick = .{ .key = 3, .outcome = .fired } }, &fx);
     try std.testing.expectEqual(@as(u32, 1), m.llama_health_attempts);
+}
+
+// ---- Chat experience (Task 10) ----
+
+const chat = @import("chat.zig");
+
+test "update: send_chat is a no-op when the runtime is not ready" {
+    var m = main.initialModel();
+    m.llama_ready = false;
+    m.chat_input.set("hello");
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .send_chat, &fx);
+    // Nothing sent, no optimistic message, an error surfaced.
+    try std.testing.expect(!m.sending);
+    try std.testing.expectEqual(@as(usize, 0), m.message_count);
+}
+
+test "update: send_chat shows the user message and begins the turn" {
+    var m = main.initialModel();
+    m.llama_ready = true;
+    m.mcp_ready = false; // skip MCP search -> go straight to completion
+    m.chat_input.set("what did I do?");
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .send_chat, &fx);
+    try std.testing.expect(m.sending);
+    // The user message is shown immediately, input cleared.
+    try std.testing.expectEqual(@as(usize, 1), m.message_count);
+    try std.testing.expect(m.messagesSlice()[0].isUser());
+    try std.testing.expectEqualStrings("what did I do?", m.messagesSlice()[0].content());
+    try std.testing.expect(m.chat_input.isEmpty());
+    // With MCP not ready we go straight to a streamed completion.
+    try std.testing.expect(m.isStreaming());
+}
+
+test "update: send_chat ignores empty/whitespace input" {
+    var m = main.initialModel();
+    m.llama_ready = true;
+    m.chat_input.set("   ");
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .send_chat, &fx);
+    try std.testing.expect(!m.sending);
+    try std.testing.expectEqual(@as(usize, 0), m.message_count);
+}
+
+test "update: a streamed chat line appends a token to the reply" {
+    var m = main.initialModel();
+    m.streaming = true;
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    // key 181 is the llama chat stream key.
+    main.update(&m, .{ .chat_line = .{ .key = 181, .line = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}" } }, &fx);
+    main.update(&m, .{ .chat_line = .{ .key = 181, .line = "data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}" } }, &fx);
+    try std.testing.expectEqualStrings("Hello there", m.streamingText());
+}
+
+test "update: chat lines are ignored when not streaming" {
+    var m = main.initialModel();
+    m.streaming = false;
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .chat_line = .{ .key = 181, .line = "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}" } }, &fx);
+    try std.testing.expectEqualStrings("", m.streamingText());
+}
+
+test "update: chat_done finalizes the streamed reply into a message" {
+    var m = main.initialModel();
+    m.llama_ready = true;
+    m.sending = true;
+    m.streaming = true;
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    // Accumulate a streamed reply, then end the stream cleanly.
+    main.update(&m, .{ .chat_line = .{ .key = 181, .line = "data: {\"choices\":[{\"delta\":{\"content\":\"A commit is a snapshot.\"}}]}" } }, &fx);
+    main.update(&m, .{ .chat_done = .{ .key = 181, .outcome = .ok, .status = 200, .body = "" } }, &fx);
+
+    // The reply becomes an assistant message; streaming ends.
+    try std.testing.expect(!m.isStreaming());
+    try std.testing.expectEqual(@as(usize, 1), m.message_count);
+    try std.testing.expect(m.messagesSlice()[0].isAssistant());
+    try std.testing.expectEqualStrings("A commit is a snapshot.", m.messagesSlice()[0].content());
+}
+
+test "update: the [DONE] sentinel finalizes the streamed reply into a message" {
+    var m = main.initialModel();
+    m.llama_ready = true;
+    m.sending = true;
+    m.streaming = true;
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    // A token arrives, then the `[DONE]` sentinel line ends the turn (the
+    // runtime keeps the socket open, so the terminal response would lag).
+    main.update(&m, .{ .chat_line = .{ .key = 181, .line = "data: {\"choices\":[{\"delta\":{\"content\":\"Done reply.\"}}]}" } }, &fx);
+    try std.testing.expect(m.isStreaming());
+    main.update(&m, .{ .chat_line = .{ .key = 181, .line = "data: [DONE]" } }, &fx);
+    try std.testing.expect(!m.isStreaming());
+    try std.testing.expect(m.messagesSlice()[m.message_count - 1].isAssistant());
+    try std.testing.expectEqualStrings("Done reply.", m.messagesSlice()[m.message_count - 1].content());
+}
+
+test "update: sending stays gated through persistence until chat_write_done" {
+    var m = main.initialModel();
+    m.llama_ready = true;
+    m.sending = true;
+    m.streaming = true;
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    // Finish the stream. The turn is NOT done yet — the async persist chain
+    // (INSERT chat -> MAX(id) -> write) is still pending, so `sending` must
+    // remain set to keep a second turn from overlapping the id recovery.
+    main.update(&m, .{ .chat_line = .{ .key = 181, .line = "data: {\"choices\":[{\"delta\":{\"content\":\"Reply.\"}}]}" } }, &fx);
+    main.update(&m, .{ .chat_line = .{ .key = 181, .line = "data: [DONE]" } }, &fx);
+    try std.testing.expect(!m.isStreaming());
+    try std.testing.expect(m.sending); // still gated
+    try std.testing.expect(!m.canSend());
+
+    // A second send while gated is a no-op (no extra user message).
+    const before = m.message_count;
+    m.chat_input.set("second question");
+    main.update(&m, .send_chat, &fx);
+    try std.testing.expectEqual(before, m.message_count);
+
+    // Only once the write commits does the turn end and input re-enable.
+    main.update(&m, .{ .chat_write_done = .{ .key = 184, .kind = .exec, .outcome = .ok } }, &fx);
+    try std.testing.expect(!m.sending);
+    try std.testing.expect(m.canSend());
+}
+
+test "update: a second finalize for the same turn is a no-op" {
+    var m = main.initialModel();
+    m.llama_ready = true;
+    m.sending = true;
+    m.streaming = true;
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .chat_line = .{ .key = 181, .line = "data: {\"choices\":[{\"delta\":{\"content\":\"Once.\"}}]}" } }, &fx);
+    main.update(&m, .{ .chat_line = .{ .key = 181, .line = "data: [DONE]" } }, &fx); // finalize
+    const count = m.message_count;
+    // The terminal chat_done (arrives .cancelled after our fx.cancel) must not
+    // finalize again — no duplicate assistant message.
+    main.update(&m, .{ .chat_done = .{ .key = 181, .outcome = .cancelled, .status = 0, .body = "" } }, &fx);
+    try std.testing.expectEqual(count, m.message_count);
+}
+
+test "update: a failed chat_done keeps the user message and clears sending" {
+    var m = main.initialModel();
+    m.llama_ready = true;
+    m.sending = true;
+    m.streaming = true;
+    m.pushMessage(.user, "hi");
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    // A connection failure mid-stream with nothing accumulated.
+    main.update(&m, .{ .chat_done = .{ .key = 181, .outcome = .connect_failed, .status = 0, .body = "" } }, &fx);
+    try std.testing.expect(!m.isStreaming());
+    try std.testing.expect(!m.sending);
+    // The user's message stays visible so they can retry.
+    try std.testing.expectEqual(@as(usize, 1), m.message_count);
+}
+
+test "update: mcp_search_done builds context then starts the completion" {
+    var m = main.initialModel();
+    m.llama_ready = true;
+    m.sending = true;
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    // A well-formed search result should not crash and should proceed to
+    // stream a completion (RAG best-effort: even 200 with hits -> streaming).
+    // The MCP envelope wraps the tool JSON as result.content[0].text, with the
+    // inner JSON's quotes escaped (hand-escaped here).
+    const envelope =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":" ++
+        "\"{\\\"query\\\":\\\"x\\\",\\\"results\\\":[{\\\"repo\\\":\\\"blocks\\\",\\\"title\\\":\\\"t\\\",\\\"snippet\\\":\\\"s\\\"}]}\"" ++
+        "}],\"isError\":false}}";
+
+    main.update(&m, .{ .mcp_search_done = .{ .key = 180, .outcome = .ok, .status = 200, .body = envelope } }, &fx);
+    try std.testing.expect(m.isStreaming());
 }

@@ -1,13 +1,18 @@
 # Blocks for Developers — Progress & Resumption Notes
 
-Last updated: end of Task 9 (local model management + llama.cpp runtime), now
-VERIFIED END-TO-END live + a health-retry fix (see the Task 9 section).
+Last updated: end of Task 10 (chat wired to the local model + MCP memory),
+VERIFIED END-TO-END live (see the Task 10 section).
 Committed so far: Task 4 (`01969e5`), Task 5 (`56ae2a2`), Task 6 (`c2afa1b`),
-Task 7 (`e27eb0a`), Task 8 (`887480e`), Task 9 (`7a6961d`; the live-verify fix is a
-follow-up commit). Read this first when resuming. To continue: open the IDE on
+Task 7 (`e27eb0a`), Task 8 (`887480e`), Task 9 (`7a6961d` + live-verify follow-up
+`2ec4210`). Read this first when resuming. To continue: open the IDE on
 this repo folder
 (`/Users/rpbarreira/Projects/GitHub/rpbarreira/blocks-for-developers`) and say
-"read docs/PROGRESS.md and continue from Task 10."
+"read docs/PROGRESS.md and continue from Task 11."
+
+**Runtime note for live runs:** the llama.cpp runtime is `llama-server`
+(installed via `brew install llama.cpp`, at `/opt/homebrew/bin/llama-server`).
+`native dev` must be launched with `BLOCKS_LLAMA_SERVER=/opt/homebrew/bin/llama-server`
+so the app can spawn it (the packaged build will vendor it — Task 13).
 
 ---
 
@@ -122,8 +127,15 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
   `selected_model` (bootstrap `configJson`), and the download/runtime lifecycle is
   wired into `main.zig` (keys 170-175, timer key 3) with a "Local model" section in
   `app.native`. 123 tests pass; `native check` clean. See the Task 9 section.
-- [ ] Task 10 — Chat experience wired to model + MCP. ← NEXT
-- [ ] Task 11 — Single-click summaries.
+- [x] **Task 10 — Chat experience wired to model + MCP.** DONE. New PURE module
+  `src/chat.zig` (chats/messages data layer + OpenAI request builder + SSE stream
+  parser + MCP search request/response shaping) + the chat lifecycle wired into
+  `main.zig` (keys 180-185) + a chat view in `app.native`. Uses retrieval-augmented
+  generation (MCP `search_memory` → injected context), NOT native tool-calling.
+  148 tests; `native check` clean; VERIFIED END-TO-END live (streamed replies
+  grounded in real git memory, persisted to `chats`/`messages`). See the Task 10
+  section. A semantic review caught + fixed a turn-overlap persistence race.
+- [ ] Task 11 — Single-click summaries. ← NEXT
 - [ ] Task 12 — Materials (snippets) screen + chat cross-linking.
 - [ ] Task 13 — Welcome flow + settings modal completion + polish.
 
@@ -249,6 +261,25 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
   `resolveServerBinary(env)` = `$BLOCKS_LLAMA_SERVER` else `default_server_binary`
   (`vendor/llama/bin/llama-server`). `parseSelectedModel(json)` reads the config
   `selected_model` via a tiny hand `jsonStringField`. All unit-tested.
+- **chat.zig** — chat data layer + local-LLM protocol shaping, PURE (Task 10).
+  `Role{user,assistant,system}` (`.name`/`.fromName`). CHATS/MESSAGES: `chat_insert_sql`
+  (kind='chat', created=updated), `chat_touch_sql` (preview+updated_at), `max_chat_id_sql`
+  (`SELECT MAX(id)` — recovers the just-inserted chat id, since the SDK store may run a
+  follow-up query on a different pooled connection where `last_insert_rowid()` is 0),
+  `messages_by_chat_sql` (ORDER BY seq), `message_insert_sql`; statement builders
+  `chatInsertStatement`/`chatTouchStatement`/`messageInsertStatement` (caller-owned
+  param bufs). `Message.fromRow`; `MessageEntry` (inline-owned copy: `content`, `roleLabel`
+  = You/Blocks/System, `fromMessage`/`set`). `max_content_bytes=8192`, `max_messages=256`.
+  LLM PROTOCOL: `system_prompt` (Blocks memory-assistant persona); `buildRequest(out, alloc,
+  history []OutMessage, context, stream, max_tokens)` → the `/v1/chat/completions` body
+  (system message + optional "Relevant memory:" context block + history, all JSON-escaped
+  via a local `JsonWriter`); `parseStreamLine(line, scratch)` → `StreamEvent{delta,done,
+  ignore}` (scans a `data:` SSE chunk for `delta.content`, detects `[DONE]`; `unescapeJsonString`
+  handles the standard escapes + BMP `\uXXXX`). MCP RAG: `buildSearchRequest(out, alloc,
+  query, limit)` → a `tools/call search_memory` JSON-RPC body; `formatSearchContext(out,
+  alloc, response_body, max_hits)` unwraps the double-wrapped `result.content[0].text` →
+  inner `{results:[{repo,title,snippet}]}` → `"- [repo] title: snippet"` lines (fail-soft:
+  0 hits on any parse error, never blocks the chat). `excerptTitle` (chat title/preview).
 - **repos.zig** — watched-repos data layer. `Repo{id,path,name,active,added_at}`
   `.fromRow(cols)`; `RepoEntry` (owned inline path/name copy) `.fromRepo/.path()/.name()`;
   `insert_sql/delete_sql/list_sql/exists_sql`; `insertStatement(*[3]Value, path, name, now_ms)`,
@@ -311,9 +342,11 @@ allowed; multi-statement files OK. FK cascades work (the writer sets foreign_key
      120-122 (git capture), 130-134 (snapshot scan), 140-141 (launch-at-login host
      requests), 150-152 (embedding generation), 160-161 (MCP child spawn + health
      fetch), 170-175 (Task 9: 170 config read, 171 model stat, 172 model download
-     curl, 173 model rename mv, 174 llama-server spawn, 175 llama /health fetch).
-     TIMER keys (own namespace): 1 = the repeating working-tree scan tick,
-     2 = the one-shot MCP health-check delay, 3 = the one-shot llama health delay.
+     curl, 173 model rename mv, 174 llama-server spawn, 175 llama /health fetch),
+     180-185 (Task 10: 180 MCP search_memory POST, 181 llama chat `.stream` POST,
+     182 chat INSERT, 183 chat MAX(id) query, 184 messages write batch, 185 messages
+     reload query). TIMER keys (own namespace): 1 = the repeating working-tree scan
+     tick, 2 = the one-shot MCP health-check delay, 3 = the one-shot llama health delay.
 2. **ZIG LIFETIME TRAP (will recur!):** a function returning a struct with
    `.params = &.{ runtimeValue, ... }` DANGLES (temporary array dies at return) →
    causes `.rejected` exec and crashes. FIX: builder takes a caller-owned
@@ -845,3 +878,142 @@ after the cap is `llama_failed` set. Verified: the status now reaches "Model rea
 - **Chat wiring (Task 10).** The OpenAI-compatible endpoint is up but nothing calls
   `/v1/chat/completions` yet; streaming tokens back into the chat view + injecting the
   MCP memory tools is Task 10.
+
+## Task 10 — Chat experience wired to model + MCP (DONE — what was built)
+
+The user can now chat with the LOCAL model, and its answers are grounded in the
+developer's own git/file memory. The chat POSTs to the llama.cpp runtime's
+OpenAI-compatible `/v1/chat/completions` (streamed, SSE), and BEFORE each turn the
+app queries the MCP `search_memory` tool with the user's message and injects the top
+hits as context. Conversations persist to the `chats`/`messages` tables.
+
+**KEY DECISION — retrieval-augmented generation, NOT native tool-calling (read before
+Task 11).** llama-server exposes OpenAI `tools`/`tool_calls`, but a 1.5-3B local model
+calls tools unreliably. So instead of a model-driven tool loop, the app does RAG: it
+always calls `search_memory(query = the user's message)` first and injects the ranked
+hits into the system message as a "Relevant memory:" block, then asks the model. This
+is deterministic, works with a small model, and still exercises the Task 8 MCP tools.
+Native tool-calling (letting the model choose `get_commits`/`get_activity` too) is a
+documented follow-up. Retrieval is BEST-EFFORT: if the MCP server isn't ready or the
+search fails, the turn proceeds with no context (the chat never blocks on memory).
+
+Layering: all protocol/SQL shaping is PURE + unit-tested in `chat.zig`; only the effect
+firing + turn state machine live in `main.zig`.
+
+**The turn lifecycle** (`main.zig`; effect keys 180-185):
+1. `send_chat` (guarded by `canSend` = `llama_ready and !sending`, and non-empty input):
+   copy the input to `pending_user_buf`, optimistically `pushMessage(.user)` for instant
+   display, clear the field, set `sending = true`, `finalizing = false`.
+2. If `mcp_ready`: `searchMemory` POSTs `buildSearchRequest` to the MCP root (key 180);
+   `mcp_search_done` runs `formatSearchContext` into `context_buf` (best-effort) →
+   `startCompletion`. If MCP isn't ready, `sendChat` calls `startCompletion` directly.
+3. `startCompletion` builds the request from the loaded history + context and opens a
+   `.stream` fetch (key 181) — `on_line = chat_line`, `on_response = chat_done`.
+4. `chat_line` runs `parseStreamLine` and appends each `delta.content` token to
+   `streaming_buf` (shown live via the `isStreaming` bubble).
+5. `finalizeChat` runs on the `[DONE]` sentinel (see the finalization note) — pushes the
+   assistant message, then persists: a NEW chat does `createChatThenPersist` (INSERT chat
+   key 182 → `chat_rowid_done` reads `MAX(id)` key 183 → `persistTurn`); an existing chat
+   goes straight to `persistTurn` (key 184: user msg + assistant msg + chat touch in ONE
+   exec batch). `chat_write_done` clears `sending`, then reloads the chat (key 185) so
+   ids/seqs are authoritative.
+
+**FINALIZATION — why we finalize on `[DONE]`, not the terminal response (important
+SDK/llama-server detail).** llama-server keeps the HTTP connection OPEN (keep-alive)
+AFTER it emits the reply + `data: [DONE]`, so the `.stream` fetch's terminal
+`on_response` (`chat_done`) lags by the WHOLE `chat_stream_timeout_ms` (120 s). The
+reliable end-of-turn signal is the `data: [DONE]` LINE, which arrives promptly. So
+`chat_line` finalizes on the `[DONE]` `StreamEvent`, and `finalizeChat` does
+`fx.cancel(key_llama_chat)` to tear down the held-open fetch (which then delivers a
+`.cancelled` `chat_done`). `finalizeChat` is IDEMPOTENT via a `finalizing` guard, so the
+follow-up `chat_done` is a no-op. A transport failure that lands as `chat_done` with a
+non-`ok` outcome (no `[DONE]`) also finalizes, with `ok=false`: it keeps the user's
+message visible and surfaces an error. (An earlier idle-timer watchdog approach was
+tried and REMOVED once the `[DONE]` path proved reliable — no dead code.)
+
+**Persisting the new chat's id — `MAX(id)`, not `last_insert_rowid()`.** The `.exec`
+result carries no rowid, and a follow-up `SELECT last_insert_rowid()` returned 0 in
+practice (the SDK relational store ran it on a DIFFERENT pooled connection where no
+insert had happened — confirmed live). Since Blocks is the SOLE writer and rows aren't
+deleted mid-turn, `SELECT MAX(id) FROM chats` recovers the just-inserted id. This is
+safe ONLY if turns don't overlap — see the race fix below. `next_seq` is tracked
+in-model but is authoritatively recomputed from `MAX(seq)+1` on every reload.
+
+Model state added: `chat_input` (TextBuffer 2048), `current_chat_id`, `next_seq`,
+`messages[256]MessageEntry` + `message_count`, `pending_user_buf`, `streaming_buf` +
+`streaming_len`, `context_buf` + `context_len`, `sending`, `finalizing`, `streaming`,
+`chat_error`. View accessors: `messagesSlice`, `streamingText`, `isStreaming`,
+`canSend`/`sendDisabled`, `chatStatusText`, `chatEmpty`. Msg arms: `chat_input_edit`,
+`send_chat`, `mcp_search_done`, `chat_line`, `chat_done`, `chat_inserted`,
+`chat_rowid_done`, `chat_write_done`, `messages_listed`.
+
+View (`app.native`): chat is now the PRIMARY screen — a scroll transcript
+(`<for each="messagesSlice">` role-labeled bubbles + the live `isStreaming` bubble), a
+`chatStatusText` line, and the input row (text-field + Send, `disabled="{sendDisabled}"`).
+The Task 3 Watched Repositories + Task 9 Local model sections remain BELOW (they move into
+the Settings modal in Task 13). This is a FUNCTIONAL demo layout; the high-fidelity
+`chat_screen.png` (sidebar + chat list, single-click summary cards, message bubbles,
+Save-to-Snippets) is Task 13 polish, once its dependencies (Task 11 summaries, Task 12
+snippets) exist. (User confirmed this sequencing — "Option A".)
+
+**Allocator discipline:** per-turn request/response JSON is built in SHORT-LIVED arenas
+(`ArenaAllocator(page_allocator)` with `defer deinit` in `startCompletion`/`mcpSearchDone`,
+a stack `FixedBufferAllocator` in `searchMemory`) — `fx.fetch` copies the body at call
+time, so nothing accumulates across turns. (An earlier version used the process-lifetime
+`boot_arena` for these — a real per-turn leak, and it crashed tests where `boot_arena`
+is uninitialized; fixed.)
+
+Tests (148 total): the pure `chat.zig` layer (Role, statement params, `MessageEntry`,
+`buildRequest` with/without context + JSON validity, `parseStreamLine` delta/DONE/role-
+only/blank/escapes, `buildSearchRequest`, `formatSearchContext` happy + malformed,
+`excerptTitle`, `Message.fromRow`) + `main.zig` update-arm tests (send gating when not
+ready, optimistic display, empty-input, streamed append, ignore-when-not-streaming,
+`[DONE]` finalize, failed `chat_done`, `mcp_search_done` → stream, turn stays gated
+through persistence, second-finalize no-op). `native check` clean (0 warnings).
+
+**VERIFIED END-TO-END via automation** (`native dev -Dautomation=true` +
+`BLOCKS_LLAMA_SERVER`, real Qwen2.5-1.5B): added this repo (→ 11 commit events, embeddings),
+then chatted. "What did I most recently work on?" → a streamed reply grounded in the real
+Task 6 commit ("Always-on tray + auto-start on login… resolved the 'tray needs Runtime
+access' concern"), persisted as `chats`(1 row) + `messages`(user seq 0, assistant seq 1),
+and the status returned to idle. A LONG reply (detailed task-by-task summary, 2609 chars)
+streamed fully, finalized on `[DONE]`, and persisted intact — no stall on longer
+generation. A post-fix run confirmed exactly ONE chat row per new conversation (no
+duplicate from the race fix).
+
+### Semantic review + the turn-overlap race fix
+A behavioral review (semantic-review/2026-09-18-…-pr-task10-chat.md) caught a BLOCKER:
+`finalizeChat` originally cleared `sending` BEFORE the async persist chain adopted
+`current_chat_id`, so a fast second `send_chat` on a brand-new chat could create a second
+`chats` row and race the `MAX(id)` recovery → both turns adopt the same id with colliding
+`seq`s (and `messages` has no `UNIQUE(chat_id, seq)`, so SQLite accepts the dupes).
+FIXED: idempotency now uses a dedicated `finalizing` flag, and `sending` stays SET through
+the ENTIRE persist chain (cleared only in `chat_write_done`, or on the finalize failure
+path) — so `canSend` keeps a second turn from overlapping the id recovery. Also fixed from
+the review: clear `context_len` on the failure path (no stale memory leaking into a later
+turn), dropped a redundant in-model `next_seq += 2` (the reload is authoritative), surfaced
+a chat error if the id recovery yields nothing (instead of silently dropping the write),
+and sized the search scratch for worst-case JSON escaping so retrieval is never silently
+skipped.
+
+### Deferred / follow-ups
+- **Native tool-calling.** v1 is RAG-only (always `search_memory`). Letting the model
+  drive `get_commits`/`get_activity`/`search_memory` via OpenAI `tool_calls` is a
+  follow-up — worthwhile once a stronger model is the default (it needs a tool-call loop:
+  model → tool request → app runs the MCP tool → feed the result back → continue).
+- **Chat sidebar / history.** v1 starts a FRESH chat each session (a row is created on the
+  first send); prior chats accumulate in the DB but there is no "New chat" button or chat
+  list to switch between them yet. The `chat_screen.png` sidebar is Task 13.
+- **Single-click summaries (Task 11).** The chat mockup's Day Recap / What's Top of Mind /
+  Standup cards are Task 11 — they reuse this same runtime + MCP plumbing with canned
+  prompts and a `chats.kind` other than 'chat'.
+- **Save-to-Snippets (Task 12).** The "Save to Snippets" affordance in the mockup + the
+  `snippets.origin_chat_id/origin_message_id` cross-link is Task 12.
+- **8 KiB reply cap.** A streamed reply longer than `max_content_bytes` (8 KiB) is
+  displayed + persisted TRUNCATED with no marker. Fine for v1 (the long-reply test was
+  2.6 KiB); add a visible indicator or a larger stored cap later.
+- **Runtime not ready / offline.** If `llama_ready` is false the composer's Send is
+  disabled and `chatStatusText` shows the model status; there's no explicit "start the
+  model" affordance in the chat area yet (the Local model section below handles download).
+- **High-fidelity chat UI (Task 13).** The faithful `chat_screen.png` layout (bubbles,
+  avatars, sidebar, summary cards) lands in Task 13 once Tasks 11/12 exist.

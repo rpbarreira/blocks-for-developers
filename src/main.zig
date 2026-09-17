@@ -24,6 +24,7 @@ const snapshots = @import("snapshots.zig");
 const tray = @import("tray.zig");
 const embeddings = @import("embeddings.zig");
 const models = @import("models.zig");
+const chat = @import("chat.zig");
 
 const canvas = native_sdk.canvas;
 
@@ -81,6 +82,13 @@ const key_model_download: u64 = 172; // spawn curl to download the GGUF (.lines)
 const key_model_rename: u64 = 173; // spawn mv to move .part into place
 const key_llama_spawn: u64 = 174; // spawn the llama-server runtime child
 const key_llama_health: u64 = 175; // fetch /health to confirm the runtime is up
+// Chat experience (Task 10). Share the spawn/fetch/file key space.
+const key_mcp_search: u64 = 180; // POST search_memory tools/call to the MCP server
+const key_llama_chat: u64 = 181; // POST /v1/chat/completions (.stream) to the runtime
+const key_chat_insert: u64 = 182; // INSERT a new chats row
+const key_chat_rowid: u64 = 183; // SELECT last_insert_rowid() for the new chat
+const key_chat_write: u64 = 184; // INSERT the turn's messages + touch the chat
+const key_messages_list: u64 = 185; // load a chat's messages
 
 /// The loopback port the MCP child binds (passed explicitly so the app
 /// knows where to reach it without first reading the endpoint file).
@@ -113,6 +121,16 @@ const llama_health_max_attempts: u32 = 40;
 /// Max curl progress lines we bother to process per download (each just
 /// updates a float; this is a sanity bound, not a hard limit).
 const download_progress_line_cap: usize = 100_000;
+
+/// Chat tuning (Task 10).
+const chat_max_tokens: u32 = 512; // cap the assistant reply length
+const chat_search_hits: u32 = 6; // how many memory hits to retrieve for context
+const chat_context_cap: usize = 4096; // max bytes of retrieved context injected
+const chat_reply_cap: usize = chat.max_content_bytes; // max streamed reply we retain
+const chat_input_capacity = 2048; // chat text-field buffer capacity
+/// Whole-exchange timeout for the streamed completion (a long reply on a
+/// small local model can still take a while); the stream lifetime counts.
+const chat_stream_timeout_ms: u32 = 120_000;
 
 /// How many source rows to embed per query batch. Each row contributes a
 /// 256-f32 vector + an FTS insert; two statements/row, all frame-local.
@@ -173,10 +191,6 @@ const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 
 // ------------------------------------------------------------------ model
 
-/// Which onboarding/app stage the UI is in. Task 1 only distinguishes
-/// "still booting" from "ready"; later tasks add welcome/chat/materials.
-pub const Stage = enum { booting, ready };
-
 /// Which source table an embedding pass is currently draining. A pass
 /// embeds all un-embedded events, then all un-embedded file snapshots.
 pub const EmbedPhase = enum { events, snapshots };
@@ -212,10 +226,9 @@ pub const ModelChoice = struct {
 };
 
 pub const Model = struct {
-    stage: Stage = .booting,
-    /// True once bootstrap has confirmed (or created) the app-data dir.
-    data_dir_ready: bool = false,
     /// True when the config file already existed at boot (returning user).
+    /// Read by `persistSelectedModel` to preserve the flag when rewriting
+    /// config.json on a model change.
     onboarded: bool = false,
     /// Detected OS username, shown next to the avatar. Borrowed from the
     /// process-lifetime boot arena.
@@ -344,6 +357,46 @@ pub const Model = struct {
     /// refreshModelChoices). Inline storage so the view slice survives.
     model_choices: [models.catalog.len]ModelChoice = undefined,
 
+    // ---- Chat experience (Task 10) ----
+    /// The chat-input field buffer (model-owned inline storage).
+    chat_input: canvas.TextBuffer(chat_input_capacity) = .{},
+    /// The active chat's id (0 = none yet; a row is created on first send).
+    current_chat_id: i64 = 0,
+    /// The next message `seq` for the active chat. We are the sole writer,
+    /// so we track this in-model instead of re-querying MAX(seq) each turn.
+    next_seq: i64 = 0,
+    /// Loaded/visible messages for the active chat (oldest first).
+    messages: [chat.max_messages]chat.MessageEntry = undefined,
+    message_count: usize = 0,
+    /// The user text for the turn in flight, held from `send_chat` across the
+    /// MCP-search → stream chain so it can be persisted at the end.
+    pending_user_buf: [chat.max_content_bytes]u8 = undefined,
+    pending_user_len: usize = 0,
+    /// The assistant reply being streamed in (grows as tokens arrive).
+    streaming_buf: [chat_reply_cap]u8 = undefined,
+    streaming_len: usize = 0,
+    /// The retrieved-memory context for the turn in flight (from MCP search),
+    /// held only until the request body is built.
+    context_buf: [chat_context_cap]u8 = undefined,
+    context_len: usize = 0,
+    /// True from `send_chat` until the assistant reply is fully PERSISTED
+    /// (through the async INSERT/reload chain), not merely until the stream
+    /// ends. This is the sole interlock `canSend` uses, so keeping it set
+    /// through persistence prevents a second turn from overlapping the
+    /// new-chat id recovery (which would create a duplicate chat + colliding
+    /// seqs). Cleared in `chat_write_done` (success) or the finalize failure
+    /// path (no persist).
+    sending: bool = false,
+    /// Guards `finalizeChat` against running twice for one turn (the `[DONE]`
+    /// sentinel and the terminal `chat_done` both call it). Set on the first
+    /// finalize, cleared when the next turn starts.
+    finalizing: bool = false,
+    /// True while llama tokens are streaming into `streaming_buf`.
+    streaming: bool = false,
+    /// Last chat error, shown under the input ("" when none).
+    chat_error_buf: [256]u8 = undefined,
+    chat_error_len: usize = 0,
+
     pub fn selectedModel(self: *const Model) []const u8 {
         if (self.selected_model_len == 0) return models.default_model_id;
         return self.selected_model_buf[0..self.selected_model_len];
@@ -392,6 +445,76 @@ pub const Model = struct {
     /// not already downloading).
     pub fn canDownload(self: *const Model) bool {
         return !self.model_present and !self.downloading;
+    }
+
+    // ---- Chat accessors (Task 10) ----
+    /// Loaded messages as a slice for the view's `<for each>`.
+    pub fn messagesSlice(self: *const Model) []const chat.MessageEntry {
+        return self.messages[0..self.message_count];
+    }
+    /// The assistant reply currently streaming in (empty when idle).
+    pub fn streamingText(self: *const Model) []const u8 {
+        return self.streaming_buf[0..self.streaming_len];
+    }
+    /// True while a reply is streaming (drives the in-progress bubble).
+    pub fn isStreaming(self: *const Model) bool {
+        return self.streaming;
+    }
+    /// The Send button is offered only when the runtime is up and no turn is
+    /// already in flight.
+    pub fn canSend(self: *const Model) bool {
+        return self.llama_ready and !self.sending;
+    }
+    /// Inverse of `canSend`, for the button's `disabled` binding.
+    pub fn sendDisabled(self: *const Model) bool {
+        return !self.canSend();
+    }
+    /// A one-line status for the chat area.
+    pub fn chatStatusText(self: *const Model) []const u8 {
+        if (self.chat_error_len > 0) return self.chat_error_buf[0..self.chat_error_len];
+        if (self.streaming) return "Blocks is thinking…";
+        if (self.sending) return "Searching your memory…";
+        if (!self.llama_ready) return self.modelStatusText();
+        return "Ask about your recent work.";
+    }
+    /// True when there is nothing to show yet (empty-state hint).
+    pub fn chatEmpty(self: *const Model) bool {
+        return self.message_count == 0 and !self.streaming;
+    }
+    fn pendingUser(self: *const Model) []const u8 {
+        return self.pending_user_buf[0..self.pending_user_len];
+    }
+    fn setPendingUser(self: *Model, text: []const u8) void {
+        self.pending_user_len = @min(text.len, self.pending_user_buf.len);
+        @memcpy(self.pending_user_buf[0..self.pending_user_len], text[0..self.pending_user_len]);
+    }
+    fn contextText(self: *const Model) []const u8 {
+        return self.context_buf[0..self.context_len];
+    }
+    fn setContext(self: *Model, text: []const u8) void {
+        self.context_len = @min(text.len, self.context_buf.len);
+        @memcpy(self.context_buf[0..self.context_len], text[0..self.context_len]);
+    }
+    fn appendStreaming(self: *Model, delta: []const u8) void {
+        const room = self.streaming_buf.len - self.streaming_len;
+        const n = @min(delta.len, room);
+        @memcpy(self.streaming_buf[self.streaming_len .. self.streaming_len + n], delta[0..n]);
+        self.streaming_len += n;
+    }
+    fn setChatError(self: *Model, msg: []const u8) void {
+        self.chat_error_len = @min(msg.len, self.chat_error_buf.len);
+        @memcpy(self.chat_error_buf[0..self.chat_error_len], msg[0..self.chat_error_len]);
+    }
+    fn clearChatError(self: *Model) void {
+        self.chat_error_len = 0;
+    }
+    /// Append a message to the in-memory list (bounded), for immediate
+    /// display; the DB is the source of truth on the next reload. Public so
+    /// update-arm tests can seed a conversation.
+    pub fn pushMessage(self: *Model, role: chat.Role, text: []const u8) void {
+        if (self.message_count >= chat.max_messages) return;
+        self.messages[self.message_count] = chat.MessageEntry.set(role, text);
+        self.message_count += 1;
     }
 
     pub fn capturePath(self: *const Model) []const u8 {
@@ -456,9 +579,6 @@ pub const Model = struct {
     pub fn reposSlice(self: *const Model) []const repos.RepoEntry {
         return self.repo_list[0..self.repo_count];
     }
-    pub fn hasRepos(self: *const Model) bool {
-        return self.repo_count > 0;
-    }
     pub fn isAddingRepo(self: *const Model) bool {
         return self.adding_repo;
     }
@@ -467,12 +587,14 @@ pub const Model = struct {
         return self.data_dir;
     }
 
-    // These fields are read by update/effect logic or via accessor
-    // functions (usernameText/dataDirText/statusText), not bound directly
-    // in markup, so they are intentionally exempt from the dead-state lint.
+    // These fields/accessors are read by update/effect logic or via accessor
+    // functions (usernameText/dataDirText/…), or are TextBuffers the
+    // text-fields drive through their on-input handlers, not bound directly
+    // in markup — so they are intentionally exempt from the dead-state lint.
     pub const view_unbound = .{
-        "stage",            "data_dir_ready",   "onboarded",        "username",
+        "onboarded",        "username",
         "data_dir",         "repo_list",        "repo_count",       "adding_repo",
+        "repo_input",       "chat_input",
         "repo_error_buf",   "repo_error_len",   "pending_path_buf", "pending_path_len",
         "capturing",        "capture_idx",      "capture_repo_id",  "capture_path_buf",
         "capture_path_len", "capture_since_buf", "capture_since_len",
@@ -493,13 +615,15 @@ pub const Model = struct {
         "download_progress",  "download_failed",    "llama_started",  "llama_ready",
         "llama_failed",       "selectedModel",       "model_choices",
         "selectedModelName",  "downloadPercent",     "llama_health_attempts",
+        // Chat experience (Task 10). chat_input is bound (text-field), and
+        // messagesSlice/streamingText/isStreaming/canSend/chatStatusText/
+        // chatEmpty are bound in markup — the rest are update/effect state.
+        "current_chat_id",    "next_seq",           "messages",       "message_count",
+        "pending_user_buf",   "pending_user_len",   "streaming_buf",  "streaming_len",
+        "context_buf",        "context_len",        "sending",        "streaming",
+        "finalizing",         "chat_error_buf",     "chat_error_len", "pushMessage",
+        "canSend",
     };
-    pub fn statusText(self: *const Model) []const u8 {
-        return switch (self.stage) {
-            .booting => "Starting Blocks…",
-            .ready => if (self.onboarded) "Ready" else "Welcome — let's get set up",
-        };
-    }
 };
 
 pub const Msg = union(enum) {
@@ -558,6 +682,17 @@ pub const Msg = union(enum) {
     llama_health_tick: native_sdk.EffectTimer, // delay elapsed -> run the health check
     llama_health_done: native_sdk.EffectResponse, // /health response
 
+    // Chat experience (Task 10)
+    chat_input_edit: canvas.TextInputEvent, // typing in the chat field
+    send_chat, // Send pressed (or field submitted)
+    mcp_search_done: native_sdk.EffectResponse, // search_memory result -> build context
+    chat_line: native_sdk.EffectLine, // one streamed SSE line from the runtime
+    chat_done: native_sdk.EffectResponse, // the completion stream ended (terminal)
+    chat_inserted: native_sdk.EffectDbResult, // new chats row insert result
+    chat_rowid_done: native_sdk.EffectDbResult, // last_insert_rowid() for the new chat
+    chat_write_done: native_sdk.EffectDbResult, // the turn's messages persisted
+    messages_listed: native_sdk.EffectDbResult, // a chat's messages reload
+
     // Delivered by effects/host, never bound as markup handlers.
     pub const view_unbound = .{
         "stat_config",         "wrote_config",       "wrote_keep",
@@ -574,6 +709,11 @@ pub const Msg = union(enum) {
         "config_read_done",    "model_stat_done",    "download_progress_line",
         "download_done",       "model_renamed",      "llama_exit",
         "llama_health_tick",   "llama_health_done",
+        // Task 10 effect-delivered arms (send_chat/chat_input_edit ARE
+        // bound as markup handlers, so they are intentionally omitted).
+        "mcp_search_done",     "chat_line",          "chat_done",
+        "chat_inserted",       "chat_rowid_done",    "chat_write_done",
+        "messages_listed",
     };
 };
 
@@ -648,8 +788,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // Returning user: config already present. Read it to learn
                 // the selected model (then stat the model file).
                 model.onboarded = true;
-                model.data_dir_ready = true;
-                model.stage = .ready;
                 readConfig(fx);
             } else {
                 // First run: create the directory tree + default config.
@@ -660,9 +798,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .wrote_config => |res| {
             if (res.outcome == .ok) {
-                model.data_dir_ready = true;
                 model.onboarded = false;
-                model.stage = .ready;
                 // First-run config just written with the default model id;
                 // check whether that model is already on disk.
                 statSelectedModel(model, fx);
@@ -728,6 +864,61 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 }
             }
         },
+
+        // ---- Chat experience (Task 10) ----
+        .chat_input_edit => |event| {
+            model.chat_input.apply(event);
+            model.clearChatError();
+        },
+        .send_chat => sendChat(model, fx),
+        .mcp_search_done => |res| mcpSearchDone(model, res, fx),
+        .chat_line => |line| {
+            if (line.key != key_llama_chat) return;
+            if (!model.streaming) return;
+            var scratch: [chat.max_content_bytes]u8 = undefined;
+            switch (chat.parseStreamLine(line.line, &scratch)) {
+                .delta => |d| model.appendStreaming(d),
+                // Finalize on the `[DONE]` sentinel: llama-server keeps the
+                // connection open (keep-alive) after `[DONE]`, so the terminal
+                // `chat_done` response lags by the whole stream timeout. The
+                // sentinel is the reliable end-of-turn signal. `finalizeChat`
+                // is idempotent, so a later `chat_done` is a no-op.
+                .done => finalizeChat(model, true, fx),
+                .ignore => {},
+            }
+        },
+        .chat_done => |res| {
+            // Terminal response for the stream. If `[DONE]` already finalized
+            // the turn this is a no-op; otherwise finalize (covers a clean
+            // close without a `[DONE]`, or a mid-stream failure).
+            const ok = res.outcome == .ok;
+            finalizeChat(model, ok, fx);
+        },
+        .chat_inserted => |res| {
+            if (res.outcome == .ok) {
+                // Learn the new chat's id, then persist the turn's messages.
+                fx.dbQuery(.{
+                    .key = key_chat_rowid,
+                    .sql = chat.max_chat_id_sql,
+                    .on_result = Effects.dbMsg(.chat_rowid_done),
+                });
+            } else {
+                model.setChatError("Could not start a new chat.");
+            }
+        },
+        .chat_rowid_done => |res| chatRowidDone(model, res, fx),
+        .chat_write_done => {
+            // The turn's messages are committed — the turn is fully done now.
+            // Clear the interlock (re-enabling Send) and the per-turn buffers,
+            // then reload from the DB (source of truth) so ids/seqs/next_seq
+            // are authoritative.
+            model.sending = false;
+            model.pending_user_len = 0;
+            model.context_len = 0;
+            if (model.current_chat_id != 0) loadMessages(model.current_chat_id, fx);
+        },
+        .messages_listed => |res| messagesListed(model, res),
+
         .wrote_keep => {
             // Directory anchor created; no state change needed. Kept as a
             // distinct arm so a future models UI can react to it.
@@ -1177,6 +1368,279 @@ fn healthCheckLlama(fx: *Effects) void {
         .timeout_ms = 3_000,
         .on_response = Effects.responseMsg(.llama_health_done),
     });
+}
+
+// ------------------------------------------------------------- chat (Task 10)
+
+/// A user pressed Send. Capture the input, show it immediately, and kick off
+/// the turn: first retrieve relevant memory from the MCP server (if it's
+/// reachable), then stream a completion from the local runtime with that
+/// memory injected as context.
+fn sendChat(model: *Model, fx: *Effects) void {
+    if (model.sending) return; // one turn at a time
+    if (!model.llama_ready) {
+        model.setChatError("The model runtime isn't ready yet.");
+        return;
+    }
+    const raw = std.mem.trim(u8, model.chat_input.text(), " \t\r\n");
+    if (raw.len == 0) return;
+
+    model.setPendingUser(raw);
+    model.pushMessage(.user, raw); // optimistic display
+    model.chat_input.clear();
+    model.clearChatError();
+    model.sending = true;
+    model.finalizing = false;
+    model.streaming = false;
+    model.streaming_len = 0;
+    model.context_len = 0;
+
+    // Retrieve memory context first (best-effort). If the MCP server isn't
+    // ready, skip straight to the completion with no injected context.
+    if (model.mcp_ready) {
+        searchMemory(model, fx);
+    } else {
+        startCompletion(model, fx);
+    }
+}
+
+/// POST a `search_memory` tools/call to the MCP server for the pending user
+/// text. The result lands in `mcp_search_done`.
+fn searchMemory(model: *Model, fx: *Effects) void {
+    // Build the request body in a frame-local fixed buffer — no allocator
+    // dependency, no growth over the session (fetch copies the body at call).
+    // Sized for the worst case: every query byte could escape to `\uXXXX`
+    // (6x), plus the fixed JSON-RPC envelope. Generous so retrieval is never
+    // silently skipped for a heavily-punctuated query.
+    var scratch: [chat.max_content_bytes * 6 + 512]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    var body: std.ArrayList(u8) = .empty;
+    chat.buildSearchRequest(&body, fba.allocator(), model.pendingUser(), chat_search_hits) catch {
+        // Couldn't build the request — proceed without context.
+        return startCompletion(model, fx);
+    };
+    var url_buf: [64]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{mcp_port}) catch return;
+    fx.fetch(.{
+        .key = key_mcp_search,
+        .method = .POST,
+        .url = url,
+        .headers = &.{.{ .name = "content-type", .value = "application/json" }},
+        .body = body.items,
+        .timeout_ms = 5_000,
+        .on_response = Effects.responseMsg(.mcp_search_done),
+    });
+}
+
+/// Got the memory-search response (or a failure). Format the hits into the
+/// context block (best-effort) and start the completion either way.
+fn mcpSearchDone(model: *Model, res: native_sdk.EffectResponse, fx: *Effects) void {
+    if (res.outcome == .ok and res.status == 200) {
+        // Parse + format the retrieved hits in a short-lived arena (std.json
+        // builds a tree proportional to the body, which the SDK caps at
+        // 256 KiB). The arena is freed before this update returns, so nothing
+        // accumulates across turns.
+        var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena_state.deinit();
+        var ctx: std.ArrayList(u8) = .empty;
+        const hits = chat.formatSearchContext(&ctx, arena_state.allocator(), res.body, chat_search_hits) catch 0;
+        if (hits > 0) model.setContext(ctx.items);
+    }
+    // Whether or not we found memory, ask the model now.
+    startCompletion(model, fx);
+}
+
+/// Build the OpenAI chat request from the loaded history (which already
+/// includes the just-added user message) + the retrieved context, and open
+/// a streamed completion against the runtime. Tokens arrive via `chat_line`;
+/// the terminal `chat_done` finalizes and persists the turn.
+fn startCompletion(model: *Model, fx: *Effects) void {
+    // Assemble the history as OutMessages (borrowing the model's inline
+    // storage, valid for this call — buildRequest copies into `body`).
+    var hist_buf: [chat.max_messages]chat.OutMessage = undefined;
+    var n: usize = 0;
+    for (model.messagesSlice()) |*m| {
+        if (n >= hist_buf.len) break;
+        hist_buf[n] = .{ .role = m.role, .content = m.content() };
+        n += 1;
+    }
+
+    // Build the request body in a short-lived arena (freed before this
+    // update returns — nothing accumulates across turns). fetch copies the
+    // body at call time.
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    var body: std.ArrayList(u8) = .empty;
+    chat.buildRequest(&body, arena_state.allocator(), hist_buf[0..n], model.contextText(), true, chat_max_tokens) catch {
+        model.sending = false;
+        model.setChatError("Could not build the chat request.");
+        return;
+    };
+
+    model.streaming = true;
+    model.streaming_len = 0;
+
+    var url_buf: [80]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/v1/chat/completions", .{llama_port}) catch return;
+    fx.fetch(.{
+        .key = key_llama_chat,
+        .method = .POST,
+        .url = url,
+        .headers = &.{.{ .name = "content-type", .value = "application/json" }},
+        .body = body.items,
+        .timeout_ms = chat_stream_timeout_ms,
+        .response = .stream, // frame the SSE body into `chat_line` Msgs
+        .on_line = Effects.lineMsg(.chat_line),
+        .on_response = Effects.responseMsg(.chat_done),
+    });
+}
+
+/// Finalize the in-flight completion: turn the accumulated `streaming_buf`
+/// into an assistant message and persist the turn. IDEMPOTENT via the
+/// `finalizing` guard — it is called once on the `[DONE]` stream sentinel and
+/// again on the terminal `chat_done`; the second call returns immediately.
+/// `sending` stays SET across the async persist chain (cleared only in
+/// `chat_write_done` or the failure path here) so `canSend` keeps a second
+/// turn from overlapping the new-chat id recovery. `ok` is false for a
+/// transport failure.
+fn finalizeChat(model: *Model, ok: bool, fx: *Effects) void {
+    if (model.finalizing) return; // already finalized this turn
+    if (!model.sending) return; // no turn in flight
+    model.finalizing = true;
+    model.streaming = false;
+    const reply = model.streamingText();
+
+    // We got the `[DONE]` sentinel or a clean close — cancel the (possibly
+    // still-open, keep-alive) stream fetch so it doesn't linger to its
+    // timeout before the terminal response arrives.
+    fx.cancel(key_llama_chat);
+
+    if (!ok or reply.len == 0) {
+        // Nothing usable came back. Drop the in-flight turn state; keep the
+        // user's message visible so they can retry. No persist runs, so clear
+        // `sending` here to re-enable input.
+        model.sending = false;
+        model.streaming_len = 0;
+        model.context_len = 0;
+        if (!ok) model.setChatError("The model did not respond. Is the runtime still up?");
+        return;
+    }
+
+    // Show the finished reply as a real message and clear the streaming line.
+    model.pushMessage(.assistant, reply);
+    model.streaming_len = 0;
+
+    // Persist the turn. If this is a brand-new chat, create the row first
+    // (its id + the messages are written once the id comes back); otherwise
+    // write the two messages directly.
+    if (model.current_chat_id == 0) {
+        createChatThenPersist(model, fx);
+    } else {
+        persistTurn(model, fx);
+    }
+}
+
+/// INSERT a new `chats` row titled from the user's first message; the id is
+/// read back in `chat_rowid_done`, which then persists the turn's messages.
+fn createChatThenPersist(model: *Model, fx: *Effects) void {
+    const title = chat.excerptTitle(model.pendingUser());
+    var params: [3]db.Value = undefined;
+    fx.dbExec(.{
+        .key = key_chat_insert,
+        .statements = &.{chat.chatInsertStatement(&params, title, title, fx.wallMs())},
+        .on_result = Effects.dbMsg(.chat_inserted),
+    });
+}
+
+/// The new chat's id came back — adopt it and persist the turn's messages.
+fn chatRowidDone(model: *Model, res: native_sdk.EffectDbResult, fx: *Effects) void {
+    switch (res.kind) {
+        .page => {
+            var reader = db.PageReader.init(res.bytes) catch return;
+            var row: [1]db.ColumnValue = undefined;
+            if ((reader.next(&row) catch null)) |cols| {
+                if (cols.len > 0) {
+                    if (cols[0].asInt()) |id| {
+                        model.current_chat_id = id;
+                        model.next_seq = 0;
+                    }
+                }
+            }
+        },
+        .done => persistTurn(model, fx),
+        .exec => {},
+    }
+}
+
+/// Write the turn's two messages (user then assistant) with monotonic seqs
+/// and bump the chat's preview/updated_at, all in one exec batch.
+fn persistTurn(model: *Model, fx: *Effects) void {
+    if (model.current_chat_id == 0) {
+        // We finished a reply but couldn't obtain a chat id to save it under.
+        // Surface it and re-enable input; the messages stay on screen.
+        model.sending = false;
+        model.setChatError("Couldn't save this chat — your reply is shown but not stored.");
+        return;
+    }
+    const now = fx.wallMs();
+    // `next_seq` is authoritative in-model: it starts at 0 for a new chat and
+    // is recomputed from the DB on every reload (`messagesListed`), so the two
+    // seqs for this turn are next_seq and next_seq+1. The reload after the
+    // write refreshes it, so we do NOT advance it here (that would double it).
+    const user_seq = model.next_seq;
+    const asst_seq = model.next_seq + 1;
+
+    // The assistant reply is the last message `finalizeChat` pushed.
+    const reply = if (model.message_count > 0)
+        model.messages[model.message_count - 1].content()
+    else
+        "";
+
+    var user_params: [5]db.Value = undefined;
+    var asst_params: [5]db.Value = undefined;
+    var touch_params: [3]db.Value = undefined;
+    const preview = chat.excerptTitle(reply);
+    fx.dbExec(.{
+        .key = key_chat_write,
+        .statements = &.{
+            chat.messageInsertStatement(&user_params, model.current_chat_id, .user, model.pendingUser(), user_seq, now),
+            chat.messageInsertStatement(&asst_params, model.current_chat_id, .assistant, reply, asst_seq, now),
+            chat.chatTouchStatement(&touch_params, preview, now, model.current_chat_id),
+        },
+        .on_result = Effects.dbMsg(.chat_write_done),
+    });
+    // `sending` stays SET until `chat_write_done` — the turn isn't done until
+    // the write commits, which keeps a second turn from overlapping.
+}
+
+/// Load a chat's messages into the model (oldest first). ?1 = chat id.
+fn loadMessages(chat_id: i64, fx: *Effects) void {
+    var params: [1]db.Value = .{db.val.int(chat_id)};
+    fx.dbQuery(.{
+        .key = key_messages_list,
+        .sql = chat.messages_by_chat_sql,
+        .params = &params,
+        .on_result = Effects.dbMsg(.messages_listed),
+    });
+}
+
+/// Copy a `messages_listed` page into the model's owned list.
+fn messagesListed(model: *Model, res: native_sdk.EffectDbResult) void {
+    switch (res.kind) {
+        .page => {
+            var reader = db.PageReader.init(res.bytes) catch return;
+            model.message_count = 0;
+            var row: [8]db.ColumnValue = undefined;
+            while (reader.next(&row) catch null) |cols| {
+                if (model.message_count >= chat.max_messages) break;
+                const m = chat.Message.fromRow(cols) orelse continue;
+                model.messages[model.message_count] = chat.MessageEntry.fromMessage(m);
+                model.message_count += 1;
+                if (m.seq + 1 > model.next_seq) model.next_seq = m.seq + 1;
+            }
+        },
+        .done, .exec => {},
+    }
 }
 
 /// Interpret a launch-at-login host result (from either the status query or

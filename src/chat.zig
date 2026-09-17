@@ -1,0 +1,659 @@
+//! Chat data layer + local-LLM protocol shaping — PURE (Task 10).
+//!
+//! Blocks' chat talks to the LOCAL llama.cpp runtime over its
+//! OpenAI-compatible HTTP API and grounds answers in the developer's own
+//! git/file memory via the MCP `search_memory` tool. This module owns
+//! everything about that exchange that can be expressed without touching
+//! the OS or the network:
+//!
+//!   * the `chats` / `messages` data layer (statement builders + row
+//!     decoders + a model-owned `MessageEntry` inline copy), mirroring the
+//!     conventions in repos.zig / git.zig (caller-owned `*[N]db.Value`
+//!     param buffers, `select_columns`/`*_sql` consts, `fromRow`),
+//!   * a builder for the `/v1/chat/completions` request body (system prompt
+//!     + the message history + an optional retrieved-memory context block),
+//!   * a parser for the streamed Server-Sent-Events `data:` lines (extract
+//!     each `delta.content` token; detect the terminal `[DONE]`) and for a
+//!     buffered (non-streamed) completion,
+//!   * the MCP `tools/call` request body for `search_memory`, the unwrapper
+//!     for its double-wrapped result (`result.content[0].text` -> the tool's
+//!     own JSON), and a formatter that turns the ranked hits into a compact
+//!     plain-text context block to inject.
+//!
+//! **Retrieval strategy (v1 decision — see docs/PROGRESS.md):** rather than
+//! rely on the small local model's (unreliable) native tool-calling, the app
+//! does retrieval-augmented generation — it calls `search_memory` with the
+//! user's message itself and injects the top hits as context BEFORE asking
+//! the model. Deterministic, works with a 1.5-3B model, and still exercises
+//! the MCP tools built in Task 8. Native OpenAI tool-calling is a follow-up.
+//!
+//! Everything here is pure and unit-tested; the effect firing lives in
+//! main.zig.
+
+const std = @import("std");
+const db = @import("db.zig");
+
+// ------------------------------------------------------- message roles
+
+/// A chat message role. Stored as TEXT in the `messages.role` column
+/// ('user' | 'assistant' | 'system') and mapped to the OpenAI role names
+/// (which are identical) in the request body.
+pub const Role = enum {
+    user,
+    assistant,
+    system,
+
+    pub fn name(self: Role) []const u8 {
+        return switch (self) {
+            .user => "user",
+            .assistant => "assistant",
+            .system => "system",
+        };
+    }
+    pub fn fromName(s: []const u8) ?Role {
+        if (std.mem.eql(u8, s, "user")) return .user;
+        if (std.mem.eql(u8, s, "assistant")) return .assistant;
+        if (std.mem.eql(u8, s, "system")) return .system;
+        return null;
+    }
+};
+
+// ------------------------------------------------------- chats table
+
+pub const chat_select_columns = "id, title, preview, kind, created_at, updated_at";
+
+/// Insert a new chat. Title/preview are set from the first user message;
+/// kind defaults to 'chat'. ?1=title ?2=preview ?3=now(created) ?4=now(updated)
+pub const chat_insert_sql =
+    "INSERT INTO chats(title, preview, kind, created_at, updated_at) " ++
+    "VALUES(?1, ?2, 'chat', ?3, ?3);";
+
+/// Bump a chat's preview + updated_at after a new message. ?1=preview ?2=now ?3=id
+pub const chat_touch_sql =
+    "UPDATE chats SET preview = ?1, updated_at = ?2 WHERE id = ?3;";
+
+pub fn chatInsertStatement(buf: *[3]db.Value, title: []const u8, preview: []const u8, now_ms: i64) db.Statement {
+    buf.* = .{ db.val.text(title), db.val.text(preview), db.val.int(now_ms) };
+    return .{ .sql = chat_insert_sql, .params = buf };
+}
+
+pub fn chatTouchStatement(buf: *[3]db.Value, preview: []const u8, now_ms: i64, chat_id: i64) db.Statement {
+    buf.* = .{ db.val.text(preview), db.val.int(now_ms), db.val.int(chat_id) };
+    return .{ .sql = chat_touch_sql, .params = buf };
+}
+
+// ------------------------------------------------------- messages table
+
+pub const msg_select_columns = "id, chat_id, role, content, seq, created_at";
+
+/// Messages for one chat in order. ?1 = chat_id.
+pub const messages_by_chat_sql =
+    "SELECT " ++ msg_select_columns ++ " FROM messages WHERE chat_id = ?1 ORDER BY seq ASC;";
+
+/// Insert one message. ?1=chat_id ?2=role ?3=content ?4=seq ?5=now.
+pub const message_insert_sql =
+    "INSERT INTO messages(chat_id, role, content, seq, created_at) " ++
+    "VALUES(?1, ?2, ?3, ?4, ?5);";
+
+/// The id of the most recently created chat. We read the new chat's id back
+/// with this (MAX(id)) rather than `last_insert_rowid()`: the SDK relational
+/// store may run a follow-up query on a DIFFERENT pooled connection, where
+/// `last_insert_rowid()` is 0. Blocks is the SOLE writer and rows are never
+/// deleted mid-turn, so the greatest id is the chat we just inserted.
+pub const max_chat_id_sql = "SELECT MAX(id) FROM chats;";
+
+pub fn messageInsertStatement(
+    buf: *[5]db.Value,
+    chat_id: i64,
+    role: Role,
+    content: []const u8,
+    seq: i64,
+    now_ms: i64,
+) db.Statement {
+    buf.* = .{
+        db.val.int(chat_id),
+        db.val.text(role.name()),
+        db.val.text(content),
+        db.val.int(seq),
+        db.val.int(now_ms),
+    };
+    return .{ .sql = message_insert_sql, .params = buf };
+}
+
+/// A decoded `messages` row. Slices borrow the page bytes — copy what the
+/// model keeps (see `MessageEntry`).
+pub const Message = struct {
+    id: i64,
+    chat_id: i64,
+    role: Role,
+    content: []const u8,
+    seq: i64,
+
+    pub fn fromRow(cols: []const db.ColumnValue) ?Message {
+        if (cols.len < 5) return null;
+        return .{
+            .id = cols[0].asInt() orelse return null,
+            .chat_id = cols[1].asInt() orelse return null,
+            .role = Role.fromName(cols[2].asText() orelse return null) orelse return null,
+            .content = cols[3].asText() orelse return null,
+            .seq = cols[4].asInt() orelse return null,
+        };
+    }
+};
+
+/// Bounds for the model-owned message list (fixed inline storage, no alloc).
+pub const max_content_bytes = 8 * 1024; // per-message content cap for display/storage
+pub const max_messages = 256; // messages kept loaded per chat
+
+/// A model-owned copy of a message row with inline content storage, so the
+/// loaded conversation survives across updates without an allocator (the DB
+/// page bytes a query returns are only valid during the receiving update).
+pub const MessageEntry = struct {
+    id: i64 = 0,
+    role: Role = .user,
+    seq: i64 = 0,
+    content_buf: [max_content_bytes]u8 = undefined,
+    content_len: usize = 0,
+
+    pub fn content(self: *const MessageEntry) []const u8 {
+        return self.content_buf[0..self.content_len];
+    }
+    pub fn isUser(self: *const MessageEntry) bool {
+        return self.role == .user;
+    }
+    pub fn isAssistant(self: *const MessageEntry) bool {
+        return self.role == .assistant;
+    }
+    /// The role as a display label for the view.
+    pub fn roleLabel(self: *const MessageEntry) []const u8 {
+        return switch (self.role) {
+            .user => "You",
+            .assistant => "Blocks",
+            .system => "System",
+        };
+    }
+
+    pub fn fromMessage(m: Message) MessageEntry {
+        var e = MessageEntry{ .id = m.id, .role = m.role, .seq = m.seq };
+        e.setContent(m.content);
+        return e;
+    }
+    pub fn set(role: Role, text: []const u8) MessageEntry {
+        var e = MessageEntry{ .role = role };
+        e.setContent(text);
+        return e;
+    }
+    fn setContent(self: *MessageEntry, text: []const u8) void {
+        self.content_len = @min(text.len, max_content_bytes);
+        @memcpy(self.content_buf[0..self.content_len], text[0..self.content_len]);
+    }
+};
+
+// --------------------------------------------- OpenAI chat request body
+
+/// The system prompt that frames Blocks' assistant persona and tells it how
+/// to use the injected memory context.
+pub const system_prompt =
+    "You are Blocks, a developer's memory assistant. You help the user recall " ++
+    "and reason about their own recent coding work — git commits and file changes " ++
+    "across their watched repositories. When a \"Relevant memory\" section is " ++
+    "provided below, ground your answer in it and cite specifics (repo names, commit " ++
+    "subjects, files). If the memory does not contain the answer, say so plainly " ++
+    "rather than inventing details. Be concise and concrete.";
+
+/// A message to serialize into the request (borrowed slices).
+pub const OutMessage = struct {
+    role: Role,
+    content: []const u8,
+};
+
+/// Build the JSON body for POST /v1/chat/completions into `out`.
+///
+///   {"model":"local","stream":<stream>,"max_tokens":<max>,"messages":[
+///      {"role":"system","content":<system_prompt [+ context]>},
+///      {"role":<r>,"content":<c>}, ... ]}
+///
+/// `context` (when non-empty) is appended to the system message as a
+/// "Relevant memory" block — this is the RAG injection. `history` are the
+/// prior turns (oldest first) plus the new user message. All strings are
+/// JSON-escaped. `model_name` is cosmetic (llama-server ignores it and uses
+/// the loaded model), but we send a stable value.
+pub fn buildRequest(
+    out: *std.ArrayList(u8),
+    alloc: std.mem.Allocator,
+    history: []const OutMessage,
+    context: []const u8,
+    stream: bool,
+    max_tokens: u32,
+) !void {
+    var w = JsonWriter{ .out = out, .alloc = alloc };
+    try w.raw("{\"model\":\"local\",\"stream\":");
+    try w.raw(if (stream) "true" else "false");
+    try w.raw(",\"max_tokens\":");
+    try w.number(@intCast(max_tokens));
+    try w.raw(",\"messages\":[");
+
+    // System message (prompt + optional retrieved context).
+    try w.raw("{\"role\":\"system\",\"content\":");
+    if (context.len == 0) {
+        try w.string(system_prompt);
+    } else {
+        // Concatenate prompt + context into one escaped string.
+        try w.beginString();
+        try w.stringChunk(system_prompt);
+        try w.stringChunk("\n\nRelevant memory:\n");
+        try w.stringChunk(context);
+        try w.endString();
+    }
+    try w.raw("}");
+
+    for (history) |m| {
+        try w.raw(",{\"role\":");
+        try w.string(m.role.name());
+        try w.raw(",\"content\":");
+        try w.string(m.content);
+        try w.raw("}");
+    }
+    try w.raw("]}");
+}
+
+// --------------------------------------------- streamed response parsing
+
+/// The outcome of feeding one streamed line to the parser.
+pub const StreamEvent = union(enum) {
+    /// A content token to append to the in-progress assistant message.
+    delta: []const u8,
+    /// The terminal `data: [DONE]` sentinel — the stream is complete.
+    done,
+    /// A line with no content for us (keep-alive, role-only delta, blank).
+    ignore,
+};
+
+/// Parse one line of the llama-server SSE stream. Lines look like:
+///   `data: {"choices":[{"delta":{"content":"Hello"},...}]}`
+///   `data: [DONE]`
+/// Non-`data:` lines (blank keep-alives, comments) are ignored. The
+/// returned `delta` slice borrows `line` (valid only for this call).
+/// `scratch` is used to unescape the JSON string content.
+pub fn parseStreamLine(line: []const u8, scratch: []u8) StreamEvent {
+    const trimmed = std.mem.trim(u8, line, " \r\n\t");
+    if (trimmed.len == 0) return .ignore;
+    if (!std.mem.startsWith(u8, trimmed, "data:")) return .ignore;
+    const payload = std.mem.trim(u8, trimmed["data:".len..], " \r\n\t");
+    if (std.mem.eql(u8, payload, "[DONE]")) return .done;
+    // Extract the "content" string from the first choice's delta. We do a
+    // targeted scan rather than a full JSON parse to stay allocation-free
+    // in the hot streaming path.
+    const content = extractDeltaContent(payload, scratch) orelse return .ignore;
+    if (content.len == 0) return .ignore;
+    return .{ .delta = content };
+}
+
+/// Find `"content":"..."` inside a chat.completion.chunk payload and return
+/// the UNESCAPED string (written into `scratch`). Returns null if there is
+/// no content field (e.g. a role-only opening delta or a finish chunk).
+fn extractDeltaContent(payload: []const u8, scratch: []u8) ?[]const u8 {
+    const key = "\"content\":";
+    const at = std.mem.indexOf(u8, payload, key) orelse return null;
+    var i = at + key.len;
+    while (i < payload.len and (payload[i] == ' ' or payload[i] == '\t')) i += 1;
+    if (i >= payload.len) return null;
+    if (payload[i] == 'n') return null; // "content":null (no token)
+    if (payload[i] != '"') return null;
+    i += 1;
+    return unescapeJsonString(payload[i..], scratch);
+}
+
+/// Unescape a JSON string body (the bytes AFTER the opening quote) up to the
+/// closing unescaped quote, writing the decoded bytes into `scratch`.
+fn unescapeJsonString(s: []const u8, scratch: []u8) ?[]const u8 {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c == '"') return scratch[0..n];
+        if (n >= scratch.len) return scratch[0..n]; // cap — keep what we have
+        if (c == '\\' and i + 1 < s.len) {
+            i += 1;
+            const e = s[i];
+            const decoded: u8 = switch (e) {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                '"' => '"',
+                '\\' => '\\',
+                '/' => '/',
+                'b' => 0x08,
+                'f' => 0x0c,
+                'u' => {
+                    // \uXXXX — emit the codepoint as UTF-8 (BMP only; good
+                    // enough for chat text) and advance past the 4 hex digits.
+                    if (i + 4 >= s.len) return scratch[0..n];
+                    const cp = std.fmt.parseInt(u21, s[i + 1 .. i + 5], 16) catch {
+                        i += 5;
+                        continue;
+                    };
+                    i += 4;
+                    var utf8: [4]u8 = undefined;
+                    const len = std.unicode.utf8Encode(cp, &utf8) catch {
+                        i += 1;
+                        continue;
+                    };
+                    const room = @min(len, scratch.len - n);
+                    @memcpy(scratch[n .. n + room], utf8[0..room]);
+                    n += room;
+                    i += 1;
+                    continue;
+                },
+                else => e,
+            };
+            scratch[n] = decoded;
+            n += 1;
+            i += 1;
+            continue;
+        }
+        scratch[n] = c;
+        n += 1;
+        i += 1;
+    }
+    return scratch[0..n]; // no closing quote seen (partial) — return what we have
+}
+
+// ------------------------------------------------- MCP search_memory call
+
+/// Build the JSON-RPC `tools/call` body for `search_memory` into `out`:
+///   {"jsonrpc":"2.0","id":1,"method":"tools/call",
+///    "params":{"name":"search_memory","arguments":{"query":<q>,"limit":<n>}}}
+pub fn buildSearchRequest(out: *std.ArrayList(u8), alloc: std.mem.Allocator, query: []const u8, limit: u32) !void {
+    var w = JsonWriter{ .out = out, .alloc = alloc };
+    try w.raw("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"search_memory\",\"arguments\":{\"query\":");
+    try w.string(query);
+    try w.raw(",\"limit\":");
+    try w.number(@intCast(limit));
+    try w.raw("}}}");
+}
+
+/// Turn an MCP `search_memory` HTTP response body into a compact plain-text
+/// context block for injection, written into `out`. The response is
+/// double-wrapped: JSON-RPC `result.content[0].text` is itself the tool's
+/// JSON (`{"query":...,"results":[{repo,title,snippet,...}]}`). We parse it
+/// with std.json (this runs once per user turn, off the hot path) and emit
+/// up to `max_hits` lines like:
+///   - [<repo>] <title>: <snippet>
+/// Returns the number of hits written (0 when there are none / on any parse
+/// failure — retrieval is best-effort and never blocks the chat).
+pub fn formatSearchContext(
+    out: *std.ArrayList(u8),
+    alloc: std.mem.Allocator,
+    response_body: []const u8,
+    max_hits: usize,
+) !usize {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, response_body, .{}) catch return 0;
+    defer parsed.deinit();
+    if (parsed.value != .object) return 0;
+
+    // result.content[0].text
+    const result = parsed.value.object.get("result") orelse return 0;
+    if (result != .object) return 0;
+    const content = result.object.get("content") orelse return 0;
+    if (content != .array or content.array.items.len == 0) return 0;
+    const first = content.array.items[0];
+    if (first != .object) return 0;
+    const text_v = first.object.get("text") orelse return 0;
+    if (text_v != .string) return 0;
+
+    // Parse the inner tool JSON.
+    var inner = std.json.parseFromSlice(std.json.Value, alloc, text_v.string, .{}) catch return 0;
+    defer inner.deinit();
+    if (inner.value != .object) return 0;
+    const results = inner.value.object.get("results") orelse return 0;
+    if (results != .array) return 0;
+
+    var written: usize = 0;
+    for (results.array.items) |hit| {
+        if (written >= max_hits) break;
+        if (hit != .object) continue;
+        const repo = strField(hit.object, "repo") orelse "";
+        const title = strField(hit.object, "title") orelse "";
+        const snippet = strField(hit.object, "snippet") orelse "";
+        try out.appendSlice(alloc, "- [");
+        try out.appendSlice(alloc, repo);
+        try out.appendSlice(alloc, "] ");
+        try out.appendSlice(alloc, title);
+        if (snippet.len > 0) {
+            try out.appendSlice(alloc, ": ");
+            try out.appendSlice(alloc, snippet);
+        }
+        try out.appendSlice(alloc, "\n");
+        written += 1;
+    }
+    return written;
+}
+
+fn strField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const v = obj.get(key) orelse return null;
+    return if (v == .string) v.string else null;
+}
+
+// --------------------------------------------------------- misc helpers
+
+/// The maximum length of a chat title/preview derived from a message.
+pub const title_max_bytes = 80;
+
+/// Derive a short single-line title/preview from a message: trim, collapse
+/// to the first line, and cap at `title_max_bytes` (UTF-8-safe-ish). Returns
+/// a slice of `text` (no allocation). Used for the chat's title + preview.
+pub fn excerptTitle(text: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    // Cut at the first newline.
+    var end = trimmed.len;
+    if (std.mem.indexOfScalar(u8, trimmed, '\n')) |nl| end = nl;
+    if (end > title_max_bytes) {
+        end = title_max_bytes;
+        // Back off over a UTF-8 continuation boundary.
+        while (end > 0 and (trimmed[end] & 0xC0) == 0x80) end -= 1;
+    }
+    return trimmed[0..end];
+}
+
+// --------------------------------------------------------- JSON writer
+
+/// A tiny allocation-light JSON string writer over a caller `ArrayList`.
+/// Kept local (rather than importing the MCP one) so this module has no
+/// dependency on the MCP layer.
+const JsonWriter = struct {
+    out: *std.ArrayList(u8),
+    alloc: std.mem.Allocator,
+
+    fn raw(self: *JsonWriter, s: []const u8) !void {
+        try self.out.appendSlice(self.alloc, s);
+    }
+    fn number(self: *JsonWriter, n: i64) !void {
+        var buf: [24]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable;
+        try self.raw(s);
+    }
+    fn beginString(self: *JsonWriter) !void {
+        try self.out.append(self.alloc, '"');
+    }
+    fn endString(self: *JsonWriter) !void {
+        try self.out.append(self.alloc, '"');
+    }
+    /// Append escaped bytes to an already-open string (no surrounding quotes).
+    fn stringChunk(self: *JsonWriter, s: []const u8) !void {
+        for (s) |c| {
+            switch (c) {
+                '"' => try self.raw("\\\""),
+                '\\' => try self.raw("\\\\"),
+                '\n' => try self.raw("\\n"),
+                '\r' => try self.raw("\\r"),
+                '\t' => try self.raw("\\t"),
+                0x08 => try self.raw("\\b"),
+                0x0c => try self.raw("\\f"),
+                else => {
+                    if (c < 0x20) {
+                        var b: [6]u8 = undefined;
+                        const e = std.fmt.bufPrint(&b, "\\u{x:0>4}", .{c}) catch unreachable;
+                        try self.raw(e);
+                    } else {
+                        try self.out.append(self.alloc, c);
+                    }
+                },
+            }
+        }
+    }
+    /// Write a complete quoted, escaped JSON string.
+    fn string(self: *JsonWriter, s: []const u8) !void {
+        try self.beginString();
+        try self.stringChunk(s);
+        try self.endString();
+    }
+};
+
+// --------------------------------------------------------------- tests
+
+const testing = std.testing;
+
+test "Role round-trips through name/fromName" {
+    try testing.expectEqualStrings("assistant", Role.assistant.name());
+    try testing.expectEqual(Role.user, Role.fromName("user").?);
+    try testing.expectEqual(Role.system, Role.fromName("system").?);
+    try testing.expect(Role.fromName("bogus") == null);
+}
+
+test "message/chat statement builders carry the right params" {
+    var cbuf: [3]db.Value = undefined;
+    const c = chatInsertStatement(&cbuf, "Title", "Preview", 1000);
+    try testing.expectEqualStrings("Title", c.params[0].text);
+    try testing.expectEqualStrings("Preview", c.params[1].text);
+    try testing.expectEqual(@as(i64, 1000), c.params[2].integer);
+
+    var mbuf: [5]db.Value = undefined;
+    const m = messageInsertStatement(&mbuf, 7, .assistant, "hi", 3, 2000);
+    try testing.expectEqual(@as(i64, 7), m.params[0].integer);
+    try testing.expectEqualStrings("assistant", m.params[1].text);
+    try testing.expectEqualStrings("hi", m.params[2].text);
+    try testing.expectEqual(@as(i64, 3), m.params[3].integer);
+    try testing.expectEqual(@as(i64, 2000), m.params[4].integer);
+}
+
+test "MessageEntry copies content and reports role" {
+    const e = MessageEntry.set(.user, "hello world");
+    try testing.expectEqualStrings("hello world", e.content());
+    try testing.expect(e.isUser());
+    try testing.expectEqualStrings("You", e.roleLabel());
+}
+
+test "buildRequest without context embeds the system prompt and messages" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    const hist = [_]OutMessage{
+        .{ .role = .user, .content = "hi \"there\"" },
+    };
+    try buildRequest(&out, testing.allocator, &hist, "", true, 256);
+    // Valid JSON with stream true and the escaped user content.
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"stream\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\\\"there\\\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "You are Blocks") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.items, .{});
+    defer parsed.deinit();
+}
+
+test "buildRequest with context injects a Relevant memory block" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    const hist = [_]OutMessage{.{ .role = .user, .content = "what did I do?" }};
+    try buildRequest(&out, testing.allocator, &hist, "- [repo] Fix bug: details", false, 128);
+    try testing.expect(std.mem.indexOf(u8, out.items, "Relevant memory") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "Fix bug") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"stream\":false") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.items, .{});
+    defer parsed.deinit();
+}
+
+test "parseStreamLine extracts delta content, DONE, and ignores others" {
+    var scratch: [256]u8 = undefined;
+    const d = parseStreamLine("data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"index\":0}]}", &scratch);
+    try testing.expectEqualStrings("Hello", d.delta);
+
+    const done = parseStreamLine("data: [DONE]", &scratch);
+    try testing.expectEqual(StreamEvent.done, done);
+
+    // Role-only opening delta -> no content -> ignore.
+    const role = parseStreamLine("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"index\":0}]}", &scratch);
+    try testing.expectEqual(StreamEvent.ignore, role);
+
+    // Blank keep-alive.
+    try testing.expectEqual(StreamEvent.ignore, parseStreamLine("", &scratch));
+    try testing.expectEqual(StreamEvent.ignore, parseStreamLine(": ping", &scratch));
+}
+
+test "parseStreamLine unescapes newlines and quotes in content" {
+    var scratch: [256]u8 = undefined;
+    const d = parseStreamLine("data: {\"choices\":[{\"delta\":{\"content\":\"line1\\nsay \\\"hi\\\"\"}}]}", &scratch);
+    try testing.expectEqualStrings("line1\nsay \"hi\"", d.delta);
+}
+
+test "buildSearchRequest builds a tools/call for search_memory" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try buildSearchRequest(&out, testing.allocator, "tray commit", 5);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"method\":\"tools/call\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"name\":\"search_memory\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"query\":\"tray commit\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"limit\":5") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.items, .{});
+    defer parsed.deinit();
+}
+
+test "formatSearchContext unwraps the double-wrapped result into lines" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    // The inner tool JSON (as text) with two hits.
+    const inner =
+        "{\"query\":\"tray\",\"results\":[" ++
+        "{\"kind\":\"event\",\"repo\":\"blocks\",\"title\":\"Task 6: tray\",\"snippet\":\"always-on tray\",\"score\":0.9}," ++
+        "{\"kind\":\"file_snapshot\",\"repo\":\"blocks\",\"title\":\"src/tray.zig\",\"snippet\":\"menu builder\",\"score\":0.7}]}";
+    // The MCP envelope wraps that as result.content[0].text (escaped).
+    var envelope: std.ArrayList(u8) = .empty;
+    defer envelope.deinit(testing.allocator);
+    var w = JsonWriter{ .out = &envelope, .alloc = testing.allocator };
+    try w.raw("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":");
+    try w.string(inner);
+    try w.raw("}],\"isError\":false}}");
+
+    const n = try formatSearchContext(&out, testing.allocator, envelope.items, 5);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expect(std.mem.indexOf(u8, out.items, "[blocks] Task 6: tray: always-on tray") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/tray.zig: menu builder") != null);
+}
+
+test "formatSearchContext returns 0 on malformed or empty input" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), try formatSearchContext(&out, testing.allocator, "not json", 5));
+    try testing.expectEqual(@as(usize, 0), try formatSearchContext(&out, testing.allocator, "{\"result\":{}}", 5));
+}
+
+test "excerptTitle trims, takes the first line, and caps length" {
+    try testing.expectEqualStrings("hello", excerptTitle("  hello  "));
+    try testing.expectEqualStrings("first line", excerptTitle("first line\nsecond line"));
+    const long = "x" ** 200;
+    try testing.expectEqual(@as(usize, title_max_bytes), excerptTitle(long).len);
+}
+
+test "Message.fromRow decodes a messages row" {
+    var cols = [_]db.ColumnValue{
+        .{ .integer = 5 },
+        .{ .integer = 2 },
+        .{ .text = "assistant" },
+        .{ .text = "hi" },
+        .{ .integer = 1 },
+    };
+    const m = Message.fromRow(&cols).?;
+    try testing.expectEqual(@as(i64, 5), m.id);
+    try testing.expectEqual(@as(i64, 2), m.chat_id);
+    try testing.expectEqual(Role.assistant, m.role);
+    try testing.expectEqualStrings("hi", m.content);
+    try testing.expectEqual(@as(i64, 1), m.seq);
+}

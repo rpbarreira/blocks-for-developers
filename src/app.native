@@ -1,12 +1,51 @@
-<!-- Task 3 shell: the Watched Repositories management section. This will
-     move into the Settings modal in Task 13; for now it is the main view
-     so the add/list/remove flow is demoable. Data lives in the repos
-     table; adding validates the folder is a git repo via `git rev-parse`. -->
-<column gap="14" padding="20" grow="1">
+<!-- Task 10: the Chat experience is the primary view. It talks to the local
+     llama.cpp runtime (/v1/chat/completions, streamed) and grounds answers in
+     the user's git/file memory via the MCP `search_memory` tool (retrieval-
+     augmented). This is a FUNCTIONAL demo layout; the high-fidelity
+     chat_screen.png (sidebar, single-click summary cards, message bubbles,
+     Save-to-Snippets) is Task 13 polish, once Tasks 11/12 exist. The Task 3
+     Watched Repositories + Task 9 Local model sections remain below and move
+     into the Settings modal in Task 13. -->
+<column gap="12" padding="20" grow="1">
   <row cross="center" gap="8">
-    <text size="heading" grow="1">Watched Repositories</text>
+    <text size="heading" grow="1">Blocks</text>
     <text>{usernameText}</text>
   </row>
+
+  <!-- Conversation transcript. -->
+  <scroll grow="1">
+    <column gap="10">
+      <if test="{chatEmpty}">
+        <status-bar>Ask Blocks about your recent work — commits, file changes, what you were doing.</status-bar>
+      </if>
+      <for each="messagesSlice" key="id" as="msg">
+        <column gap="2">
+          <status-bar>{msg.roleLabel}</status-bar>
+          <text>{msg.content}</text>
+        </column>
+      </for>
+      <!-- The in-progress assistant reply, as tokens stream in. -->
+      <if test="{isStreaming}">
+        <column gap="2">
+          <status-bar>Blocks</status-bar>
+          <text>{streamingText}</text>
+        </column>
+      </if>
+    </column>
+  </scroll>
+
+  <status-bar>{chatStatusText}</status-bar>
+  <row gap="8" cross="center">
+    <text-field
+      placeholder="Ask about your recent work…"
+      on-input="chat_input_edit"
+      on-submit="send_chat"
+      grow="1" />
+    <button variant="primary" on-press="send_chat" disabled="{sendDisabled}">Send</button>
+  </row>
+
+  <!-- Watched repositories (Task 3) — moves into Settings in Task 13. -->
+  <text size="heading">Watched Repositories</text>
   <text>Blocks indexes the git history and file changes of the repositories you watch.</text>
 
   <row gap="8" cross="center">
@@ -22,24 +61,20 @@
     <text>{repoError}</text>
   </if>
 
-  <scroll grow="1">
-    <column gap="4">
-      <for each="reposSlice" key="id" as="r">
-        <row gap="8" padding="8" cross="center">
-          <column grow="1" gap="2">
-            <text>{r.name}</text>
-            <status-bar>{r.path}</status-bar>
-          </column>
-          <button size="sm" variant="ghost" on-press="remove_repo:{r.id}">Remove</button>
-        </row>
-      </for>
-    </column>
-  </scroll>
+  <column gap="4">
+    <for each="reposSlice" key="id" as="r">
+      <row gap="8" padding="8" cross="center">
+        <column grow="1" gap="2">
+          <text>{r.name}</text>
+          <status-bar>{r.path}</status-bar>
+        </column>
+        <button size="sm" variant="ghost" on-press="remove_repo:{r.id}">Remove</button>
+      </row>
+    </for>
+  </column>
 
   <!-- Task 9: local model management. A compact picker over the curated
-       catalog + a download/runtime status line. The full model-picker
-       mockup lands with the chat wiring (Task 10) / settings (Task 13);
-       this makes the select/download/runtime flow demoable now. -->
+       catalog + a download/runtime status line. Moves into Settings in Task 13. -->
   <column gap="6" padding="8">
     <text size="heading">Local model</text>
     <text>Blocks chats with a model that runs entirely on your machine.</text>
