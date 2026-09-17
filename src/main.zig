@@ -23,6 +23,7 @@ const git = @import("git.zig");
 const snapshots = @import("snapshots.zig");
 const tray = @import("tray.zig");
 const embeddings = @import("embeddings.zig");
+const models = @import("models.zig");
 
 const canvas = native_sdk.canvas;
 
@@ -73,6 +74,13 @@ const key_embed_write: u64 = 152; // insert embeddings + fts rows
 // MCP server child process (Task 8). Share the spawn/fetch/file key space.
 const key_mcp_spawn: u64 = 160; // spawn the blocks-mcp child
 const key_mcp_health: u64 = 161; // fetch tools/list to confirm it's up
+// Local model management + llama.cpp runtime (Task 9). spawn/fetch/file keys:
+const key_cfg_read: u64 = 170; // read config.json to learn the selected model
+const key_model_stat: u64 = 171; // stat the model file to see if it's present
+const key_model_download: u64 = 172; // spawn curl to download the GGUF (.lines)
+const key_model_rename: u64 = 173; // spawn mv to move .part into place
+const key_llama_spawn: u64 = 174; // spawn the llama-server runtime child
+const key_llama_health: u64 = 175; // fetch /health to confirm the runtime is up
 
 /// The loopback port the MCP child binds (passed explicitly so the app
 /// knows where to reach it without first reading the endpoint file).
@@ -88,6 +96,16 @@ const mcp_health_body =
     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}";
 /// One-shot delay before the health check, giving the child time to bind.
 const mcp_health_delay_ms: u64 = 400;
+
+/// The loopback port the llama.cpp runtime binds. Task 10's chat POSTs to
+/// its OpenAI-compatible endpoint here; for now we only health-check it.
+const llama_port: u16 = 39_018;
+/// Delay before the FIRST llama health check. Model load (mmap + warmup)
+/// takes noticeably longer than the MCP child's bind, so this is generous.
+const llama_health_delay_ms: u64 = 1_500;
+/// Max curl progress lines we bother to process per download (each just
+/// updates a float; this is a sanity bound, not a hard limit).
+const download_progress_line_cap: usize = 100_000;
 
 /// How many source rows to embed per query batch. Each row contributes a
 /// 256-f32 vector + an FTS insert; two statements/row, all frame-local.
@@ -105,6 +123,7 @@ const main_window_label = "main";
 // Timer keys live in their OWN namespace (never collide with the above).
 const key_snap_timer: u64 = 1; // the repeating scan/debounce tick
 const key_mcp_health_timer: u64 = 2; // one-shot delay before the MCP health check
+const key_llama_health_timer: u64 = 3; // one-shot delay before the llama health check
 
 /// How often the working-tree scan runs. This interval IS the debounce /
 /// coalesce window: edits made between ticks collapse into the single
@@ -172,6 +191,17 @@ pub const ChangedPath = struct {
         @memcpy(e.buf[0..e.len], c.rel_path[0..e.len]);
         return e;
     }
+};
+
+/// One row in the model picker's `<for each>`. Built fresh each rebuild
+/// from the static catalog + the current selection (no owned storage — the
+/// name/blurb slices borrow the comptime catalog strings, which live for
+/// the whole program).
+pub const ModelChoice = struct {
+    index: usize,
+    name: []const u8,
+    blurb: []const u8,
+    selected: bool,
 };
 
 pub const Model = struct {
@@ -277,6 +307,82 @@ pub const Model = struct {
     /// the app still runs (the MCP server is optional for the core UX).
     mcp_failed: bool = false,
 
+    // ---- Local model management + llama.cpp runtime (Task 9) ----
+    /// The selected model's catalog id, read from config.json on boot (or
+    /// the catalog default until then). Inline-owned so it survives updates.
+    selected_model_buf: [128]u8 = undefined,
+    selected_model_len: usize = 0,
+    /// True once the selected model's GGUF file is present on disk.
+    model_present: bool = false,
+    /// True while a download (curl child) is in flight.
+    downloading: bool = false,
+    /// Latest parsed download progress in [0,1] (0 until curl reports any).
+    download_progress: f32 = 0,
+    /// True if the last download attempt failed (curl non-zero / no binary).
+    download_failed: bool = false,
+    /// True once the llama-server runtime child has been spawned this
+    /// session (spawn it at most once per selected-model load).
+    llama_started: bool = false,
+    /// True after a `GET /health` returned 200 — the runtime is serving.
+    llama_ready: bool = false,
+    /// True if the runtime child exited or failed to spawn (e.g. the
+    /// llama-server binary isn't installed). Non-fatal: the app still runs;
+    /// Task 10's chat surfaces this and offers a retry.
+    llama_failed: bool = false,
+    /// Picker rows, rebuilt from the catalog + selection (see
+    /// refreshModelChoices). Inline storage so the view slice survives.
+    model_choices: [models.catalog.len]ModelChoice = undefined,
+
+    pub fn selectedModel(self: *const Model) []const u8 {
+        if (self.selected_model_len == 0) return models.default_model_id;
+        return self.selected_model_buf[0..self.selected_model_len];
+    }
+    fn setSelectedModel(self: *Model, id: []const u8) void {
+        self.selected_model_len = @min(id.len, self.selected_model_buf.len);
+        @memcpy(self.selected_model_buf[0..self.selected_model_len], id[0..self.selected_model_len]);
+    }
+    /// The catalog as picker rows for the view's `<for each>`. Rebuilt into
+    /// inline storage by `refreshModelChoices` whenever the selection
+    /// changes; the accessor just returns the slice.
+    pub fn modelChoices(self: *const Model) []const ModelChoice {
+        return self.model_choices[0..models.catalog.len];
+    }
+    /// Refill `model_choices` from the static catalog + current selection.
+    fn refreshModelChoices(self: *Model) void {
+        const sel = self.selectedModel();
+        for (models.catalog, 0..) |m, i| {
+            self.model_choices[i] = .{
+                .index = i,
+                .name = m.display_name,
+                .blurb = m.blurb,
+                .selected = std.mem.eql(u8, m.id, sel),
+            };
+        }
+    }
+    /// Display name of the selected model (falls back to its id).
+    pub fn selectedModelName(self: *const Model) []const u8 {
+        const m = models.findModel(self.selectedModel()) orelse return self.selectedModel();
+        return m.display_name;
+    }
+    /// A one-line status for the model/runtime, shown under the picker.
+    pub fn modelStatusText(self: *const Model) []const u8 {
+        if (self.downloading) return "Downloading model…";
+        if (self.download_failed) return "Download failed — check your connection and retry.";
+        if (self.llama_ready) return "Model ready.";
+        if (self.llama_failed) return "Model runtime unavailable (llama-server not found).";
+        if (self.model_present) return "Model downloaded. Starting runtime…";
+        return "Model not downloaded yet.";
+    }
+    /// Download progress as a whole-number percent (0–100) for the UI.
+    pub fn downloadPercent(self: *const Model) i64 {
+        return @intFromFloat(@round(std.math.clamp(self.download_progress, 0, 1) * 100));
+    }
+    /// True when the download button should be offered (model missing and
+    /// not already downloading).
+    pub fn canDownload(self: *const Model) bool {
+        return !self.model_present and !self.downloading;
+    }
+
     pub fn capturePath(self: *const Model) []const u8 {
         return self.capture_path_buf[0..self.capture_path_len];
     }
@@ -371,6 +477,11 @@ pub const Model = struct {
         "embedding",          "embed_phase",       "embed_last_rows",
         // MCP server child process (Task 8).
         "mcp_started",        "mcp_ready",         "mcp_failed",
+        // Local model management + llama.cpp runtime (Task 9).
+        "selected_model_buf", "selected_model_len", "model_present",  "downloading",
+        "download_progress",  "download_failed",    "llama_started",  "llama_ready",
+        "llama_failed",       "selectedModel",       "model_choices",
+        "selectedModelName",  "downloadPercent",
     };
     pub fn statusText(self: *const Model) []const u8 {
         return switch (self.stage) {
@@ -424,6 +535,18 @@ pub const Msg = union(enum) {
     mcp_health_tick: native_sdk.EffectTimer, // delay elapsed -> run the health check
     mcp_health_done: native_sdk.EffectResponse, // tools/list health-check response
 
+    // Local model management + llama.cpp runtime (Task 9)
+    config_read_done: native_sdk.EffectFileResult, // read config.json for selected model
+    model_stat_done: native_sdk.EffectFileResult, // stat the model file (present?)
+    download_model, // UI: start downloading the selected model
+    select_model: usize, // UI: choose catalog[index] as the selected model
+    download_progress_line: native_sdk.EffectLine, // a curl progress line
+    download_done: native_sdk.EffectExit, // curl finished (ok/failed)
+    model_renamed: native_sdk.EffectExit, // mv .part -> final finished
+    llama_exit: native_sdk.EffectExit, // the runtime child exited/failed to spawn
+    llama_health_tick: native_sdk.EffectTimer, // delay elapsed -> run the health check
+    llama_health_done: native_sdk.EffectResponse, // /health response
+
     // Delivered by effects/host, never bound as markup handlers.
     pub const view_unbound = .{
         "stat_config",         "wrote_config",       "wrote_keep",
@@ -435,6 +558,11 @@ pub const Msg = union(enum) {
         "toggle_login",        "login_status_done",  "login_set_done",
         "embed_events_page",   "embed_snaps_page",   "embed_write_done",
         "mcp_exit",            "mcp_health_tick",    "mcp_health_done",
+        // Task 9 effect-delivered arms (download_model/select_model ARE
+        // bound as markup handlers, so they are intentionally omitted).
+        "config_read_done",    "model_stat_done",    "download_progress_line",
+        "download_done",       "model_renamed",      "llama_exit",
+        "llama_health_tick",   "llama_health_done",
     };
 };
 
@@ -506,10 +634,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
         .stat_config => |res| {
             if (res.outcome == .ok and res.exists) {
-                // Returning user: config already present.
+                // Returning user: config already present. Read it to learn
+                // the selected model (then stat the model file).
                 model.onboarded = true;
                 model.data_dir_ready = true;
                 model.stage = .ready;
+                readConfig(fx);
             } else {
                 // First run: create the directory tree + default config.
                 writeAnchors(model, fx);
@@ -522,6 +652,57 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.data_dir_ready = true;
                 model.onboarded = false;
                 model.stage = .ready;
+                // First-run config just written with the default model id;
+                // check whether that model is already on disk.
+                statSelectedModel(model, fx);
+            }
+        },
+
+        // ---- Local model management + llama.cpp runtime (Task 9) ----
+        .config_read_done => |res| {
+            if (res.outcome == .ok and res.bytes.len > 0) {
+                if (models.parseSelectedModel(res.bytes)) |id| model.setSelectedModel(id);
+            }
+            model.refreshModelChoices();
+            // Now that we know which model is selected, see if it's present.
+            statSelectedModel(model, fx);
+        },
+        .model_stat_done => |res| {
+            model.model_present = (res.outcome == .ok and res.exists);
+            // If the model is already downloaded, bring up the runtime.
+            if (model.model_present) startLlama(model, fx);
+        },
+        .select_model => |idx| {
+            if (idx >= models.catalog.len) return;
+            model.setSelectedModel(models.catalog[idx].id);
+            model.refreshModelChoices();
+            model.model_present = false;
+            model.download_failed = false;
+            model.download_progress = 0;
+            // Persist the choice, then re-check presence for the new model.
+            persistSelectedModel(model, fx);
+            statSelectedModel(model, fx);
+        },
+        .download_model => startDownload(model, fx),
+        .download_progress_line => |line| {
+            if (line.key != key_model_download) return;
+            if (models.parseProgress(line.line)) |p| model.download_progress = p;
+        },
+        .download_done => |exit| downloadDone(model, exit, fx),
+        .model_renamed => |exit| modelRenamed(model, exit, fx),
+        .llama_exit => |exit| {
+            _ = exit;
+            model.llama_ready = false;
+            model.llama_failed = true;
+        },
+        .llama_health_tick => |timer| {
+            if (timer.outcome == .rejected) return;
+            healthCheckLlama(fx);
+        },
+        .llama_health_done => |res| {
+            if (res.outcome == .ok and res.status == 200) {
+                model.llama_ready = true;
+                model.llama_failed = false;
             }
         },
         .wrote_keep => {
@@ -807,6 +988,163 @@ fn healthCheckMcp(fx: *Effects) void {
         .body = mcp_health_body,
         .timeout_ms = 3_000,
         .on_response = Effects.responseMsg(.mcp_health_done),
+    });
+}
+
+// ------------------------------ local model management + llama runtime
+
+/// Read config.json so we can learn which model the user selected. The
+/// selected id lands in the model via `config_read_done`.
+fn readConfig(fx: *Effects) void {
+    const paths = boot_paths orelse return;
+    fx.readFile(.{
+        .key = key_cfg_read,
+        .path = paths.config,
+        .on_result = Effects.fileMsg(.config_read_done),
+    });
+}
+
+/// Persist the current selection by rewriting config.json. We keep the
+/// existing username + version + onboarded state and swap the model id.
+fn persistSelectedModel(model: *const Model, fx: *Effects) void {
+    const paths = boot_paths orelse return;
+    const arena = boot_arena.allocator();
+    const json = bootstrap.configJson(arena, model.username, app_version, model.selectedModel(), model.onboarded) catch return;
+    fx.writeFile(.{
+        .key = key_write_config,
+        .path = paths.config,
+        .bytes = json,
+        .on_result = Effects.fileMsg(.wrote_config),
+    });
+}
+
+/// Stat the selected model's GGUF file to learn whether it is on disk.
+fn statSelectedModel(model: *const Model, fx: *Effects) void {
+    const paths = boot_paths orelse return;
+    const m = models.findModel(model.selectedModel()) orelse return;
+    var buf: [models.max_path_bytes]u8 = undefined;
+    const path = models.modelFilePath(&buf, paths.models, m.file_name) catch return;
+    fx.statFile(.{
+        .key = key_model_stat,
+        .path = path,
+        .on_result = Effects.fileMsg(.model_stat_done),
+    });
+}
+
+/// Begin downloading the selected model with a spawned `curl`, writing to
+/// a `.part` file. Progress lines stream in via `download_progress_line`;
+/// the terminal exit is `download_done`. A download already in flight (or
+/// a model already present) is a no-op.
+fn startDownload(model: *Model, fx: *Effects) void {
+    if (model.downloading or model.model_present) return;
+    const paths = boot_paths orelse return;
+    const m = models.findModel(model.selectedModel()) orelse return;
+
+    var part_buf: [models.max_path_bytes]u8 = undefined;
+    const part_path = models.partFilePath(&part_buf, paths.models, m.file_name) catch return;
+
+    model.downloading = true;
+    model.download_failed = false;
+    model.download_progress = 0;
+
+    var argv_buf: [models.download_argv_len][]const u8 = undefined;
+    const argv = models.downloadArgv(&argv_buf, m.url, part_path);
+    fx.spawn(.{
+        .key = key_model_download,
+        .argv = argv,
+        .output = .lines, // stream curl's progress meter line-by-line
+        .on_line = Effects.lineMsg(.download_progress_line),
+        .on_exit = Effects.exitMsg(.download_done),
+    });
+}
+
+/// curl finished. On a clean exit, move the `.part` into place with `mv`
+/// (there is no rename file effect); otherwise mark the download failed.
+fn downloadDone(model: *Model, exit: native_sdk.EffectExit, fx: *Effects) void {
+    model.downloading = false;
+    if (exit.reason != .exited or exit.code != 0) {
+        model.download_failed = true;
+        return;
+    }
+    model.download_progress = 1.0;
+
+    const paths = boot_paths orelse return;
+    const m = models.findModel(model.selectedModel()) orelse return;
+    var part_buf: [models.max_path_bytes]u8 = undefined;
+    var final_buf: [models.max_path_bytes]u8 = undefined;
+    const part_path = models.partFilePath(&part_buf, paths.models, m.file_name) catch return;
+    const final_path = models.modelFilePath(&final_buf, paths.models, m.file_name) catch return;
+
+    var argv_buf: [models.rename_argv_len][]const u8 = undefined;
+    const argv = models.renameArgv(&argv_buf, part_path, final_path);
+    fx.spawn(.{
+        .key = key_model_rename,
+        .argv = argv,
+        .output = .collect,
+        .on_exit = Effects.exitMsg(.model_renamed),
+    });
+}
+
+/// The `.part` -> final move finished. On success the model is present, so
+/// bring up the runtime; on failure surface a download error.
+fn modelRenamed(model: *Model, exit: native_sdk.EffectExit, fx: *Effects) void {
+    if (exit.reason == .exited and exit.code == 0) {
+        model.model_present = true;
+        model.download_failed = false;
+        startLlama(model, fx);
+    } else {
+        model.download_failed = true;
+    }
+}
+
+/// Spawn the llama.cpp runtime child exactly once, pointing it at the
+/// selected model's GGUF and binding loopback `llama_port`. Mirrors the
+/// MCP child pattern: spawn, then a one-shot delay before health-checking
+/// (model load takes a moment). Graceful-degrades if the binary is missing
+/// (the exit's `.spawn_failed` lands in `llama_exit` and marks it failed).
+fn startLlama(model: *Model, fx: *Effects) void {
+    if (model.llama_started) return;
+    if (!model.model_present) return;
+    const paths = boot_paths orelse return;
+    const m = models.findModel(model.selectedModel()) orelse return;
+    model.llama_started = true;
+
+    var model_buf: [models.max_path_bytes]u8 = undefined;
+    const model_path = models.modelFilePath(&model_buf, paths.models, m.file_name) catch return;
+    const binary = models.resolveServerBinary(env.lookup(models.server_binary_env));
+
+    var port_buf: [8]u8 = undefined;
+    const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{llama_port}) catch return;
+    var ctx_buf: [12]u8 = undefined;
+    const ctx_str = std.fmt.bufPrint(&ctx_buf, "{d}", .{m.context_length}) catch return;
+
+    var argv_buf: [models.server_argv_len][]const u8 = undefined;
+    const argv = models.serverArgv(&argv_buf, binary, model_path, port_str, ctx_str);
+    fx.spawn(.{
+        .key = key_llama_spawn,
+        .argv = argv,
+        .output = .collect, // we don't stream stdout; an exit -> llama_exit
+        .on_exit = Effects.exitMsg(.llama_exit),
+    });
+
+    fx.startTimer(.{
+        .key = key_llama_health_timer,
+        .interval_ms = llama_health_delay_ms,
+        .mode = .one_shot,
+        .on_fire = Effects.timerMsg(.llama_health_tick),
+    });
+}
+
+/// Health-check the llama runtime: GET its `/health` and confirm a 200.
+fn healthCheckLlama(fx: *Effects) void {
+    var url_buf: [64]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/health", .{llama_port}) catch return;
+    fx.fetch(.{
+        .key = key_llama_health,
+        .method = .GET,
+        .url = url,
+        .timeout_ms = 3_000,
+        .on_response = Effects.responseMsg(.llama_health_done),
     });
 }
 
@@ -1265,7 +1603,9 @@ pub const app_markup = @embedFile("app.native");
 const BlocksApp = native_sdk.UiApp(Model, Msg);
 
 pub fn initialModel() Model {
-    return .{ .username = boot_username };
+    var m = Model{ .username = boot_username };
+    m.refreshModelChoices();
+    return m;
 }
 
 pub fn main(init: std.process.Init) !void {

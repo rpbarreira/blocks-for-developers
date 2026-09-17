@@ -1,11 +1,11 @@
 # Blocks for Developers — Progress & Resumption Notes
 
-Last updated: end of Task 8 (MCP server child; not yet committed).
+Last updated: end of Task 9 (local model management + llama.cpp runtime).
 Committed so far: Task 4 (`01969e5`), Task 5 (`56ae2a2`), Task 6 (`c2afa1b`),
-Task 7 (`e27eb0a`). Read this first when resuming. To continue: open the IDE on
+Task 7 (`e27eb0a`), Task 8 (`887480e`). Read this first when resuming. To continue: open the IDE on
 this repo folder
 (`/Users/rpbarreira/Projects/GitHub/rpbarreira/blocks-for-developers`) and say
-"read docs/PROGRESS.md and continue from Task 9."
+"read docs/PROGRESS.md and continue from Task 10."
 
 ---
 
@@ -108,14 +108,19 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
   v1 uses a DETERMINISTIC in-process hashing embedder — llama.cpp is deferred to
   Task 9 (see the Task 7 section). NOTE: in Task 8 the pure embedder was extracted
   into `src/embed_core.zig`; `embeddings.zig` now re-exports it.
-- [x] **Task 8 — MCP server (spawned child) exposing memory tools.** DONE (not yet
-  committed). New standalone binary `src/mcp_server.zig` (+ `mcp/build.zig`) and a
+- [x] **Task 8 — MCP server (spawned child) exposing memory tools.** DONE
+  (commit `887480e`). New standalone binary `src/mcp_server.zig` (+ `mcp/build.zig`) and a
   pure core `src/mcp/` (protocol + tools) + `src/embed_core.zig`; spawn/health wired
   into `main.zig`. 100 tests pass; VERIFIED END-TO-END (app spawned the child, added
   this repo, and `get_commits`/`get_activity`/`search_memory` returned correct real
   data over HTTP). See the Task 8 section.
-- [ ] **Task 9 — Local model management + llama.cpp runtime.** ← NEXT
-- [ ] Task 10 — Chat experience wired to model + MCP.
+- [x] **Task 9 — Local model management + llama.cpp runtime.** DONE.
+  New PURE module `src/models.zig` (curated GGUF catalog + curl/mv/
+  llama-server argv builders + progress + config parsing), `config.json` gains a
+  `selected_model` (bootstrap `configJson`), and the download/runtime lifecycle is
+  wired into `main.zig` (keys 170-175, timer key 3) with a "Local model" section in
+  `app.native`. 123 tests pass; `native check` clean. See the Task 9 section.
+- [ ] Task 10 — Chat experience wired to model + MCP. ← NEXT
 - [ ] Task 11 — Single-click summaries.
 - [ ] Task 12 — Materials (snippets) screen + chat cross-linking.
 - [ ] Task 13 — Welcome flow + settings modal completion + polish.
@@ -134,8 +139,11 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
   `joinPath`, `envFromLookup`.
 - **env.zig** — `get(name)`/`lookup(name)` read env via `std.c.environ` (app links
   libc; Zig 0.16 std.process env API is unstable). Returns borrowed slices.
-- **bootstrap.zig** — `defaultConfigJson(alloc, username, version)` -> JSON
-  `{version, username, onboarded:false}`; `modelsKeepPath`; `models_keep_contents`.
+- **bootstrap.zig** — `configJson(alloc, username, version, selected_model,
+  onboarded)` -> JSON `{version, username, onboarded, selected_model}`;
+  `defaultConfigJson(alloc, username, version)` = `configJson` with the catalog
+  default model + `onboarded:false` (Task 9 added `selected_model`);
+  `modelsKeepPath`; `models_keep_contents`.
   No mkdir effect exists — `writeFile` auto-creates parent dirs, so the data dir is
   materialized by writing `config.json` + `models/.keep`.
 - **db.zig** — typed SQLite helpers. `Value`/`Statement`/`Migration` aliases;
@@ -226,6 +234,19 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
   dispatcher (`handleRpc`) routing `initialize`/`tools/list`/`tools/call`/`ping` into
   the pure core; `runGetCommits`/`runGetActivity`/`runSearchMemory`. Built by
   `mcp/build.zig` (plain `zig build`, OUTSIDE the SDK graph). See the Task 8 section.
+- **models.zig** — local model management + llama.cpp runtime, PURE (Task 9).
+  `CatalogModel{id, display_name, blurb, url, file_name, size_bytes, sha256,
+  context_length}` + `catalog` (3 curated instruct GGUFs) + `default_model_id`
+  (`qwen2.5-3b-instruct-q4`) + `findModel(id)`. Path builders (caller-owned bufs):
+  `modelFilePath`/`partFilePath` (`<models>/<file>[.part]`). Argv builders (fixed
+  `*_argv_len`, caller-owned bufs): `downloadArgv` (`curl -fL --silent --show-error
+  --progress-bar --output <part> --url <url> --no-buffer`), `renameArgv`
+  (`mv -f <part> <final>` — the SDK has NO rename file effect), `serverArgv`
+  (`<bin> -m <model> --host 127.0.0.1 --port <p> -c <ctx> --no-webui`).
+  `parseProgress(line)` pulls the trailing `NN.N%` out of a curl bar line → 0..1.
+  `resolveServerBinary(env)` = `$BLOCKS_LLAMA_SERVER` else `default_server_binary`
+  (`vendor/llama/bin/llama-server`). `parseSelectedModel(json)` reads the config
+  `selected_model` via a tiny hand `jsonStringField`. All unit-tested.
 - **repos.zig** — watched-repos data layer. `Repo{id,path,name,active,added_at}`
   `.fromRow(cols)`; `RepoEntry` (owned inline path/name copy) `.fromRepo/.path()/.name()`;
   `insert_sql/delete_sql/list_sql/exists_sql`; `insertStatement(*[3]Value, path, name, now_ms)`,
@@ -287,8 +308,10 @@ allowed; multi-statement files OK. FK cascades work (the writer sets foreign_key
      Current spawn/fetch/file/host keys: 100-102 (bootstrap), 110-113 (repos),
      120-122 (git capture), 130-134 (snapshot scan), 140-141 (launch-at-login host
      requests), 150-152 (embedding generation), 160-161 (MCP child spawn + health
-     fetch). TIMER keys (own namespace): 1 = the repeating working-tree scan tick,
-     2 = the one-shot MCP health-check delay.
+     fetch), 170-175 (Task 9: 170 config read, 171 model stat, 172 model download
+     curl, 173 model rename mv, 174 llama-server spawn, 175 llama /health fetch).
+     TIMER keys (own namespace): 1 = the repeating working-tree scan tick,
+     2 = the one-shot MCP health-check delay, 3 = the one-shot llama health delay.
 2. **ZIG LIFETIME TRAP (will recur!):** a function returning a struct with
    `.params = &.{ runtimeValue, ... }` DANGLES (temporary array dies at return) →
    causes `.rejected` exec and crashes. FIX: builder takes a caller-owned
@@ -695,3 +718,115 @@ Test data cleared from `app.db` and the endpoint file removed afterward.
 - **get_commits diff/body**: commits expose subject + stats, not the full diff
   (still NULL in `events.diff`, a Task 4 deferral). Add a `get_commit_diff` tool or a
   `diff` field once capture stores diffs.
+
+## Task 9 — Local model management + llama.cpp runtime (DONE — what was built)
+
+Blocks now manages the LOCAL chat model end-to-end: a curated download catalog,
+a selection persisted in `config.json`, a resumable-into-place download, and a
+spawned `llama-server` runtime that serves an OpenAI-compatible API on loopback
+(the same "spawned child + fetch client" shape as the MCP server, since the SDK
+has no in-process HTTP listener). Task 10 wires the chat UI to this runtime.
+
+**KEY DECISIONS (read before Task 10):**
+- **Why subprocesses for BOTH download and runtime (SDK constraints):** the
+  `fetch` effect buffers at most `max_effect_body_bytes` = **256 KiB** and its
+  `.stream` mode is LINE-framed text — so it CANNOT pull a multi-hundred-MB GGUF.
+  We DOWNLOAD via a spawned **`curl`** (`/usr/bin/curl`, present on macOS; proven
+  in the spike) in `.lines` mode so its `--progress-bar` meter streams to the app.
+  For the RUNTIME, there is no in-process socket-listen effect (locked since Task
+  8), so the llama.cpp runtime is a spawned **`llama-server`** the app reaches over
+  HTTP with `fetch` and health-checks at `GET /health`.
+- **No rename file effect exists** (`EffectFileOp` = read/write/append/stat/delete
+  only). So curl writes to `<file>.gguf.part` and, ONLY on a clean curl exit, a
+  spawned **`mv -f <part> <final>`** moves it atomically into place — an aborted or
+  failed download never appears as a complete model.
+- **The embedder stays `hash-v1` (Task 7).** Task 9 stands up the CHAT runtime, not
+  a neural embedder. Swapping embeddings to llama.cpp is still the documented Task 7
+  follow-up (register under a new `model` id; the schema already allows coexistence).
+- **Catalog + selection.** `models.catalog` is a small curated set of instruct
+  GGUFs (Qwen2.5 3B / Llama-3.2 3B / Qwen2.5 1.5B), default `qwen2.5-3b-instruct-q4`.
+  The chosen id lives in `config.json` `selected_model` and is re-read on boot.
+- **llama-server binary path.** `resolveServerBinary` prefers `$BLOCKS_LLAMA_SERVER`
+  (dev override / packaged env) else `vendor/llama/bin/llama-server` (relative to the
+  app cwd, same convention as the MCP child under `native dev`). If the binary is
+  ABSENT the spawn fails with `.spawn_failed` → `llama_failed = true`, NON-FATAL: the
+  app runs; Task 10's chat surfaces "runtime unavailable" and offers a retry.
+
+Layering: ALL logic is PURE + unit-tested in `models.zig` (catalog, path/argv
+builders, `parseProgress`, `parseSelectedModel`); only the effect firing lives in
+`main.zig`.
+
+Boot + lifecycle (`main.zig`, keys 170-175, timer key 3, `llama_port = 39018`):
+1. Returning user (`stat_config` exists) → `readConfig` reads `config.json` →
+   `config_read_done` adopts `selected_model` (falls back to the catalog default) →
+   `statSelectedModel`. First run (`wrote_config`) writes the default-model config,
+   then `statSelectedModel`.
+2. `model_stat_done` sets `model_present`. If present → `startLlama`.
+3. `startLlama` (once) spawns `llama-server -m <gguf> --host 127.0.0.1 --port 39018
+   -c <ctx> --no-webui` (`.collect`; an exit → `llama_exit` → `llama_failed`,
+   non-fatal), then arms a one-shot `llama_health_delay_ms = 1500` timer (model load
+   is slower than a socket bind) → `llama_health_tick` → `healthCheckLlama` GETs
+   `/health`; a 200 → `llama_ready`.
+4. Download flow (user presses Download in the Local-model section): `startDownload`
+   spawns `curl … --output <part> --url <url>` in `.lines` mode →
+   `download_progress_line` runs `parseProgress` into `download_progress` (0..1) →
+   `download_done`: on a clean exit spawns `mv` → `model_renamed`: on success sets
+   `model_present` and calls `startLlama`; any failure sets `download_failed`.
+5. `select_model:<idx>` switches the selection, rewrites `config.json`
+   (`persistSelectedModel` via `bootstrap.configJson`), clears presence/progress, and
+   re-stats the newly selected model.
+
+Model state added: `selected_model_buf/len` (+ `selectedModel`), `model_present`,
+`downloading`, `download_progress`, `download_failed`, `llama_started/ready/failed`,
+`model_choices[catalog.len]` (rebuilt by `refreshModelChoices`). View accessors:
+`modelChoices`, `selectedModelName`, `modelStatusText`, `downloadPercent`,
+`canDownload`. Msg arms: `config_read_done`, `model_stat_done`, `download_model`,
+`select_model`, `download_progress_line`, `download_done`, `model_renamed`,
+`llama_exit`, `llama_health_tick`, `llama_health_done`.
+
+View (`app.native`): a "Local model" section — a `<for each="modelChoices">` list
+(each row: name + blurb, a "Selected" marker, a Choose button →
+`select_model:{index}`), a `{modelStatusText}` line, and a Download button (shown
+when `canDownload`) → `download_model`. The full model-picker mockup lands with the
+chat (Task 10) / settings modal (Task 13); this is enough to drive the flow now.
+
+Tests (123 total pass, was 100): `models.zig` unit tests (catalog lookup, path +
+argv builders, `parseProgress` incl. multi-percent + clamp + null, `resolveServer
+Binary` env precedence, `parseSelectedModel` present/absent), `bootstrap.zig` config
+round-trip (default + chosen model), and eleven `main.zig` update-arm tests via the
+fake executor (config adoption, model present/absent, select + out-of-range, a curl
+progress line → `downloadPercent`, failed download/rename, `/health` 200 → ready,
+child exit → failed non-fatal, rejected health tick ignored). `native check` is
+clean (`app.native: ok`, app.json valid; the only warnings — `hasRepos`,
+`statusText`, `repo_input` — pre-date Task 9).
+
+**NOT verified end-to-end at runtime:** unlike Tasks 3-8, the download + runtime
+were NOT exercised against a live `native dev` app — a real run would fetch a ~2 GB
+GGUF and needs the `llama-server` binary (not installed on this machine yet). The
+logic is covered by the unit + update-arm tests; a live smoke test is a Task 10
+prerequisite (below).
+
+### Deferred / follow-ups
+- **LIVE end-to-end run.** Before/with Task 10: install a `llama-server` (e.g.
+  `brew install llama.cpp`, or vendor a build to `vendor/llama/bin/`), set
+  `$BLOCKS_LLAMA_SERVER` if needed, run `native dev -Dautomation=true`, press
+  Download for the lightest model (`qwen2.5-1.5b-instruct-q4`, ~1.1 GB), and confirm:
+  the `.part` file appears then is `mv`d to the final name, `llama_ready` flips on the
+  `/health` 200, and a manual `curl` to `http://127.0.0.1:39018/v1/chat/completions`
+  returns a completion. This mirrors how Tasks 5-8 were signed off.
+- **Bundling `llama-server` + Metal.** v1 expects the binary on `PATH`/env or vendored;
+  packaging (Task 13) must ship a Metal-enabled `llama-server` (and its `.metallib`)
+  in the bundle and resolve its path (same bundle-exe-dir gap noted for the MCP child).
+- **Download integrity.** `sha256` is empty in the catalog for v1 (curl `-f` + the
+  post-download presence/size are the guard). Pin real digests and verify with a
+  spawned `shasum -a 256` before the `mv` when we lock exact catalog builds. Also:
+  no resume (`curl -C -`), no cancel button (wire `fx.cancel(key_model_download)`),
+  and `download_progress` is fraction-only (no bytes/ETA) — all easy follow-ups.
+- **Runtime supervision.** A crashed `llama-server` sets `llama_failed` but is not
+  auto-restarted, and `llama_started` latches (no restart on model change without a
+  relaunch). Task 10 should add restart/backoff and re-spawn on `select_model`.
+- **Model deletion / disk management.** No UI to delete a downloaded GGUF or show
+  disk usage yet (Settings, Task 13).
+- **Chat wiring (Task 10).** The OpenAI-compatible endpoint is up but nothing calls
+  `/v1/chat/completions` yet; streaming tokens back into the chat view + injecting the
+  MCP memory tools is Task 10.

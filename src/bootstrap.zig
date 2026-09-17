@@ -18,27 +18,43 @@
 
 const std = @import("std");
 const config = @import("config.zig");
+const models = @import("models.zig");
 
 pub const models_keep_rel = config.dir_models ++ "/.keep";
 pub const models_keep_contents =
     "This directory holds locally-downloaded GGUF models for Blocks.\n";
 
 /// The default config written on first run. `username` is the detected
-/// OS account name shown in the UI. Kept minimal for v1; later tasks
-/// extend the schema (selected model, MCP port, etc.).
+/// OS account name shown in the UI; `selected_model` is the catalog id the
+/// app defaults to (the user can change it in the model picker, which
+/// rewrites this file). Kept minimal for v1; later tasks extend the schema
+/// (MCP port, etc.).
 pub fn defaultConfigJson(
     allocator: std.mem.Allocator,
     username: []const u8,
     app_version: []const u8,
 ) ![]const u8 {
+    return configJson(allocator, username, app_version, models.default_model_id, false);
+}
+
+/// Serialize the full config JSON. Used for the first-run default and when
+/// the user changes their model selection (which persists a new blob).
+pub fn configJson(
+    allocator: std.mem.Allocator,
+    username: []const u8,
+    app_version: []const u8,
+    selected_model: []const u8,
+    onboarded: bool,
+) ![]const u8 {
     return std.fmt.allocPrint(allocator,
         \\{{
         \\  "version": "{s}",
         \\  "username": "{s}",
-        \\  "onboarded": false
+        \\  "onboarded": {s},
+        \\  "selected_model": "{s}"
         \\}}
         \\
-    , .{ app_version, username });
+    , .{ app_version, username, if (onboarded) "true" else "false", selected_model });
 }
 
 /// Absolute path of the models `.keep` anchor for a resolved layout.
@@ -50,13 +66,23 @@ pub fn modelsKeepPath(allocator: std.mem.Allocator, paths: config.Paths) ![]cons
 
 const testing = std.testing;
 
-test "defaultConfigJson embeds username and version and marks not-onboarded" {
+test "defaultConfigJson embeds username, version, default model and marks not-onboarded" {
     const a = testing.allocator;
     const json = try defaultConfigJson(a, "rui", "0.1.0");
     defer a.free(json);
     try testing.expect(std.mem.indexOf(u8, json, "\"username\": \"rui\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"version\": \"0.1.0\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"onboarded\": false") != null);
+    // The default model id must be present and re-readable by the parser.
+    try testing.expectEqualStrings(models.default_model_id, models.parseSelectedModel(json).?);
+}
+
+test "configJson round-trips a chosen model and onboarded flag" {
+    const a = testing.allocator;
+    const json = try configJson(a, "rui", "0.1.0", "llama-3.2-3b-instruct-q4", true);
+    defer a.free(json);
+    try testing.expect(std.mem.indexOf(u8, json, "\"onboarded\": true") != null);
+    try testing.expectEqualStrings("llama-3.2-3b-instruct-q4", models.parseSelectedModel(json).?);
 }
 
 const EnvStub = struct {

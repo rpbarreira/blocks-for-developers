@@ -36,5 +36,34 @@
     </column>
   </scroll>
 
+  <!-- Task 9: local model management. A compact picker over the curated
+       catalog + a download/runtime status line. The full model-picker
+       mockup lands with the chat wiring (Task 10) / settings (Task 13);
+       this makes the select/download/runtime flow demoable now. -->
+  <column gap="6" padding="8">
+    <text size="heading">Local model</text>
+    <text>Blocks chats with a model that runs entirely on your machine.</text>
+    <column gap="4">
+      <for each="modelChoices" key="index" as="m">
+        <row gap="8" padding="6" cross="center">
+          <column grow="1" gap="2">
+            <text>{m.name}</text>
+            <status-bar>{m.blurb}</status-bar>
+          </column>
+          <if test="{m.selected}">
+            <text>Selected</text>
+          </if>
+          <button size="sm" variant="ghost" on-press="select_model:{m.index}">Choose</button>
+        </row>
+      </for>
+    </column>
+    <row gap="8" cross="center">
+      <status-bar grow="1">{modelStatusText}</status-bar>
+      <if test="{canDownload}">
+        <button variant="primary" size="sm" on-press="download_model">Download</button>
+      </if>
+    </row>
+  </column>
+
   <status-bar>{dataDirText}</status-bar>
 </column>

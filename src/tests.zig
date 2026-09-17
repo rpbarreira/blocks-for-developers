@@ -15,6 +15,9 @@ comptime {
     _ = @import("tray.zig");
     _ = @import("embed_core.zig");
     _ = @import("embeddings.zig");
+    // Local model management + llama.cpp runtime (Task 9): pure catalog,
+    // path/argv builders, progress + config parsing.
+    _ = @import("models.zig");
     // MCP server core (Task 8): pure protocol + tool builders, plus the
     // real-DB integration tests for each tool's SQL + JSON shaping.
     _ = @import("mcp/protocol.zig");
@@ -219,4 +222,140 @@ test "update: a rejected health-check timer tick is ignored" {
     main.update(&m, .{ .mcp_health_tick = .{ .key = 2, .outcome = .rejected } }, &fx);
     try std.testing.expect(!m.mcp_ready);
     try std.testing.expect(!m.mcp_failed);
+}
+
+// ---- Local model management + llama.cpp runtime (Task 9) ----
+
+const models = @import("models.zig");
+
+test "update: config_read_done adopts the selected model id from config" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    const cfg =
+        \\{ "version": "0.1.0", "username": "rui", "selected_model": "qwen2.5-1.5b-instruct-q4" }
+    ;
+    main.update(&m, .{ .config_read_done = .{ .key = 170, .op = .read, .outcome = .ok, .bytes = cfg, .exists = true } }, &fx);
+    try std.testing.expectEqualStrings("qwen2.5-1.5b-instruct-q4", m.selectedModel());
+}
+
+test "update: model_stat_done present=true marks the model present" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .model_stat_done = .{ .key = 171, .op = .stat, .outcome = .ok, .exists = true } }, &fx);
+    try std.testing.expect(m.model_present);
+}
+
+test "update: model_stat_done absent leaves the model not present" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .model_stat_done = .{ .key = 171, .op = .stat, .outcome = .ok, .exists = false } }, &fx);
+    try std.testing.expect(!m.model_present);
+}
+
+test "update: select_model switches the selection and marks it not present" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    // Pick a different catalog entry by index.
+    var target: usize = 0;
+    for (models.catalog, 0..) |c, i| {
+        if (!std.mem.eql(u8, c.id, m.selectedModel())) {
+            target = i;
+            break;
+        }
+    }
+    main.update(&m, .{ .select_model = target }, &fx);
+    try std.testing.expectEqualStrings(models.catalog[target].id, m.selectedModel());
+    try std.testing.expect(!m.model_present);
+}
+
+test "update: out-of-range select_model is ignored" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    const before = m.selectedModel();
+    main.update(&m, .{ .select_model = 9999 }, &fx);
+    try std.testing.expectEqualStrings(before, m.selectedModel());
+}
+
+test "update: a curl progress line updates download_progress" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    // key 172 is the download spawn key; a 40% bar line -> 0.40.
+    main.update(&m, .{ .download_progress_line = .{ .key = 172, .line = "########            40.0%" } }, &fx);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.40), m.download_progress, 0.0001);
+    try std.testing.expectEqual(@as(i64, 40), m.downloadPercent());
+}
+
+test "update: a failed download marks download_failed and clears downloading" {
+    var m = main.initialModel();
+    m.downloading = true;
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .download_done = .{ .key = 172, .code = 22, .reason = .exited } }, &fx);
+    try std.testing.expect(!m.downloading);
+    try std.testing.expect(m.download_failed);
+}
+
+test "update: a failed rename marks the download failed" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .model_renamed = .{ .key = 173, .code = 1, .reason = .exited } }, &fx);
+    try std.testing.expect(m.download_failed);
+    try std.testing.expect(!m.model_present);
+}
+
+test "update: a 200 llama /health response marks the runtime ready" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .llama_health_done = .{ .key = 175, .outcome = .ok, .status = 200, .body = "ok" } }, &fx);
+    try std.testing.expect(m.llama_ready);
+    try std.testing.expect(!m.llama_failed);
+}
+
+test "update: the llama child exiting marks the runtime failed (non-fatal)" {
+    var m = main.initialModel();
+    m.llama_ready = true;
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .llama_exit = .{ .key = 174, .code = 127, .reason = .spawn_failed } }, &fx);
+    try std.testing.expect(!m.llama_ready);
+    try std.testing.expect(m.llama_failed);
+}
+
+test "update: a rejected llama health tick is ignored" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .llama_health_tick = .{ .key = 3, .outcome = .rejected } }, &fx);
+    try std.testing.expect(!m.llama_ready);
+    try std.testing.expect(!m.llama_failed);
 }
