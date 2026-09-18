@@ -182,10 +182,41 @@ test "update: a failed health response leaves the MCP server not-ready (non-fata
     defer fx.deinit();
     fx.executor = .fake;
 
-    // A connection failure while the child is still binding: not ready,
-    // but not marked failed either (Task 10 adds retry/backoff).
+    // A connection failure while the child is still binding, under the retry
+    // cap: not ready, but not marked failed either — a retry is armed.
     main.update(&m, .{ .mcp_health_done = .{ .key = 161, .outcome = .rejected, .status = 0, .body = "" } }, &fx);
     try std.testing.expect(!m.mcp_ready);
+    try std.testing.expect(!m.mcp_failed);
+}
+
+test "update: an MCP health tick increments the attempt counter" {
+    var m = main.Model{};
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    try std.testing.expectEqual(@as(u32, 0), m.mcp_health_attempts);
+    main.update(&m, .{ .mcp_health_tick = .{ .key = 2, .outcome = .fired } }, &fx);
+    try std.testing.expectEqual(@as(u32, 1), m.mcp_health_attempts);
+}
+
+test "update: MCP health retries while under the cap, then gives up" {
+    var m = main.Model{};
+    m.mcp_health_attempts = 1; // one attempt made, well under the cap
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    // A non-200 under the cap leaves it not-ready + not-failed (a retry is armed).
+    main.update(&m, .{ .mcp_health_done = .{ .key = 161, .outcome = .connect_failed, .status = 0, .body = "" } }, &fx);
+    try std.testing.expect(!m.mcp_ready);
+    try std.testing.expect(!m.mcp_failed);
+
+    // At the cap, give up: mark failed (non-fatal).
+    m.mcp_health_attempts = 20; // == mcp_health_max_attempts
+    main.update(&m, .{ .mcp_health_done = .{ .key = 161, .outcome = .connect_failed, .status = 0, .body = "" } }, &fx);
+    try std.testing.expect(!m.mcp_ready);
+    try std.testing.expect(m.mcp_failed);
 }
 
 test "update: the MCP child exiting marks it failed but does not crash" {
@@ -583,4 +614,122 @@ test "update: mcp_search_done builds context then starts the completion" {
 
     main.update(&m, .{ .mcp_search_done = .{ .key = 180, .outcome = .ok, .status = 200, .body = envelope } }, &fx);
     try std.testing.expect(m.isStreaming());
+}
+
+// ---- Single-click summaries (Task 11) ----
+
+test "update: start_summary is a no-op when the runtime is not ready" {
+    var m = main.initialModel();
+    m.llama_ready = false;
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .start_summary = .day_recap }, &fx);
+    try std.testing.expect(!m.sending);
+    try std.testing.expectEqual(@as(usize, 0), m.message_count);
+    try std.testing.expect(m.pending_summary_kind == null);
+}
+
+test "update: start_summary begins a canned turn and shows the prompt" {
+    var m = main.initialModel();
+    m.llama_ready = true;
+    m.mcp_ready = false; // skip get_activity -> straight to completion
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .start_summary = .standup }, &fx);
+    try std.testing.expect(m.sending);
+    try std.testing.expect(m.pending_summary_kind.? == .standup);
+    // The canned prompt is shown immediately as the user message, and we
+    // stream a completion (MCP not ready -> no activity retrieval step).
+    try std.testing.expectEqual(@as(usize, 1), m.message_count);
+    try std.testing.expect(m.messagesSlice()[0].isUser());
+    try std.testing.expectEqualStrings(chat.SummaryKind.standup.prompt(), m.messagesSlice()[0].content());
+    try std.testing.expect(m.isStreaming());
+}
+
+test "update: start_summary resets any prior conversation (fresh chat)" {
+    var m = main.initialModel();
+    m.llama_ready = true;
+    m.mcp_ready = false;
+    // Seed a prior conversation.
+    m.current_chat_id = 7;
+    m.next_seq = 4;
+    m.pushMessage(.user, "old question");
+    m.pushMessage(.assistant, "old answer");
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .start_summary = .day_recap }, &fx);
+    // A summary is a NEW conversation: chat id + seq reset, only the prompt shown.
+    try std.testing.expectEqual(@as(i64, 0), m.current_chat_id);
+    try std.testing.expectEqual(@as(usize, 1), m.message_count);
+    try std.testing.expect(m.pending_summary_kind.? == .day_recap);
+}
+
+test "update: a summary turn stays gated while another summary is in flight" {
+    var m = main.initialModel();
+    m.llama_ready = true;
+    m.mcp_ready = false;
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .start_summary = .day_recap }, &fx);
+    try std.testing.expect(m.sending);
+    const before = m.message_count;
+    // A second card tap while the first is in flight must be ignored.
+    main.update(&m, .{ .start_summary = .top_of_mind }, &fx);
+    try std.testing.expectEqual(before, m.message_count);
+    try std.testing.expect(m.pending_summary_kind.? == .day_recap); // unchanged
+}
+
+test "update: mcp_activity_done builds context then starts the completion" {
+    var m = main.initialModel();
+    m.llama_ready = true;
+    m.sending = true;
+    m.pending_summary_kind = .day_recap;
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    // The MCP envelope wraps the get_activity tool JSON as result.content[0].text.
+    const envelope =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":" ++
+        "\"{\\\"activity\\\":[{\\\"kind\\\":\\\"commit\\\",\\\"ref_id\\\":1,\\\"repo_id\\\":1,\\\"repo\\\":\\\"blocks\\\",\\\"title\\\":\\\"Add tray\\\",\\\"occurred_at\\\":2000}]}\"" ++
+        "}],\"isError\":false}}";
+
+    main.update(&m, .{ .mcp_activity_done = .{ .key = 186, .outcome = .ok, .status = 200, .body = envelope } }, &fx);
+    try std.testing.expect(m.isStreaming());
+}
+
+test "update: a summary finalizes and stays gated until the write commits" {
+    var m = main.initialModel();
+    m.llama_ready = true;
+    m.mcp_ready = false;
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    // Start the summary, stream a reply, and end it with [DONE].
+    main.update(&m, .{ .start_summary = .standup }, &fx);
+    main.update(&m, .{ .chat_line = .{ .key = 181, .line = "data: {\"choices\":[{\"delta\":{\"content\":\"Yesterday: shipped the tray.\"}}]}" } }, &fx);
+    main.update(&m, .{ .chat_line = .{ .key = 181, .line = "data: [DONE]" } }, &fx);
+
+    // The assistant summary is now a message; the turn stays gated (the
+    // create-chat/persist chain is pending) and the kind is still held.
+    try std.testing.expect(!m.isStreaming());
+    try std.testing.expect(m.sending);
+    try std.testing.expect(m.pending_summary_kind.? == .standup);
+    try std.testing.expect(m.messagesSlice()[m.message_count - 1].isAssistant());
+
+    // Once the write commits, the turn ends: sending clears and the summary
+    // kind is released (ready for the next turn/summary).
+    main.update(&m, .{ .chat_write_done = .{ .key = 184, .kind = .exec, .outcome = .ok } }, &fx);
+    try std.testing.expect(!m.sending);
+    try std.testing.expect(m.pending_summary_kind == null);
+    try std.testing.expect(m.canSend());
 }

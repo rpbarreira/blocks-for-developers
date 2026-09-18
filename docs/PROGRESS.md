@@ -1,13 +1,14 @@
 # Blocks for Developers — Progress & Resumption Notes
 
-Last updated: end of Task 10 (chat wired to the local model + MCP memory),
-VERIFIED END-TO-END live (see the Task 10 section).
+Last updated: end of Task 11 (single-click summaries), VERIFIED END-TO-END live
+(two bugs found + fixed during verification — MCP health-check retry + a too-small
+get_activity request buffer; see the Task 11 verification section).
 Committed so far: Task 4 (`01969e5`), Task 5 (`56ae2a2`), Task 6 (`c2afa1b`),
 Task 7 (`e27eb0a`), Task 8 (`887480e`), Task 9 (`7a6961d` + live-verify follow-up
-`2ec4210`). Read this first when resuming. To continue: open the IDE on
-this repo folder
+`2ec4210`); Task 10 + Task 11 implemented (see their sections). Read this first
+when resuming. To continue: open the IDE on this repo folder
 (`/Users/rpbarreira/Projects/GitHub/rpbarreira/blocks-for-developers`) and say
-"read docs/PROGRESS.md and continue from Task 11."
+"read docs/PROGRESS.md and continue from Task 12."
 
 **Runtime note for live runs:** the llama.cpp runtime is `llama-server`
 (installed via `brew install llama.cpp`, at `/opt/homebrew/bin/llama-server`).
@@ -135,8 +136,15 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
   148 tests; `native check` clean; VERIFIED END-TO-END live (streamed replies
   grounded in real git memory, persisted to `chats`/`messages`). See the Task 10
   section. A semantic review caught + fixed a turn-overlap persistence race.
-- [ ] Task 11 — Single-click summaries. ← NEXT
-- [ ] Task 12 — Materials (snippets) screen + chat cross-linking.
+- [x] **Task 11 — Single-click summaries.** DONE. New PURE additions to
+  `src/chat.zig` (`SummaryKind` enum + `chat_insert_kind_sql`/
+  `chatInsertKindStatement` + `buildActivityRequest`/`formatActivityContext`) +
+  the summary turn wired into `main.zig` (key 186, `pending_summary_kind`) +
+  three summary cards in `app.native`. Day Recap / What's Top of Mind / Standup
+  Update each pull recent activity from the MCP `get_activity` tool and ask the
+  local model to write a canned summary, saved as a chat with its own
+  `chats.kind`. 159 tests; `native check` clean. See the Task 11 section.
+- [ ] Task 12 — Materials (snippets) screen + chat cross-linking. ← NEXT
 - [ ] Task 13 — Welcome flow + settings modal completion + polish.
 
 ---
@@ -280,6 +288,14 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
   alloc, response_body, max_hits)` unwraps the double-wrapped `result.content[0].text` →
   inner `{results:[{repo,title,snippet}]}` → `"- [repo] title: snippet"` lines (fail-soft:
   0 hits on any parse error, never blocks the chat). `excerptTitle` (chat title/preview).
+  SUMMARIES (Task 11): `SummaryKind{day_recap,top_of_mind,standup}` with `.chatKind()`
+  (the `chats.kind` value), `.title()`, `.prompt()` (canned instruction), `.lookbackMs()`
+  (activity window), `.activityLimit()`; `chat_insert_kind_sql` + `chatInsertKindStatement`
+  (`*[4]Value`: title, preview, kind, now) inserts a chat with an EXPLICIT kind;
+  `buildActivityRequest(out, alloc, since_ms, limit)` builds a `tools/call get_activity`
+  body; `formatActivityContext(out, alloc, response_body, max_rows)` unwraps `get_activity`'s
+  double-wrapped result into inner `{activity:[{repo,title,kind}]}` -> `"- [repo]
+  commit|edit title"` lines (fail-soft, same as search).
 - **repos.zig** — watched-repos data layer. `Repo{id,path,name,active,added_at}`
   `.fromRow(cols)`; `RepoEntry` (owned inline path/name copy) `.fromRepo/.path()/.name()`;
   `insert_sql/delete_sql/list_sql/exists_sql`; `insertStatement(*[3]Value, path, name, now_ms)`,
@@ -345,7 +361,8 @@ allowed; multi-statement files OK. FK cascades work (the writer sets foreign_key
      curl, 173 model rename mv, 174 llama-server spawn, 175 llama /health fetch),
      180-185 (Task 10: 180 MCP search_memory POST, 181 llama chat `.stream` POST,
      182 chat INSERT, 183 chat MAX(id) query, 184 messages write batch, 185 messages
-     reload query). TIMER keys (own namespace): 1 = the repeating working-tree scan
+     reload query), 186 (Task 11: MCP get_activity POST for a summary's context).
+     TIMER keys (own namespace): 1 = the repeating working-tree scan
      tick, 2 = the one-shot MCP health-check delay, 3 = the one-shot llama health delay.
 2. **ZIG LIFETIME TRAP (will recur!):** a function returning a struct with
    `.params = &.{ runtimeValue, ... }` DANGLES (temporary array dies at return) →
@@ -738,10 +755,11 @@ Test data cleared from `app.db` and the endpoint file removed afterward.
   mcp/build.zig` step; it is NOT hooked into `native build`/`native package` yet, so
   packaging must invoke it (and copy the binary into the bundle). Wire this when
   Task 13 does packaging/polish.
-- **Health-check retry/backoff**: a failed first health check leaves `mcp_ready`
-  false with no retry (the 400 ms delay is usually enough). Task 10 (chat) should add
-  retry/backoff and surface `mcp_ready`/`mcp_failed` in the UI, and restart the child
-  if it dies (`mcp_exit`).
+- **Health-check retry/backoff**: RESOLVED in Task 11 — the single 400 ms check used
+  to leave `mcp_ready` false forever on a bind race (silently disabling ALL
+  retrieval); the check now retries on a fixed backoff up to a cap (see the Task 11
+  verification section). Still open: surface `mcp_ready`/`mcp_failed` in the UI and
+  restart the child if it dies (`mcp_exit`).
 - **search_memory hybrid fusion**: v1 ranks by VECTOR similarity only (the FTS arm
   exists in `embeddings`/`embed_core` + is integration-tested, but the tool doesn't
   yet blend FTS into the ranked list). Reciprocal-rank fusion is the natural next
@@ -1017,3 +1035,135 @@ skipped.
   model" affordance in the chat area yet (the Local model section below handles download).
 - **High-fidelity chat UI (Task 13).** The faithful `chat_screen.png` layout (bubbles,
   avatars, sidebar, summary cards) lands in Task 13 once Tasks 11/12 exist.
+
+## Task 11 — Single-click summaries (DONE — what was built)
+
+The chat mockup's three summary cards now work: **Day Recap**, **What's Top of
+Mind**, and **Standup Update**. Each is a ONE-CLICK canned "turn" that pulls the
+developer's RECENT ACTIVITY from the MCP `get_activity` tool, injects it as
+context, and asks the local model to write the summary with a fixed instruction —
+saved as a chat with its own `chats.kind`.
+
+**KEY DECISION — a summary is a canned chat turn, reusing the Task 10 machinery.**
+Rather than a parallel code path, a summary is modeled as an ordinary turn whose
+"user message" is a fixed prompt (`SummaryKind.prompt()`). It reuses the exact Task
+10 pipeline — `startCompletion` (stream) -> `chat_line` tokens -> `finalizeChat`
+on `[DONE]` -> `createChatThenPersist`/`persistTurn`. Only two things differ:
+- **Retrieval source.** A normal chat retrieves with `search_memory` (semantic,
+  keyed on the typed question). A summary retrieves with **`get_activity`** — a
+  time-windowed union of commits ∪ file snapshots (newest first) — because "what
+  did I do recently" is a RANGE query, not a similarity query. The window comes
+  from `SummaryKind.lookbackMs()` (1 day for recap/standup, 3 days for
+  top-of-mind), computed as `now - lookback` and passed as `since_ms`.
+- **The chat's kind + title.** A summary always starts a FRESH chat, INSERTed with
+  its `chats.kind` (`day_recap`|`top_of_mind`|`standup`) and a fixed title via the
+  new `chat.chatInsertKindStatement` (the ordinary path still uses the kind='chat'
+  `chatInsertStatement`). The schema already allowed these kinds (Task 2).
+
+Retrieval is BEST-EFFORT, exactly like Task 10: if the MCP server isn't ready or
+`get_activity` fails, the summary proceeds with no injected context (the model then
+says it has nothing recent). The turn never blocks on memory.
+
+Layering: all protocol/SQL shaping is PURE + unit-tested in `chat.zig`; only the
+effect firing + the per-turn state live in `main.zig`.
+
+**The summary lifecycle** (`main.zig`; effect key 186 for the activity POST, then
+the shared 181-185 chat keys):
+1. `start_summary(kind)` (a card tap; guarded by `canSend` = `llama_ready and
+   !sending`): reset the active chat (`current_chat_id=0`, `next_seq=0`,
+   `message_count=0`), set `pending_summary_kind=kind`, `setPendingUser(kind.prompt())`,
+   `pushMessage(.user, prompt)` for instant display, set `sending=true`.
+2. If `mcp_ready`: `retrieveActivity` POSTs `buildActivityRequest(since_ms, limit)`
+   to the MCP root (key 186); `mcp_activity_done` runs `formatActivityContext` into
+   `context_buf` (best-effort) -> `startCompletion`. If MCP isn't ready,
+   `startCompletion` runs directly.
+3. From here it's the Task 10 path verbatim: stream tokens, finalize on `[DONE]`,
+   then `createChatThenPersist` — which now branches on `pending_summary_kind` to
+   INSERT the kind-tagged chat — `chat_rowid_done` -> `persistTurn` (user prompt +
+   assistant summary + chat touch) -> `chat_write_done` clears `sending` AND
+   `pending_summary_kind`, then reloads the chat.
+
+`pending_summary_kind` is the summary's interlock: it is cleared on EVERY turn-end
+path (success in `chat_write_done`, the finalize failure path, the `persistTurn`
+id-recovery failure, and the `chat_inserted` failure — which now also clears
+`sending`, closing a latent stuck-`sending` gap), and set to null at the start of
+an ordinary `sendChat` so a chat turn never inherits a stale kind.
+
+Model state added: `pending_summary_kind: ?chat.SummaryKind`. View: `summaryCards`
+(a `[3]SummaryCard{tag,label,blurb}` where `tag = @tagName(kind)`), `summaryDisabled`
+(= `!canSend`). `chatStatusText` now reads "Gathering your recent activity…" /
+"Writing your summary…" while a summary is in flight. Msg arms: `start_summary:
+chat.SummaryKind` (markup-bound) and `mcp_activity_done` (effect-delivered).
+
+View (`app.native`): a `<row>` of `<for each="summaryCards">` buttons above the
+transcript — `<button variant="secondary" on-press="start_summary:{c.tag}"
+disabled="{summaryDisabled}">{c.label}</button>`.
+
+**SDK note — passing an ENUM as a message payload from markup.** `on-press=
+"start_summary:{c.tag}"` works because the markup engine's payload `coerce` for an
+enum field does `std.meta.stringToEnum(EnumType, value.string)` (confirmed in the
+CLI's `ui_markup_view.zig`). So the payload binding must resolve to a STRING equal
+to the tag name — hence `SummaryCard.tag = @tagName(SummaryKind.<x>)`. (Contrast
+the Task 9 `select_model:{m.index}` which coerces a binding integer to `usize`.)
+
+Tests (159 total, was 148): pure `chat.zig` tests (SummaryKind kinds/titles/prompts/
+windows, `chatInsertKindStatement` params, `buildActivityRequest` shape + JSON
+validity, `formatActivityContext` happy + malformed) + `main.zig` update-arm tests
+(start_summary gated when the runtime isn't ready; a canned turn shows the prompt +
+streams; a summary resets any prior conversation; a second card tap is ignored while
+one is in flight; `mcp_activity_done` -> stream; a summary finalizes + stays gated
+until `chat_write_done`, which releases the kind). `native check` clean (markup
+validated against the refreshed model contract, 0 warnings).
+
+### VERIFIED END-TO-END via automation (+ two bugs found and fixed live)
+Driven live (`native dev --yes -Dautomation=true` with `BLOCKS_LLAMA_SERVER`, real
+Qwen2.5-1.5B, this repo already watched). All four criteria confirmed: (a) each of
+the three cards streams a summary GROUNDED in the injected `get_activity` context
+(the replies referenced the real `src/*.zig` edits; the standup used its
+"Yesterday/Today/Blockers" framing); (b) each persists a `chats` row with the right
+`kind` (`day_recap`/`top_of_mind`/`standup`) + title, and `messages` (user seq 0 =
+the canned prompt, assistant seq 1 = the summary), preview filled from the reply;
+(c) mid-turn all three cards read `enabled=false` with the status "Writing your
+summary...", and re-enable after; (d) the empty-activity path degrades to a plain
+"no recent activity" reply. Test rows cleared from `app.db` afterward.
+
+**Two bugs the live run surfaced (both fixed in this change; +3 regression tests):**
+1. **MCP `mcp_ready` never flipped -> ALL retrieval silently skipped.** The Task 8
+   MCP health check was a SINGLE shot 400 ms after spawn; it raced the child's
+   `listen()` and, on a miss, left `mcp_ready` false forever -- so BOTH Task 10's
+   `search_memory` and Task 11's `get_activity` were skipped and every reply was
+   ungrounded ("you have not provided recent activity"). This was the documented
+   Task 8 fragility finally biting. FIX: the MCP health check now RETRIES on a fixed
+   backoff (`mcp_health_retry_ms = 500`, up to `mcp_health_max_attempts = 20`,
+   tracked by `mcp_health_attempts`, via a new `armMcpHealth` helper reset in
+   `startMcpServer`) -- mirroring the llama health check (Task 9). `mcp_failed` is set
+   only after the cap. This hardening benefits Task 10's chat RAG too.
+2. **`retrieveActivity` request buffer too small -> context dropped.** The
+   `get_activity` request body was built into a 256-byte `FixedBufferAllocator`;
+   `std.ArrayList`'s growth overflowed it, so `buildActivityRequest` errored and the
+   `catch` fell through to `startCompletion` with NO context (`context_len = 0`) --
+   even though MCP was healthy. Diagnosed by temporary logging that showed
+   `startSummary mcp_ready=true` immediately followed by `startCompletion
+   context_len=0` with no `mcpActivityDone`. FIX: bumped the scratch buffer to 1024
+   bytes. (Task 10's `searchMemory` was never affected -- it already sizes its buffer
+   for worst-case escaping, ~49 KiB.)
+
+After both fixes a clean run passed all four criteria above; 161 tests green;
+`native check` clean.
+
+### Deferred / follow-ups
+- **Activity context de-duplication.** The injected context is one line PER activity
+  row, so a file edited repeatedly (e.g. `src/main.zig`) appears many times and the
+  summary parrots the repetition. De-dup by path (keep the newest) and/or fold
+  counts ("edited src/main.zig x7") before injecting — surfaced by the live run.
+- **Activity → prompt richness.** The injected context is one line per activity row
+  (`- [repo] commit|edit <title>`); it omits diffs/bodies and the timestamp (a
+  `occurred_at` prefix like "2h ago" is parsed-but-unused, reserved for later). The
+  `get_activity` window is a fixed lookback, not "since your last summary."
+- **Summary history / sidebar.** Summaries persist as their own `chats.kind` but
+  there is still no chat list to revisit them (the `chat_screen.png` sidebar is Task
+  13). A "regenerate" affordance and per-repo scoping are later polish.
+- **Standup date framing.** The standup prompt says "Yesterday/Today" but the window
+  is a rolling 24h, not calendar-aware; a real "since yesterday 9am" bound is a
+  follow-up once we track summary runs.
+- **Model quality.** Same 8 KiB reply cap and small-model caveats as Task 10 apply.

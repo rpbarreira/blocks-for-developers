@@ -12,6 +12,17 @@
     <text>{usernameText}</text>
   </row>
 
+  <!-- Task 11: single-click summary cards. Each pulls the developer's recent
+       activity from the MCP get_activity tool and asks the local model to
+       write a canned summary (Day Recap / What's Top of Mind / Standup Update),
+       saved as its own chat kind. Disabled while a turn is in flight or the
+       runtime isn't ready (same gate as Send). -->
+  <row gap="8" cross="center">
+    <for each="summaryCards" key="tag" as="c">
+      <button variant="secondary" size="sm" on-press="start_summary:{c.tag}" disabled="{summaryDisabled}">{c.label}</button>
+    </for>
+  </row>
+
   <!-- Conversation transcript. -->
   <scroll grow="1">
     <column gap="10">

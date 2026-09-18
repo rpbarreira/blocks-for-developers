@@ -58,6 +58,83 @@ pub const Role = enum {
     }
 };
 
+// ---------------------------------------------------- summaries (Task 11)
+
+/// The three single-click summaries. Each is a canned "turn": Blocks pulls
+/// the developer's RECENT ACTIVITY from the MCP `get_activity` tool (a time
+/// window for the recap/standup, a broader window for top-of-mind), injects
+/// it as context, and asks the local model to write the summary with a fixed
+/// instruction. Each maps to a distinct `chats.kind` so the sidebar (Task 13)
+/// can badge them, and carries its own title + prompt.
+pub const SummaryKind = enum {
+    day_recap,
+    top_of_mind,
+    standup,
+
+    /// The value stored in `chats.kind` (must match the schema CHECK: one of
+    /// 'chat' | 'day_recap' | 'top_of_mind' | 'standup').
+    pub fn chatKind(self: SummaryKind) []const u8 {
+        return switch (self) {
+            .day_recap => "day_recap",
+            .top_of_mind => "top_of_mind",
+            .standup => "standup",
+        };
+    }
+
+    /// A human title for the generated chat (shown in the transcript header /
+    /// sidebar).
+    pub fn title(self: SummaryKind) []const u8 {
+        return switch (self) {
+            .day_recap => "Day Recap",
+            .top_of_mind => "What's Top of Mind",
+            .standup => "Standup Update",
+        };
+    }
+
+    /// The canned instruction sent as the turn's user message. Phrased to lean
+    /// on the injected "Recent activity" block and to keep the small local
+    /// model on task.
+    pub fn prompt(self: SummaryKind) []const u8 {
+        return switch (self) {
+            .day_recap =>
+            "Write a Day Recap of my recent coding work. Using the recent activity below, " ++
+                "summarize what I worked on — group related commits and file changes by repository " ++
+                "and theme, and note anything that looks unfinished. Use short bullet points. " ++
+                "If there is no recent activity, say so plainly.",
+            .top_of_mind =>
+            "Tell me what's top of mind in my recent coding work. From the recent activity below, " ++
+                "identify the few threads I've been most active on and what I likely need to pick back up. " ++
+                "Use short bullet points, most important first. If there is no recent activity, say so plainly.",
+            .standup =>
+            "Write a standup update from my recent coding work. Using the recent activity below, produce " ++
+                "three short sections — \"Yesterday\" (what I did), \"Today\" (the natural next steps), and " ++
+                "\"Blockers\" (anything that looks stuck, or \"None\"). Keep it to a few bullets each. " ++
+                "If there is no recent activity, say so plainly.",
+        };
+    }
+
+    /// How far back to pull activity, relative to now (ms). Recap/standup look
+    /// at the last work day-ish window; top-of-mind spans a bit wider so it can
+    /// surface threads that stalled a couple of days ago. A sentinel of 0 means
+    /// "no lower bound" (unused today; every kind has a window).
+    pub fn lookbackMs(self: SummaryKind) i64 {
+        const day: i64 = 24 * 60 * 60 * 1000;
+        return switch (self) {
+            .day_recap => 1 * day,
+            .standup => 1 * day,
+            .top_of_mind => 3 * day,
+        };
+    }
+
+    /// How many activity rows to retrieve for the context block.
+    pub fn activityLimit(self: SummaryKind) u32 {
+        return switch (self) {
+            .day_recap, .top_of_mind => 30,
+            .standup => 30,
+        };
+    }
+};
+
 // ------------------------------------------------------- chats table
 
 pub const chat_select_columns = "id, title, preview, kind, created_at, updated_at";
@@ -68,6 +145,14 @@ pub const chat_insert_sql =
     "INSERT INTO chats(title, preview, kind, created_at, updated_at) " ++
     "VALUES(?1, ?2, 'chat', ?3, ?3);";
 
+/// Insert a new chat with an EXPLICIT kind. Used by the single-click
+/// summaries (Task 11), which create a chat whose `kind` is one of
+/// 'day_recap' | 'top_of_mind' | 'standup' rather than 'chat'.
+/// ?1=title ?2=preview ?3=kind ?4=now(created+updated)
+pub const chat_insert_kind_sql =
+    "INSERT INTO chats(title, preview, kind, created_at, updated_at) " ++
+    "VALUES(?1, ?2, ?3, ?4, ?4);";
+
 /// Bump a chat's preview + updated_at after a new message. ?1=preview ?2=now ?3=id
 pub const chat_touch_sql =
     "UPDATE chats SET preview = ?1, updated_at = ?2 WHERE id = ?3;";
@@ -75,6 +160,19 @@ pub const chat_touch_sql =
 pub fn chatInsertStatement(buf: *[3]db.Value, title: []const u8, preview: []const u8, now_ms: i64) db.Statement {
     buf.* = .{ db.val.text(title), db.val.text(preview), db.val.int(now_ms) };
     return .{ .sql = chat_insert_sql, .params = buf };
+}
+
+/// Build a kind-tagged chat INSERT (Task 11 summaries). `kind` must be one
+/// of the schema-allowed chat kinds (see `SummaryKind.chatKind`).
+pub fn chatInsertKindStatement(
+    buf: *[4]db.Value,
+    title: []const u8,
+    preview: []const u8,
+    kind: []const u8,
+    now_ms: i64,
+) db.Statement {
+    buf.* = .{ db.val.text(title), db.val.text(preview), db.val.text(kind), db.val.int(now_ms) };
+    return .{ .sql = chat_insert_kind_sql, .params = buf };
 }
 
 pub fn chatTouchStatement(buf: *[3]db.Value, preview: []const u8, now_ms: i64, chat_id: i64) db.Statement {
@@ -435,6 +533,100 @@ fn strField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     return if (v == .string) v.string else null;
 }
 
+fn intField(obj: std.json.ObjectMap, key: []const u8) ?i64 {
+    const v = obj.get(key) orelse return null;
+    return switch (v) {
+        .integer => |n| n,
+        .float => |f| @as(i64, @intFromFloat(f)),
+        else => null,
+    };
+}
+
+// ------------------------------------------------ MCP get_activity call
+
+/// Build the JSON-RPC `tools/call` body for `get_activity` into `out`. Used
+/// by the single-click summaries to retrieve recent commits ∪ file snapshots
+/// in a time window:
+///   {"jsonrpc":"2.0","id":1,"method":"tools/call",
+///    "params":{"name":"get_activity","arguments":{"since_ms":<s>,"limit":<n>}}}
+/// `since_ms` bounds the window; `until_ms` is left open (the tool defaults it
+/// to +inf), so "now" is implicit.
+pub fn buildActivityRequest(
+    out: *std.ArrayList(u8),
+    alloc: std.mem.Allocator,
+    since_ms: i64,
+    limit: u32,
+) !void {
+    var w = JsonWriter{ .out = out, .alloc = alloc };
+    try w.raw("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"get_activity\",\"arguments\":{\"since_ms\":");
+    try w.number(since_ms);
+    try w.raw(",\"limit\":");
+    try w.number(@intCast(limit));
+    try w.raw("}}}");
+}
+
+/// Turn an MCP `get_activity` HTTP response body into a compact plain-text
+/// "recent activity" context block for injection, written into `out`. Same
+/// double-wrapping as `formatSearchContext`: JSON-RPC `result.content[0].text`
+/// is the tool's own JSON (`{"activity":[{kind,repo,title,occurred_at,...}]}`).
+/// Emits up to `max_rows` lines like:
+///   - [<repo>] <commit|edit> <title>
+/// Returns the number of rows written (0 when there are none / on any parse
+/// failure — retrieval is best-effort and never blocks the summary).
+pub fn formatActivityContext(
+    out: *std.ArrayList(u8),
+    alloc: std.mem.Allocator,
+    response_body: []const u8,
+    max_rows: usize,
+) !usize {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, response_body, .{}) catch return 0;
+    defer parsed.deinit();
+    if (parsed.value != .object) return 0;
+
+    const result = parsed.value.object.get("result") orelse return 0;
+    if (result != .object) return 0;
+    const content = result.object.get("content") orelse return 0;
+    if (content != .array or content.array.items.len == 0) return 0;
+    const first = content.array.items[0];
+    if (first != .object) return 0;
+    const text_v = first.object.get("text") orelse return 0;
+    if (text_v != .string) return 0;
+
+    var inner = std.json.parseFromSlice(std.json.Value, alloc, text_v.string, .{}) catch return 0;
+    defer inner.deinit();
+    if (inner.value != .object) return 0;
+    const activity = inner.value.object.get("activity") orelse return 0;
+    if (activity != .array) return 0;
+
+    var written: usize = 0;
+    for (activity.array.items) |row| {
+        if (written >= max_rows) break;
+        if (row != .object) continue;
+        const repo = strField(row.object, "repo") orelse "";
+        const title = strField(row.object, "title") orelse "";
+        const kind = strField(row.object, "kind") orelse "";
+        // Map the tool's row kind to a compact verb.
+        const verb: []const u8 = if (std.mem.eql(u8, kind, "commit"))
+            "commit"
+        else if (std.mem.eql(u8, kind, "file_snapshot"))
+            "edit"
+        else
+            kind;
+        _ = intField(row.object, "occurred_at"); // reserved for a future date prefix
+        try out.appendSlice(alloc, "- [");
+        try out.appendSlice(alloc, repo);
+        try out.appendSlice(alloc, "] ");
+        if (verb.len > 0) {
+            try out.appendSlice(alloc, verb);
+            try out.appendSlice(alloc, " ");
+        }
+        try out.appendSlice(alloc, title);
+        try out.appendSlice(alloc, "\n");
+        written += 1;
+    }
+    return written;
+}
+
 // --------------------------------------------------------- misc helpers
 
 /// The maximum length of a chat title/preview derived from a message.
@@ -633,6 +825,73 @@ test "formatSearchContext returns 0 on malformed or empty input" {
     defer out.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), try formatSearchContext(&out, testing.allocator, "not json", 5));
     try testing.expectEqual(@as(usize, 0), try formatSearchContext(&out, testing.allocator, "{\"result\":{}}", 5));
+}
+
+test "SummaryKind exposes distinct chat kinds, titles, and prompts" {
+    try testing.expectEqualStrings("day_recap", SummaryKind.day_recap.chatKind());
+    try testing.expectEqualStrings("top_of_mind", SummaryKind.top_of_mind.chatKind());
+    try testing.expectEqualStrings("standup", SummaryKind.standup.chatKind());
+    try testing.expectEqualStrings("Day Recap", SummaryKind.day_recap.title());
+    try testing.expectEqualStrings("What's Top of Mind", SummaryKind.top_of_mind.title());
+    try testing.expectEqualStrings("Standup Update", SummaryKind.standup.title());
+    // Prompts are non-empty and mention "activity" (they lean on the block).
+    inline for (.{ SummaryKind.day_recap, SummaryKind.top_of_mind, SummaryKind.standup }) |k| {
+        try testing.expect(k.prompt().len > 0);
+        try testing.expect(std.mem.indexOf(u8, k.prompt(), "activity") != null);
+        try testing.expect(k.lookbackMs() > 0);
+        try testing.expect(k.activityLimit() > 0);
+    }
+    // Top-of-mind looks back further than the day recap.
+    try testing.expect(SummaryKind.top_of_mind.lookbackMs() > SummaryKind.day_recap.lookbackMs());
+}
+
+test "chatInsertKindStatement carries the kind param" {
+    var buf: [4]db.Value = undefined;
+    const s = chatInsertKindStatement(&buf, "Day Recap", "preview", "day_recap", 4242);
+    try testing.expectEqualStrings(chat_insert_kind_sql, s.sql);
+    try testing.expectEqualStrings("Day Recap", s.params[0].text);
+    try testing.expectEqualStrings("preview", s.params[1].text);
+    try testing.expectEqualStrings("day_recap", s.params[2].text);
+    try testing.expectEqual(@as(i64, 4242), s.params[3].integer);
+}
+
+test "buildActivityRequest builds a tools/call for get_activity" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try buildActivityRequest(&out, testing.allocator, 1_700_000_000_000, 30);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"method\":\"tools/call\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"name\":\"get_activity\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"since_ms\":1700000000000") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"limit\":30") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.items, .{});
+    defer parsed.deinit();
+}
+
+test "formatActivityContext unwraps the double-wrapped result into lines" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    const inner =
+        "{\"activity\":[" ++
+        "{\"kind\":\"commit\",\"ref_id\":1,\"repo_id\":1,\"repo\":\"blocks\",\"title\":\"Add tray\",\"occurred_at\":2000}," ++
+        "{\"kind\":\"file_snapshot\",\"ref_id\":2,\"repo_id\":1,\"repo\":\"blocks\",\"title\":\"src/tray.zig\",\"occurred_at\":1000}]}";
+    var envelope: std.ArrayList(u8) = .empty;
+    defer envelope.deinit(testing.allocator);
+    var w = JsonWriter{ .out = &envelope, .alloc = testing.allocator };
+    try w.raw("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":");
+    try w.string(inner);
+    try w.raw("}],\"isError\":false}}");
+
+    const n = try formatActivityContext(&out, testing.allocator, envelope.items, 10);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expect(std.mem.indexOf(u8, out.items, "[blocks] commit Add tray") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "[blocks] edit src/tray.zig") != null);
+}
+
+test "formatActivityContext returns 0 on malformed or empty input" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), try formatActivityContext(&out, testing.allocator, "not json", 5));
+    try testing.expectEqual(@as(usize, 0), try formatActivityContext(&out, testing.allocator, "{\"result\":{}}", 5));
 }
 
 test "excerptTitle trims, takes the first line, and caps length" {

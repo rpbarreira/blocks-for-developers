@@ -89,6 +89,8 @@ const key_chat_insert: u64 = 182; // INSERT a new chats row
 const key_chat_rowid: u64 = 183; // SELECT last_insert_rowid() for the new chat
 const key_chat_write: u64 = 184; // INSERT the turn's messages + touch the chat
 const key_messages_list: u64 = 185; // load a chat's messages
+// Single-click summaries (Task 11). Share the spawn/fetch/file key space.
+const key_mcp_activity: u64 = 186; // POST get_activity tools/call for a summary's context
 
 /// The loopback port the MCP child binds (passed explicitly so the app
 /// knows where to reach it without first reading the endpoint file).
@@ -102,8 +104,17 @@ const mcp_binary_path = "mcp/zig-out/bin/blocks-mcp";
 /// has had a moment to bind its port.
 const mcp_health_body =
     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}";
-/// One-shot delay before the health check, giving the child time to bind.
+/// One-shot delay before the FIRST health check, giving the child time to bind.
 const mcp_health_delay_ms: u64 = 400;
+/// Delay between subsequent MCP health checks while the child is still coming
+/// up. The single-shot check used to race the child's bind and leave
+/// `mcp_ready` false forever (retrieval then silently skipped) — so we retry
+/// on a fixed backoff, mirroring the llama health check (Task 9).
+const mcp_health_retry_ms: u64 = 500;
+/// How many MCP health checks to attempt before giving up (non-fatal). The
+/// child binds fast (no model load), so a handful of tries over ~a few
+/// seconds is ample; `mcp_failed` is set only after the cap.
+const mcp_health_max_attempts: u32 = 20;
 
 /// The loopback port the llama.cpp runtime binds. Task 10's chat POSTs to
 /// its OpenAI-compatible endpoint here; for now we only health-check it.
@@ -225,6 +236,24 @@ pub const ModelChoice = struct {
     selected: bool,
 };
 
+/// One single-click summary card (Task 11) for the view's `<for each>`.
+/// `tag` is the `chat.SummaryKind` enum tag name — the markup coerces it to
+/// the enum for `on-press="start_summary:{c.tag}"`.
+pub const SummaryCard = struct {
+    tag: []const u8,
+    label: []const u8,
+    blurb: []const u8,
+};
+
+/// The fixed set of summary cards, one per `chat.SummaryKind`. `tag` MUST be
+/// the exact enum tag name (`@tagName`) so markup's `stringToEnum` coercion
+/// resolves it.
+const summary_cards = [_]SummaryCard{
+    .{ .tag = @tagName(chat.SummaryKind.day_recap), .label = "Day Recap", .blurb = "What you worked on recently" },
+    .{ .tag = @tagName(chat.SummaryKind.top_of_mind), .label = "What's Top of Mind", .blurb = "The threads to pick back up" },
+    .{ .tag = @tagName(chat.SummaryKind.standup), .label = "Standup Update", .blurb = "Yesterday · Today · Blockers" },
+};
+
 pub const Model = struct {
     /// True when the config file already existed at boot (returning user).
     /// Read by `persistSelectedModel` to preserve the flag when rewriting
@@ -326,6 +355,10 @@ pub const Model = struct {
     /// True if the child exited or failed to spawn. Surfaced for later UI;
     /// the app still runs (the MCP server is optional for the core UX).
     mcp_failed: bool = false,
+    /// How many MCP `/` health checks have been attempted this session.
+    /// Resets on spawn; caps at `mcp_health_max_attempts` before we declare
+    /// the server unreachable (non-fatal).
+    mcp_health_attempts: u32 = 0,
 
     // ---- Local model management + llama.cpp runtime (Task 9) ----
     /// The selected model's catalog id, read from config.json on boot (or
@@ -372,6 +405,13 @@ pub const Model = struct {
     /// MCP-search → stream chain so it can be persisted at the end.
     pending_user_buf: [chat.max_content_bytes]u8 = undefined,
     pending_user_len: usize = 0,
+    /// For a single-click summary turn (Task 11), the summary being generated;
+    /// null for an ordinary chat turn. Held across the whole turn so the new
+    /// chat is created with the right `chats.kind` + title, then cleared when
+    /// the turn completes (`chat_write_done`) or fails. A summary retrieves
+    /// context via the MCP `get_activity` tool (time-windowed) instead of
+    /// `search_memory`, but otherwise reuses the exact chat turn machinery.
+    pending_summary_kind: ?chat.SummaryKind = null,
     /// The assistant reply being streamed in (grows as tokens arrive).
     streaming_buf: [chat_reply_cap]u8 = undefined,
     streaming_len: usize = 0,
@@ -469,13 +509,27 @@ pub const Model = struct {
     pub fn sendDisabled(self: *const Model) bool {
         return !self.canSend();
     }
+    /// The single-click summary cards (Task 11) share the same gate as Send:
+    /// offered only when the runtime is up and no turn is already in flight.
+    pub fn summaryDisabled(self: *const Model) bool {
+        return !self.canSend();
+    }
+    /// The summary cards for the view's `<for each>`. `tag` is the
+    /// `SummaryKind` enum tag NAME — markup coerces it to the enum for
+    /// `on-press="start_summary:{c.tag}"` (the runtime does
+    /// `std.meta.stringToEnum`). Static strings, so no owned storage needed.
+    pub fn summaryCards(self: *const Model) []const SummaryCard {
+        _ = self;
+        return &summary_cards;
+    }
     /// A one-line status for the chat area.
     pub fn chatStatusText(self: *const Model) []const u8 {
         if (self.chat_error_len > 0) return self.chat_error_buf[0..self.chat_error_len];
-        if (self.streaming) return "Blocks is thinking…";
-        if (self.sending) return "Searching your memory…";
+        const summary = self.pending_summary_kind != null;
+        if (self.streaming) return if (summary) "Writing your summary…" else "Blocks is thinking…";
+        if (self.sending) return if (summary) "Gathering your recent activity…" else "Searching your memory…";
         if (!self.llama_ready) return self.modelStatusText();
-        return "Ask about your recent work.";
+        return "Ask about your recent work, or tap a summary above.";
     }
     /// True when there is nothing to show yet (empty-state hint).
     pub fn chatEmpty(self: *const Model) bool {
@@ -609,7 +663,7 @@ pub const Model = struct {
         // Embedding generation (Task 7).
         "embedding",          "embed_phase",       "embed_last_rows",
         // MCP server child process (Task 8).
-        "mcp_started",        "mcp_ready",         "mcp_failed",
+        "mcp_started",        "mcp_ready",         "mcp_failed",     "mcp_health_attempts",
         // Local model management + llama.cpp runtime (Task 9).
         "selected_model_buf", "selected_model_len", "model_present",  "downloading",
         "download_progress",  "download_failed",    "llama_started",  "llama_ready",
@@ -623,6 +677,9 @@ pub const Model = struct {
         "context_buf",        "context_len",        "sending",        "streaming",
         "finalizing",         "chat_error_buf",     "chat_error_len", "pushMessage",
         "canSend",
+        // Single-click summaries (Task 11). `summaryDisabled` is bound in
+        // markup; `pending_summary_kind` is per-turn update state.
+        "pending_summary_kind",
     };
 };
 
@@ -693,6 +750,10 @@ pub const Msg = union(enum) {
     chat_write_done: native_sdk.EffectDbResult, // the turn's messages persisted
     messages_listed: native_sdk.EffectDbResult, // a chat's messages reload
 
+    // Single-click summaries (Task 11)
+    start_summary: chat.SummaryKind, // a summary card was tapped
+    mcp_activity_done: native_sdk.EffectResponse, // get_activity result -> build context
+
     // Delivered by effects/host, never bound as markup handlers.
     pub const view_unbound = .{
         "stat_config",         "wrote_config",       "wrote_keep",
@@ -714,6 +775,9 @@ pub const Msg = union(enum) {
         "mcp_search_done",     "chat_line",          "chat_done",
         "chat_inserted",       "chat_rowid_done",    "chat_write_done",
         "messages_listed",
+        // Task 11 effect-delivered arm (start_summary IS bound as a markup
+        // handler, so it is intentionally omitted).
+        "mcp_activity_done",
     };
 };
 
@@ -903,6 +967,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     .on_result = Effects.dbMsg(.chat_rowid_done),
                 });
             } else {
+                model.sending = false;
+                model.pending_summary_kind = null;
                 model.setChatError("Could not start a new chat.");
             }
         },
@@ -915,9 +981,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.sending = false;
             model.pending_user_len = 0;
             model.context_len = 0;
+            model.pending_summary_kind = null;
             if (model.current_chat_id != 0) loadMessages(model.current_chat_id, fx);
         },
         .messages_listed => |res| messagesListed(model, res),
+
+        // ---- Single-click summaries (Task 11) ----
+        .start_summary => |kind| startSummary(model, kind, fx),
+        .mcp_activity_done => |res| mcpActivityDone(model, res, fx),
 
         .wrote_keep => {
             // Directory anchor created; no state change needed. Kept as a
@@ -1031,6 +1102,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .mcp_health_tick => |timer| {
             if (timer.outcome == .rejected) return;
+            model.mcp_health_attempts += 1;
             healthCheckMcp(fx);
         },
         .mcp_health_done => |res| {
@@ -1038,9 +1110,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (res.outcome == .ok and res.status == 200) {
                 model.mcp_ready = true;
                 model.mcp_failed = false;
+            } else if (!model.mcp_ready) {
+                // The child may still be binding (connection refused) or the
+                // first check raced its listen(). Retry on a fixed backoff
+                // until the cap, then give up (non-fatal — retrieval degrades
+                // to no-context, and the UI still works). Mirrors the llama
+                // health check (Task 9).
+                if (model.mcp_health_attempts < mcp_health_max_attempts) {
+                    armMcpHealth(mcp_health_retry_ms, fx);
+                } else {
+                    model.mcp_failed = true;
+                }
             }
-            // A failure is not fatal: the child may still be binding. We
-            // leave mcp_ready false; Task 10 will add retry/backoff.
         },
     }
 }
@@ -1181,9 +1262,15 @@ fn startMcpServer(model: *Model, fx: *Effects) void {
     });
 
     // Give the child a moment to bind before the first health check.
+    model.mcp_health_attempts = 0;
+    armMcpHealth(mcp_health_delay_ms, fx);
+}
+
+/// Arm the one-shot timer that fires the next MCP health check after `delay_ms`.
+fn armMcpHealth(delay_ms: u64, fx: *Effects) void {
     fx.startTimer(.{
         .key = key_mcp_health_timer,
-        .interval_ms = mcp_health_delay_ms,
+        .interval_ms = delay_ms,
         .mode = .one_shot,
         .on_fire = Effects.timerMsg(.mcp_health_tick),
     });
@@ -1389,6 +1476,7 @@ fn sendChat(model: *Model, fx: *Effects) void {
     model.pushMessage(.user, raw); // optimistic display
     model.chat_input.clear();
     model.clearChatError();
+    model.pending_summary_kind = null; // an ordinary chat turn (not a summary)
     model.sending = true;
     model.finalizing = false;
     model.streaming = false;
@@ -1447,6 +1535,83 @@ fn mcpSearchDone(model: *Model, res: native_sdk.EffectResponse, fx: *Effects) vo
         if (hits > 0) model.setContext(ctx.items);
     }
     // Whether or not we found memory, ask the model now.
+    startCompletion(model, fx);
+}
+
+/// A single-click summary card was tapped (Task 11). A summary is a canned
+/// turn: the card's fixed prompt becomes the "user" message, Blocks pulls the
+/// developer's recent activity from the MCP `get_activity` tool as context,
+/// and the model writes the summary. It always starts a FRESH chat, tagged
+/// with the summary's `chats.kind`. Reuses the entire Task 10 turn machinery
+/// (`startCompletion` → stream → `finalizeChat` → persist).
+fn startSummary(model: *Model, kind: chat.SummaryKind, fx: *Effects) void {
+    if (model.sending) return; // one turn at a time
+    if (!model.llama_ready) {
+        model.setChatError("The model runtime isn't ready yet.");
+        return;
+    }
+
+    // A summary is a NEW conversation, so reset the active chat. The canned
+    // prompt is the turn's user message (shown + persisted).
+    const prompt = kind.prompt();
+    model.current_chat_id = 0;
+    model.next_seq = 0;
+    model.message_count = 0;
+    model.setPendingUser(prompt);
+    model.pushMessage(.user, prompt); // optimistic display
+    model.clearChatError();
+    model.pending_summary_kind = kind;
+    model.sending = true;
+    model.finalizing = false;
+    model.streaming = false;
+    model.streaming_len = 0;
+    model.context_len = 0;
+
+    // Retrieve recent activity (best-effort). If the MCP server isn't ready,
+    // proceed straight to the completion with no injected context.
+    if (model.mcp_ready) {
+        retrieveActivity(model, kind, fx);
+    } else {
+        startCompletion(model, fx);
+    }
+}
+
+/// POST a `get_activity` tools/call to the MCP server for the summary's time
+/// window. The result lands in `mcp_activity_done`.
+fn retrieveActivity(model: *Model, kind: chat.SummaryKind, fx: *Effects) void {
+    const since_ms = fx.wallMs() - kind.lookbackMs();
+    // The request is small + fixed-shape (two integers); a stack buffer is
+    // ample. fetch copies the body at call time.
+    var scratch: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    var body: std.ArrayList(u8) = .empty;
+    chat.buildActivityRequest(&body, fba.allocator(), since_ms, kind.activityLimit()) catch {
+        return startCompletion(model, fx);
+    };
+    var url_buf: [64]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{mcp_port}) catch return;
+    fx.fetch(.{
+        .key = key_mcp_activity,
+        .method = .POST,
+        .url = url,
+        .headers = &.{.{ .name = "content-type", .value = "application/json" }},
+        .body = body.items,
+        .timeout_ms = 5_000,
+        .on_response = Effects.responseMsg(.mcp_activity_done),
+    });
+}
+
+/// Got the recent-activity response (or a failure). Format it into the
+/// context block (best-effort) and start the completion either way.
+fn mcpActivityDone(model: *Model, res: native_sdk.EffectResponse, fx: *Effects) void {
+    if (res.outcome == .ok and res.status == 200) {
+        const rows: usize = if (model.pending_summary_kind) |k| k.activityLimit() else 30;
+        var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena_state.deinit();
+        var ctx: std.ArrayList(u8) = .empty;
+        const n = chat.formatActivityContext(&ctx, arena_state.allocator(), res.body, rows) catch 0;
+        if (n > 0) model.setContext(ctx.items);
+    }
     startCompletion(model, fx);
 }
 
@@ -1522,6 +1687,7 @@ fn finalizeChat(model: *Model, ok: bool, fx: *Effects) void {
         model.sending = false;
         model.streaming_len = 0;
         model.context_len = 0;
+        model.pending_summary_kind = null;
         if (!ok) model.setChatError("The model did not respond. Is the runtime still up?");
         return;
     }
@@ -1540,14 +1706,30 @@ fn finalizeChat(model: *Model, ok: bool, fx: *Effects) void {
     }
 }
 
-/// INSERT a new `chats` row titled from the user's first message; the id is
-/// read back in `chat_rowid_done`, which then persists the turn's messages.
+/// INSERT a new `chats` row; the id is read back in `chat_rowid_done`, which
+/// then persists the turn's messages. For a single-click summary (Task 11)
+/// the row is tagged with the summary's `chats.kind` and its fixed title;
+/// for an ordinary chat it defaults to kind='chat' titled from the first
+/// user message. Both param buffers live on this frame (dbExec copies at call).
 fn createChatThenPersist(model: *Model, fx: *Effects) void {
+    const now = fx.wallMs();
+    if (model.pending_summary_kind) |kind| {
+        // A summary: fixed title, explicit kind. The preview is filled in
+        // from the reply by `persistTurn`'s chat-touch.
+        const title = kind.title();
+        var params: [4]db.Value = undefined;
+        fx.dbExec(.{
+            .key = key_chat_insert,
+            .statements = &.{chat.chatInsertKindStatement(&params, title, title, kind.chatKind(), now)},
+            .on_result = Effects.dbMsg(.chat_inserted),
+        });
+        return;
+    }
     const title = chat.excerptTitle(model.pendingUser());
     var params: [3]db.Value = undefined;
     fx.dbExec(.{
         .key = key_chat_insert,
-        .statements = &.{chat.chatInsertStatement(&params, title, title, fx.wallMs())},
+        .statements = &.{chat.chatInsertStatement(&params, title, title, now)},
         .on_result = Effects.dbMsg(.chat_inserted),
     });
 }
@@ -1579,6 +1761,7 @@ fn persistTurn(model: *Model, fx: *Effects) void {
         // We finished a reply but couldn't obtain a chat id to save it under.
         // Surface it and re-enable input; the messages stay on screen.
         model.sending = false;
+        model.pending_summary_kind = null;
         model.setChatError("Couldn't save this chat — your reply is shown but not stored.");
         return;
     }
