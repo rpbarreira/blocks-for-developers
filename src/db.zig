@@ -34,6 +34,7 @@ pub const Migration = relational_store.Migration;
 /// running app loads the build-generated copy, not this one.
 pub const migrations = [_]Migration{
     .{ .version = 1, .name = "initial_schema", .sql = @embedFile("schema/0001_initial_schema.sql") },
+    .{ .version = 2, .name = "snippets_text_expander", .sql = @embedFile("schema/0002_snippets_text_expander.sql") },
 };
 
 // -------------------------------------------------------- bind value ctors
@@ -232,11 +233,11 @@ const TestDb = struct {
     }
 };
 
-test "migrations apply to a fresh in-memory database (schema version 1)" {
+test "migrations apply to a fresh in-memory database (schema version 2)" {
     var db = try TestDb.open();
     defer db.close();
     const version = try db.database.schemaVersion();
-    try testing.expectEqual(@as(u32, 1), version);
+    try testing.expectEqual(@as(u32, 2), version);
 }
 
 test "re-applying migrations is idempotent (already at target version)" {
@@ -245,7 +246,25 @@ test "re-applying migrations is idempotent (already at target version)" {
     // Applying the same set again must be a no-op ok at the same version.
     const result = db.database.applyMigrations(&migrations);
     try testing.expectEqual(relational_store.OpenOutcome.ok, result.outcome);
-    try testing.expectEqual(@as(u32, 1), result.version);
+    try testing.expectEqual(@as(u32, 2), result.version);
+}
+
+test "migration 0002 adds the snippets.text_expander column" {
+    var db = try TestDb.open();
+    defer db.close();
+    // A row written with text_expander reads back — proves the column exists
+    // with the right name after the 0002 ALTER.
+    try db.exec(&.{.{
+        .sql = "INSERT INTO snippets(id, title, content, language, annotation, text_expander, created_at, updated_at) " ++
+            "VALUES(1,'t','c','zig','a','expand-me',1,1);",
+    }});
+    db.fx.dbQuery(.{ .key = 7, .sql = "SELECT text_expander FROM snippets WHERE id = 1;", .on_result = Fx.dbMsg(.db) });
+    const page = try db.take();
+    var reader = try PageReader.init(page.bytes);
+    var row: [1]ColumnValue = undefined;
+    const cols = (try reader.next(&row)).?;
+    try testing.expectEqualStrings("expand-me", cols[0].asText().?);
+    _ = try db.take(); // .done
 }
 
 test "every declared table exists after migration" {

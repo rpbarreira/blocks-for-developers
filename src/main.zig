@@ -25,6 +25,7 @@ const tray = @import("tray.zig");
 const embeddings = @import("embeddings.zig");
 const models = @import("models.zig");
 const chat = @import("chat.zig");
+const snippets = @import("snippets.zig");
 
 const canvas = native_sdk.canvas;
 
@@ -91,6 +92,16 @@ const key_chat_write: u64 = 184; // INSERT the turn's messages + touch the chat
 const key_messages_list: u64 = 185; // load a chat's messages
 // Single-click summaries (Task 11). Share the spawn/fetch/file key space.
 const key_mcp_activity: u64 = 186; // POST get_activity tools/call for a summary's context
+// Materials / snippets (Task 12). Share the spawn/fetch/file/db key space.
+const key_snip_list: u64 = 190; // query the snippets list (recent/alpha, optional lang filter)
+const key_snip_langs: u64 = 191; // query the distinct languages
+const key_snip_insert: u64 = 192; // INSERT a new snippet
+const key_snip_rowid: u64 = 193; // SELECT MAX(id) to recover a new snippet's id
+const key_snip_update: u64 = 194; // UPDATE an existing snippet
+const key_snip_setlang: u64 = 195; // UPDATE just the language (set-language modal)
+const key_snip_delete: u64 = 196; // DELETE a snippet
+const key_snip_clip: u64 = 197; // writeClipboard the selected snippet
+const key_snip_detail: u64 = 198; // query the selected snippet's full body
 
 /// The loopback port the MCP child binds (passed explicitly so the app
 /// knows where to reach it without first reading the endpoint file).
@@ -139,6 +150,20 @@ const chat_search_hits: u32 = 6; // how many memory hits to retrieve for context
 const chat_context_cap: usize = 4096; // max bytes of retrieved context injected
 const chat_reply_cap: usize = chat.max_content_bytes; // max streamed reply we retain
 const chat_input_capacity = 2048; // chat text-field buffer capacity
+
+/// Materials / snippets (Task 12) input-field capacities.
+const snip_search_capacity = 256; // "Find materials…" search field
+const snip_title_capacity = snippets.max_title_bytes;
+const snip_content_capacity = 8192; // editor body field (display/edit cap)
+const snip_language_capacity = snippets.max_language_bytes;
+const snip_annotation_capacity = snippets.max_annotation_bytes;
+const snip_text_expander_capacity = snippets.max_text_expander_bytes;
+/// How the sidebar list is ordered (mockup: SORT BY → Recent / Alphabetical).
+const SnippetSort = enum { recent, alphabetical };
+
+/// Which top-level screen is showing. A minimal nav so the Chat and Materials
+/// views don't stack in one scroll (Task 13 does the high-fidelity shell).
+const Screen = enum { chat, materials };
 /// Whole-exchange timeout for the streamed completion (a long reply on a
 /// small local model can still take a while); the stream lifetime counts.
 const chat_stream_timeout_ms: u32 = 120_000;
@@ -437,6 +462,56 @@ pub const Model = struct {
     chat_error_buf: [256]u8 = undefined,
     chat_error_len: usize = 0,
 
+    // ---- Top-level navigation (Task 12) ----
+    /// Which screen is showing (Chat by default; Materials is Task 12's view).
+    screen: Screen = .chat,
+
+    // ---- Materials / snippets (Task 12) ----
+    /// Loaded snippets (filtered + sorted by the current controls), refreshed
+    /// after every change. Inline-owned so the view slice survives updates.
+    snippet_list: [snippets.max_snippets]snippets.SnippetEntry = undefined,
+    snippet_count: usize = 0,
+    /// The distinct languages the user has snippets for — powers the sidebar
+    /// language-filter menu AND the set-language modal's typeahead suggestions.
+    languages: [snippets.max_languages]snippets.LanguageEntry = undefined,
+    language_count: usize = 0,
+    /// The selected snippet's id (0 = none). The sidebar `snippet_list` holds
+    /// only lightweight cards; the SELECTED snippet's full body is loaded into
+    /// `selected_detail` on demand (so the big content buffers exist once).
+    selected_snippet_id: i64 = 0,
+    selected_detail: snippets.SnippetDetail = .{},
+    /// Sidebar controls: sort order + the active language filter ("" = All).
+    snippet_sort: SnippetSort = .recent,
+    lang_filter_buf: [snippets.max_language_bytes]u8 = undefined,
+    lang_filter_len: usize = 0,
+    /// "Find materials…" search text (client-side filter over the loaded list).
+    snippet_search: canvas.TextBuffer(snip_search_capacity) = .{},
+    /// Which transient sidebar menu is open (only one at a time).
+    sort_menu_open: bool = false,
+    lang_menu_open: bool = false,
+    /// The editor sheet: open when adding or editing a snippet. `editing_id`
+    /// is 0 for a new snippet, else the id being edited.
+    editor_open: bool = false,
+    editing_id: i64 = 0,
+    edit_title: canvas.TextBuffer(snip_title_capacity) = .{},
+    edit_content: canvas.TextBuffer(snip_content_capacity) = .{},
+    edit_language: canvas.TextBuffer(snip_language_capacity) = .{},
+    edit_annotation: canvas.TextBuffer(snip_annotation_capacity) = .{},
+    edit_text_expander: canvas.TextBuffer(snip_text_expander_capacity) = .{},
+    /// The set-language modal (main-panel `{}` icon): a free-text field with
+    /// typeahead from `languages`. `lang_modal_id` is the snippet being tagged.
+    lang_modal_open: bool = false,
+    lang_modal_id: i64 = 0,
+    lang_modal_input: canvas.TextBuffer(snip_language_capacity) = .{},
+    /// True once the snippets list has been loaded on boot (load exactly once).
+    snippets_loaded: bool = false,
+    /// True while a snippet write (insert/update/delete/setlang) is in flight,
+    /// so the new snippet's id recovery (MAX(id)) can't race a second write.
+    snippet_writing: bool = false,
+    /// Transient status/toast for materials actions (e.g. "Copied to clipboard").
+    snippet_status_buf: [128]u8 = undefined,
+    snippet_status_len: usize = 0,
+
     pub fn selectedModel(self: *const Model) []const u8 {
         if (self.selected_model_len == 0) return models.default_model_id;
         return self.selected_model_buf[0..self.selected_model_len];
@@ -568,7 +643,125 @@ pub const Model = struct {
     pub fn pushMessage(self: *Model, role: chat.Role, text: []const u8) void {
         if (self.message_count >= chat.max_messages) return;
         self.messages[self.message_count] = chat.MessageEntry.set(role, text);
+        self.messages[self.message_count].index = @intCast(self.message_count);
         self.message_count += 1;
+    }
+
+    // ---- Navigation accessors (Task 12) ----
+    pub fn onChatScreen(self: *const Model) bool {
+        return self.screen == .chat;
+    }
+    pub fn onMaterialsScreen(self: *const Model) bool {
+        return self.screen == .materials;
+    }
+
+    // ---- Materials / snippets accessors (Task 12) ----
+    /// The loaded snippets, further narrowed by the "Find materials…" text
+    /// (client-side substring match over title + blurb). The language filter
+    /// and sort are applied server-side by the reload query; search is applied
+    /// here so typing doesn't hit the DB per keystroke. NOTE: returns a slice
+    /// into a per-call static scratch of indices is overkill — instead the
+    /// view iterates `snippetList()` and each row exposes `matchesSearch`.
+    pub fn snippetList(self: *const Model) []const snippets.SnippetEntry {
+        return self.snippet_list[0..self.snippet_count];
+    }
+    /// The count badge in the sidebar ("N/total"): matches shown / total loaded.
+    pub fn snippetCount(self: *const Model) i64 {
+        return @intCast(self.snippet_count);
+    }
+    pub fn languageList(self: *const Model) []const snippets.LanguageEntry {
+        return self.languages[0..self.language_count];
+    }
+    pub fn snippetSearchText(self: *const Model) []const u8 {
+        return self.snippet_search.text();
+    }
+    pub fn hasSnippets(self: *const Model) bool {
+        return self.snippet_count > 0;
+    }
+    pub fn noSnippets(self: *const Model) bool {
+        return self.snippet_count == 0;
+    }
+    pub fn snippetSelected(self: *const Model) bool {
+        return self.selected_snippet_id != 0 and self.selected_detail.id == self.selected_snippet_id;
+    }
+    pub fn noSnippetSelected(self: *const Model) bool {
+        return !self.snippetSelected();
+    }
+    /// The main-panel language button label: the language, or a hint to set one.
+    pub fn selectedLanguageLabel(self: *const Model) []const u8 {
+        const lang = self.selectedLanguage();
+        return if (lang.len > 0) lang else "Set language";
+    }
+    /// The editor's current content text (bound by the editable `<code>`).
+    pub fn editContent(self: *const Model) []const u8 {
+        return self.edit_content.text();
+    }
+    /// The selected snippet's LIST CARD (or null when not in the loaded list).
+    pub fn selectedCard(self: *const Model) ?*const snippets.SnippetEntry {
+        for (self.snippet_list[0..self.snippet_count]) |*e| {
+            if (e.id == self.selected_snippet_id) return e;
+        }
+        return null;
+    }
+    /// The selected snippet's full detail (valid when `id` matches the selection).
+    fn detail(self: *const Model) ?*const snippets.SnippetDetail {
+        if (self.selected_detail.id != 0 and self.selected_detail.id == self.selected_snippet_id)
+            return &self.selected_detail;
+        return null;
+    }
+    pub fn selectedTitle(self: *const Model) []const u8 {
+        return if (self.detail()) |d| d.title() else "";
+    }
+    pub fn selectedContent(self: *const Model) []const u8 {
+        return if (self.detail()) |d| d.content() else "";
+    }
+    pub fn selectedLanguage(self: *const Model) []const u8 {
+        return if (self.detail()) |d| d.language() else "";
+    }
+    pub fn selectedAnnotation(self: *const Model) []const u8 {
+        return if (self.detail()) |d| d.annotation() else "";
+    }
+    pub fn selectedTextExpander(self: *const Model) []const u8 {
+        return if (self.detail()) |d| d.textExpander() else "";
+    }
+    pub fn langFilter(self: *const Model) []const u8 {
+        return self.lang_filter_buf[0..self.lang_filter_len];
+    }
+    /// The active filter's display label for the sidebar ("All" when none).
+    pub fn langFilterLabel(self: *const Model) []const u8 {
+        return if (self.lang_filter_len == 0) "All" else self.langFilter();
+    }
+    pub fn sortLabel(self: *const Model) []const u8 {
+        return switch (self.snippet_sort) {
+            .recent => "Recent",
+            .alphabetical => "Alphabetical",
+        };
+    }
+    pub fn sortMenuOpen(self: *const Model) bool {
+        return self.sort_menu_open;
+    }
+    pub fn langMenuOpen(self: *const Model) bool {
+        return self.lang_menu_open;
+    }
+    pub fn editorOpen(self: *const Model) bool {
+        return self.editor_open;
+    }
+    pub fn editorTitleLabel(self: *const Model) []const u8 {
+        return if (self.editing_id == 0) "New material" else "Edit material";
+    }
+    pub fn langModalOpen(self: *const Model) bool {
+        return self.lang_modal_open;
+    }
+    pub fn snippetStatus(self: *const Model) []const u8 {
+        return self.snippet_status_buf[0..self.snippet_status_len];
+    }
+    fn setSnippetStatus(self: *Model, msg: []const u8) void {
+        self.snippet_status_len = @min(msg.len, self.snippet_status_buf.len);
+        @memcpy(self.snippet_status_buf[0..self.snippet_status_len], msg[0..self.snippet_status_len]);
+    }
+    fn setLangFilter(self: *Model, lang: []const u8) void {
+        self.lang_filter_len = @min(lang.len, self.lang_filter_buf.len);
+        @memcpy(self.lang_filter_buf[0..self.lang_filter_len], lang[0..self.lang_filter_len]);
     }
 
     pub fn capturePath(self: *const Model) []const u8 {
@@ -680,6 +873,22 @@ pub const Model = struct {
         // Single-click summaries (Task 11). `summaryDisabled` is bound in
         // markup; `pending_summary_kind` is per-turn update state.
         "pending_summary_kind",
+        // Navigation + Materials / snippets (Task 12). The list/menu/editor
+        // accessors are bound in markup; these are the update/effect-only
+        // fields + the text-field buffers (driven via on-input, not bound).
+        "screen",
+        "snippet_list",         "snippet_count",       "languages",          "language_count",
+        "selected_snippet_id",  "selected_detail",     "snippet_sort",       "lang_filter_buf",
+        "lang_filter_len",
+        "snippet_search",       "sort_menu_open",      "lang_menu_open",     "editor_open",
+        "editing_id",           "edit_title",          "edit_content",       "edit_language",
+        "edit_annotation",      "edit_text_expander",  "lang_modal_open",    "lang_modal_id",
+        "lang_modal_input",     "snippet_writing",     "snippet_status_buf", "snippet_status_len",
+        "snippets_loaded",
+        // Accessors read only from update/other-accessor logic (not bound in
+        // markup): the search text drives a reload; selectedLanguage feeds
+        // selectedLanguageLabel; langFilter feeds the reload query.
+        "snippetSearchText",    "selectedLanguage",    "langFilter",
     };
 };
 
@@ -754,6 +963,45 @@ pub const Msg = union(enum) {
     start_summary: chat.SummaryKind, // a summary card was tapped
     mcp_activity_done: native_sdk.EffectResponse, // get_activity result -> build context
 
+    // Navigation (Task 12)
+    show_chat, // top-level nav: show the Chat screen
+    show_materials, // top-level nav: show the Materials screen
+
+    // Materials / snippets (Task 12)
+    snippets_listed: native_sdk.EffectDbResult, // snippets list query page/done
+    languages_listed: native_sdk.EffectDbResult, // distinct-languages query page/done
+    select_snippet: i64, // a sidebar card was tapped (select by id)
+    snippet_search_edit: canvas.TextInputEvent, // typing in "Find materials…"
+    toggle_sort_menu, // open/close the SORT BY menu
+    sort_recent, // choose the Recent sort
+    sort_alphabetical, // choose the Alphabetical sort
+    toggle_lang_menu, // open/close the language-filter menu
+    clear_lang_filter, // "All" — clear the language filter
+    set_lang_filter: usize, // choose a filter language (filterIndex = position+1)
+    open_new_snippet, // "+" — open a blank editor
+    open_edit_snippet, // pencil — load the selected snippet into the editor
+    edit_title_edit: canvas.TextInputEvent,
+    edit_content_edit: canvas.TextInputEvent,
+    edit_language_edit: canvas.TextInputEvent,
+    edit_annotation_edit: canvas.TextInputEvent,
+    edit_text_expander_edit: canvas.TextInputEvent,
+    save_snippet, // commit the editor (insert or update)
+    cancel_editor, // discard the editor
+    delete_snippet, // trash — delete the selected snippet
+    copy_snippet, // copy icon — copy the selected snippet to the clipboard
+    snippet_clip_done: native_sdk.EffectClipboardResult, // clipboard write result
+    open_lang_modal, // main-panel `{}` — open the set-language modal
+    lang_modal_edit: canvas.TextInputEvent, // typing the language in the modal
+    pick_lang_suggestion: usize, // tap a typeahead suggestion (index into languages)
+    save_lang_modal, // commit the set-language modal
+    cancel_lang_modal, // discard the set-language modal
+    start_copilot_chat, // "Start Copilot Chat" — seed a new chat from the snippet
+    snippet_inserted: native_sdk.EffectDbResult, // new snippet insert result
+    snippet_rowid_done: native_sdk.EffectDbResult, // MAX(id) recovery for a new snippet
+    snippet_write_done: native_sdk.EffectDbResult, // update/delete/setlang result
+    snippet_detail_loaded: native_sdk.EffectDbResult, // selected snippet's full body
+    save_to_snippets: i64, // "Save to Snippets" from a chat message (by seq index)
+
     // Delivered by effects/host, never bound as markup handlers.
     pub const view_unbound = .{
         "stat_config",         "wrote_config",       "wrote_keep",
@@ -778,6 +1026,12 @@ pub const Msg = union(enum) {
         // Task 11 effect-delivered arm (start_summary IS bound as a markup
         // handler, so it is intentionally omitted).
         "mcp_activity_done",
+        // Task 12 effect-delivered arms (the select/toggle/open/save/cancel/
+        // delete/copy + *_edit on-input arms ARE bound as markup handlers, so
+        // they are intentionally omitted).
+        "snippets_listed",  "languages_listed",  "snippet_clip_done",
+        "snippet_inserted", "snippet_rowid_done", "snippet_write_done",
+        "snippet_detail_loaded",
     };
 };
 
@@ -990,6 +1244,116 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .start_summary => |kind| startSummary(model, kind, fx),
         .mcp_activity_done => |res| mcpActivityDone(model, res, fx),
 
+        // ---- Navigation (Task 12) ----
+        .show_chat => model.screen = .chat,
+        .show_materials => model.screen = .materials,
+
+        // ---- Materials / snippets (Task 12) ----
+        .snippets_listed => |res| snippetsListed(model, res),
+        .languages_listed => |res| languagesListed(model, res),
+        .select_snippet => |id| {
+            model.selected_snippet_id = id;
+            model.snippet_status_len = 0;
+            loadSnippetDetail(model, id, fx);
+        },
+        .snippet_search_edit => |event| {
+            model.snippet_search.apply(event);
+            loadSnippets(model, fx);
+        },
+        .toggle_sort_menu => {
+            model.sort_menu_open = !model.sort_menu_open;
+            model.lang_menu_open = false;
+        },
+        .sort_recent => {
+            model.snippet_sort = .recent;
+            model.sort_menu_open = false;
+            loadSnippets(model, fx);
+        },
+        .sort_alphabetical => {
+            model.snippet_sort = .alphabetical;
+            model.sort_menu_open = false;
+            loadSnippets(model, fx);
+        },
+        .toggle_lang_menu => {
+            model.lang_menu_open = !model.lang_menu_open;
+            model.sort_menu_open = false;
+        },
+        .clear_lang_filter => {
+            model.lang_filter_len = 0;
+            model.lang_menu_open = false;
+            loadSnippets(model, fx);
+        },
+        .set_lang_filter => |fidx| {
+            // filterIndex is position+1 (index 0 is the separate "All" action),
+            // so the language is languages[fidx-1].
+            if (fidx >= 1 and fidx - 1 < model.language_count) {
+                model.setLangFilter(model.languages[fidx - 1].name());
+            }
+            model.lang_menu_open = false;
+            loadSnippets(model, fx);
+        },
+        .open_new_snippet => openEditor(model, 0),
+        .open_edit_snippet => {
+            if (model.selected_snippet_id != 0) openEditor(model, model.selected_snippet_id);
+        },
+        .edit_title_edit => |e| model.edit_title.apply(e),
+        .edit_content_edit => |e| model.edit_content.apply(e),
+        .edit_language_edit => |e| model.edit_language.apply(e),
+        .edit_annotation_edit => |e| model.edit_annotation.apply(e),
+        .edit_text_expander_edit => |e| model.edit_text_expander.apply(e),
+        .save_snippet => saveSnippet(model, fx),
+        .cancel_editor => {
+            model.editor_open = false;
+            model.editing_id = 0;
+        },
+        .delete_snippet => deleteSnippet(model, fx),
+        .copy_snippet => copySnippet(model, fx),
+        .snippet_clip_done => |res| {
+            if (res.outcome == .ok) {
+                model.setSnippetStatus("Copied to clipboard.");
+            } else {
+                model.setSnippetStatus("Couldn't copy to the clipboard.");
+            }
+        },
+        .open_lang_modal => {
+            if (model.detail()) |s| {
+                model.lang_modal_open = true;
+                model.lang_modal_id = s.id;
+                model.lang_modal_input.set(s.language());
+            }
+        },
+        .lang_modal_edit => |e| model.lang_modal_input.apply(e),
+        .pick_lang_suggestion => |idx| {
+            if (idx < model.language_count) model.lang_modal_input.set(model.languages[idx].name());
+        },
+        .save_lang_modal => saveLangModal(model, fx),
+        .cancel_lang_modal => {
+            model.lang_modal_open = false;
+            model.lang_modal_id = 0;
+        },
+        .start_copilot_chat => startCopilotChat(model, fx),
+        .snippet_inserted => |res| {
+            if (res.outcome == .ok) {
+                fx.dbQuery(.{
+                    .key = key_snip_rowid,
+                    .sql = snippets.max_id_sql,
+                    .on_result = Effects.dbMsg(.snippet_rowid_done),
+                });
+            } else {
+                model.snippet_writing = false;
+                model.setSnippetStatus("Couldn't save the material.");
+            }
+        },
+        .snippet_rowid_done => |res| snippetRowidDone(model, res, fx),
+        .snippet_write_done => {
+            model.snippet_writing = false;
+            loadSnippets(model, fx);
+            loadLanguages(model, fx);
+            if (model.selected_snippet_id != 0) loadSnippetDetail(model, model.selected_snippet_id, fx);
+        },
+        .snippet_detail_loaded => |res| snippetDetailLoaded(model, res),
+        .save_to_snippets => |seq_idx| saveToSnippets(model, seq_idx, fx),
+
         .wrote_keep => {
             // Directory anchor created; no state change needed. Kept as a
             // distinct arm so a future models UI can react to it.
@@ -1026,6 +1390,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // Start the MCP server child once, now that app.db exists and
             // the runner has applied migrations (the list query proves it).
             if (res.kind == .done) startMcpServer(model, fx);
+            // Load the saved materials (snippets) + their languages once the
+            // DB is confirmed ready (Task 12).
+            if (res.kind == .done and !model.snippets_loaded) {
+                model.snippets_loaded = true;
+                loadSnippets(model, fx);
+                loadLanguages(model, fx);
+            }
         },
         .remove_repo => |id| {
             var params: [1]db.Value = undefined;
@@ -1818,12 +2189,351 @@ fn messagesListed(model: *Model, res: native_sdk.EffectDbResult) void {
                 if (model.message_count >= chat.max_messages) break;
                 const m = chat.Message.fromRow(cols) orelse continue;
                 model.messages[model.message_count] = chat.MessageEntry.fromMessage(m);
+                model.messages[model.message_count].index = @intCast(model.message_count);
                 model.message_count += 1;
                 if (m.seq + 1 > model.next_seq) model.next_seq = m.seq + 1;
             }
         },
         .done, .exec => {},
     }
+}
+
+// ------------------------------------------------- materials / snippets (Task 12)
+
+/// Load the snippets list into the model, honoring the current sort + language
+/// filter. Fired on boot (after the DB is ready) and after every change.
+fn loadSnippets(model: *Model, fx: *Effects) void {
+    const has_filter = model.lang_filter_len > 0;
+    const search = std.mem.trim(u8, model.snippet_search.text(), " \t\r\n");
+    const has_search = search.len > 0;
+
+    // LIKE pattern lives on this frame (dbQuery copies params at call time).
+    var like_buf: [snip_search_capacity + 4]u8 = undefined;
+    const pattern = snippets.likePattern(&like_buf, search);
+
+    if (has_search) {
+        const sql = switch (model.snippet_sort) {
+            .recent => if (has_filter) snippets.search_recent_by_lang_sql else snippets.search_recent_sql,
+            .alphabetical => if (has_filter) snippets.search_alpha_by_lang_sql else snippets.search_alpha_sql,
+        };
+        if (has_filter) {
+            var params: [2]db.Value = .{ db.val.text(pattern), db.val.text(model.langFilter()) };
+            fx.dbQuery(.{ .key = key_snip_list, .sql = sql, .params = &params, .on_result = Effects.dbMsg(.snippets_listed) });
+        } else {
+            var params: [1]db.Value = .{db.val.text(pattern)};
+            fx.dbQuery(.{ .key = key_snip_list, .sql = sql, .params = &params, .on_result = Effects.dbMsg(.snippets_listed) });
+        }
+        return;
+    }
+
+    const sql = switch (model.snippet_sort) {
+        .recent => if (has_filter) snippets.list_recent_by_lang_sql else snippets.list_recent_sql,
+        .alphabetical => if (has_filter) snippets.list_alpha_by_lang_sql else snippets.list_alpha_sql,
+    };
+    if (has_filter) {
+        var params: [1]db.Value = undefined;
+        fx.dbQuery(.{
+            .key = key_snip_list,
+            .sql = sql,
+            .params = snippets.langFilterParams(&params, model.langFilter()),
+            .on_result = Effects.dbMsg(.snippets_listed),
+        });
+    } else {
+        fx.dbQuery(.{
+            .key = key_snip_list,
+            .sql = sql,
+            .on_result = Effects.dbMsg(.snippets_listed),
+        });
+    }
+}
+
+/// Load the distinct languages (for the filter menu + set-language typeahead).
+fn loadLanguages(model: *Model, fx: *Effects) void {
+    _ = model;
+    fx.dbQuery(.{
+        .key = key_snip_langs,
+        .sql = snippets.distinct_langs_sql,
+        .on_result = Effects.dbMsg(.languages_listed),
+    });
+}
+
+/// Copy a `snippets_listed` page into the model's owned list, preserving the
+/// current selection when the selected id is still present (else selecting the
+/// first row so the detail panel always shows something after a reload).
+fn snippetsListed(model: *Model, res: native_sdk.EffectDbResult) void {
+    switch (res.kind) {
+        .page => {
+            var reader = db.PageReader.init(res.bytes) catch return;
+            model.snippet_count = 0;
+            var row: [9]db.ColumnValue = undefined;
+            while (reader.next(&row) catch null) |cols| {
+                if (model.snippet_count >= snippets.max_snippets) break;
+                const s = snippets.Snippet.fromRow(cols) orelse continue;
+                model.snippet_list[model.snippet_count] = snippets.SnippetEntry.fromSnippet(s);
+                model.snippet_count += 1;
+            }
+        },
+        .done => {
+            // Keep the selection valid: if the selected id vanished (deleted or
+            // filtered out), select the first visible snippet (or none). We
+            // don't fetch the detail here — the caller (`select_snippet` or a
+            // write's follow-up) drives detail loads; this only keeps the id sane.
+            if (model.selectedCard() == null) {
+                model.selected_snippet_id = if (model.snippet_count > 0) model.snippet_list[0].id else 0;
+            }
+        },
+        .exec => {},
+    }
+}
+
+/// Load the full body of one snippet into `selected_detail` (the detail panel).
+fn loadSnippetDetail(model: *Model, id: i64, fx: *Effects) void {
+    if (id == 0) {
+        model.selected_detail = .{};
+        return;
+    }
+    var params: [1]db.Value = undefined;
+    fx.dbQuery(.{
+        .key = key_snip_detail,
+        .sql = snippets.get_sql,
+        .params = snippets.getParams(&params, id),
+        .on_result = Effects.dbMsg(.snippet_detail_loaded),
+    });
+}
+
+/// Copy the selected snippet's full row into `selected_detail`.
+fn snippetDetailLoaded(model: *Model, res: native_sdk.EffectDbResult) void {
+    switch (res.kind) {
+        .page => {
+            var reader = db.PageReader.init(res.bytes) catch return;
+            var row: [9]db.ColumnValue = undefined;
+            if ((reader.next(&row) catch null)) |cols| {
+                if (snippets.Snippet.fromRow(cols)) |s| {
+                    model.selected_detail = snippets.SnippetDetail.fromSnippet(s);
+                }
+            }
+        },
+        .done, .exec => {},
+    }
+}
+
+/// Copy a `languages_listed` page into the model's owned language list.
+fn languagesListed(model: *Model, res: native_sdk.EffectDbResult) void {
+    switch (res.kind) {
+        .page => {
+            var reader = db.PageReader.init(res.bytes) catch return;
+            model.language_count = 0;
+            var row: [1]db.ColumnValue = undefined;
+            while (reader.next(&row) catch null) |cols| {
+                if (model.language_count >= snippets.max_languages) break;
+                const name = cols[0].asText() orelse continue;
+                var entry = snippets.LanguageEntry.set(name);
+                entry.index = model.language_count;
+                entry.filterIndex = model.language_count + 1;
+                model.languages[model.language_count] = entry;
+                model.language_count += 1;
+            }
+        },
+        .done, .exec => {},
+    }
+}
+
+/// Open the editor sheet, blank for a new snippet (`id == 0`) or pre-filled
+/// from the snippet being edited.
+fn openEditor(model: *Model, id: i64) void {
+    model.editor_open = true;
+    model.editing_id = id;
+    model.snippet_status_len = 0;
+    if (id == 0) {
+        model.edit_title.clear();
+        model.edit_content.clear();
+        model.edit_language.clear();
+        model.edit_annotation.clear();
+        model.edit_text_expander.clear();
+    } else if (model.detail()) |s| {
+        model.edit_title.set(s.title());
+        model.edit_content.set(s.content());
+        model.edit_language.set(s.language());
+        model.edit_annotation.set(s.annotation());
+        model.edit_text_expander.set(s.textExpander());
+    }
+}
+
+/// Commit the editor: INSERT a new snippet or UPDATE the one being edited.
+/// A title is required (fall back to a first-line default when blank).
+fn saveSnippet(model: *Model, fx: *Effects) void {
+    if (model.snippet_writing) return;
+    const content = model.edit_content.text();
+    const raw_title = std.mem.trim(u8, model.edit_title.text(), " \t\r\n");
+    const title = if (raw_title.len > 0) raw_title else snippets.defaultTitle(content);
+    const language = std.mem.trim(u8, model.edit_language.text(), " \t\r\n");
+    const now = fx.wallMs();
+
+    model.snippet_writing = true;
+    model.editor_open = false;
+    if (model.editing_id == 0) {
+        var params: [8]db.Value = undefined;
+        fx.dbExec(.{
+            .key = key_snip_insert,
+            .statements = &.{snippets.insertStatement(
+                &params,
+                title,
+                content,
+                language,
+                model.edit_annotation.text(),
+                model.edit_text_expander.text(),
+                0, // no origin — created directly
+                0,
+                now,
+            )},
+            .on_result = Effects.dbMsg(.snippet_inserted),
+        });
+    } else {
+        var params: [7]db.Value = undefined;
+        fx.dbExec(.{
+            .key = key_snip_update,
+            .statements = &.{snippets.updateStatement(
+                &params,
+                model.editing_id,
+                title,
+                content,
+                language,
+                model.edit_annotation.text(),
+                model.edit_text_expander.text(),
+                now,
+            )},
+            .on_result = Effects.dbMsg(.snippet_write_done),
+        });
+        // Keep this snippet selected after the reload.
+        model.selected_snippet_id = model.editing_id;
+    }
+    model.editing_id = 0;
+}
+
+/// A brand-new snippet's id came back — select it, then reload the list +
+/// languages so the sidebar + detail reflect it.
+fn snippetRowidDone(model: *Model, res: native_sdk.EffectDbResult, fx: *Effects) void {
+    switch (res.kind) {
+        .page => {
+            var reader = db.PageReader.init(res.bytes) catch return;
+            var row: [1]db.ColumnValue = undefined;
+            if ((reader.next(&row) catch null)) |cols| {
+                if (cols.len > 0) {
+                    if (cols[0].asInt()) |id| model.selected_snippet_id = id;
+                }
+            }
+        },
+        .done => {
+            model.snippet_writing = false;
+            loadSnippets(model, fx);
+            loadLanguages(model, fx);
+            // Load the just-created snippet's full body into the detail panel.
+            if (model.selected_snippet_id != 0) loadSnippetDetail(model, model.selected_snippet_id, fx);
+        },
+        .exec => {},
+    }
+}
+
+/// Delete the selected snippet, then reload.
+fn deleteSnippet(model: *Model, fx: *Effects) void {
+    if (model.snippet_writing) return;
+    if (model.selected_snippet_id == 0) return;
+    model.snippet_writing = true;
+    // Drop the selection so the reload picks a new one.
+    const id = model.selected_snippet_id;
+    model.selected_snippet_id = 0;
+    var params: [1]db.Value = undefined;
+    fx.dbExec(.{
+        .key = key_snip_delete,
+        .statements = &.{snippets.deleteStatement(&params, id)},
+        .on_result = Effects.dbMsg(.snippet_write_done),
+    });
+}
+
+/// Copy the selected snippet's content to the system clipboard.
+fn copySnippet(model: *Model, fx: *Effects) void {
+    const s = model.detail() orelse return;
+    fx.writeClipboard(.{
+        .key = key_snip_clip,
+        .text = s.content(),
+        .on_result = Effects.clipboardMsg(.snippet_clip_done),
+    });
+}
+
+/// Commit the set-language modal: UPDATE just the snippet's language.
+fn saveLangModal(model: *Model, fx: *Effects) void {
+    if (model.lang_modal_id == 0) {
+        model.lang_modal_open = false;
+        return;
+    }
+    if (model.snippet_writing) return;
+    const language = std.mem.trim(u8, model.lang_modal_input.text(), " \t\r\n");
+    model.snippet_writing = true;
+    model.lang_modal_open = false;
+    model.selected_snippet_id = model.lang_modal_id;
+    var params: [3]db.Value = undefined;
+    fx.dbExec(.{
+        .key = key_snip_setlang,
+        .statements = &.{snippets.setLanguageStatement(&params, model.lang_modal_id, language, fx.wallMs())},
+        .on_result = Effects.dbMsg(.snippet_write_done),
+    });
+    model.lang_modal_id = 0;
+}
+
+/// "Save to Snippets" from a chat message: create a snippet from a message's
+/// content, tagged with the current chat + message as its origin. `seq_idx`
+/// is the index into the loaded `messages` (the seq shown in the transcript).
+fn saveToSnippets(model: *Model, seq_idx: i64, fx: *Effects) void {
+    if (model.snippet_writing) return;
+    const idx: usize = if (seq_idx < 0) return else @intCast(seq_idx);
+    if (idx >= model.message_count) return;
+    const msg = &model.messages[idx];
+    const content = msg.content();
+    if (content.len == 0) return;
+
+    model.snippet_writing = true;
+    var params: [8]db.Value = undefined;
+    fx.dbExec(.{
+        .key = key_snip_insert,
+        .statements = &.{snippets.insertStatement(
+            &params,
+            snippets.defaultTitle(content),
+            content,
+            "", // language unset — the user tags it later via the modal
+            "", // annotation
+            "", // text_expander
+            model.current_chat_id, // origin chat (0 -> NULL if none)
+            msg.id, // origin message (0 -> NULL if not yet persisted)
+            fx.wallMs(),
+        )},
+        .on_result = Effects.dbMsg(.snippet_inserted),
+    });
+    model.setSnippetStatus("Saved to Materials.");
+}
+
+/// "Start Copilot Chat" from the selected snippet: begin a fresh chat whose
+/// first user message references the snippet, then stream a reply. Reuses the
+/// Task 10 chat turn machinery (send as if the user typed it).
+fn startCopilotChat(model: *Model, fx: *Effects) void {
+    const s = model.detail() orelse return;
+    if (!model.llama_ready) {
+        model.setSnippetStatus("The model runtime isn't ready yet.");
+        return;
+    }
+    if (model.sending) return;
+
+    // Seed the chat input with a prompt about this snippet, then send it
+    // through the normal chat path (which persists + streams). The materials
+    // screen stays put; the chat view shows the conversation.
+    var buf: [snippets.max_content_bytes + 256]u8 = undefined;
+    const seeded = std.fmt.bufPrint(
+        &buf,
+        "Here is a code snippet titled \"{s}\". Explain what it does and suggest improvements:\n\n{s}",
+        .{ s.title(), s.content() },
+    ) catch s.content();
+    model.chat_input.set(seeded);
+    model.setSnippetStatus("Started a chat about this material.");
+    sendChat(model, fx);
 }
 
 /// Interpret a launch-at-login host result (from either the status query or

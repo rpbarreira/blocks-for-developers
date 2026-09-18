@@ -20,6 +20,8 @@ comptime {
     _ = @import("models.zig");
     // Chat data layer + local-LLM protocol shaping (Task 10).
     _ = @import("chat.zig");
+    // Snippets ("materials") data layer (Task 12).
+    _ = @import("snippets.zig");
     // MCP server core (Task 8): pure protocol + tool builders, plus the
     // real-DB integration tests for each tool's SQL + JSON shaping.
     _ = @import("mcp/protocol.zig");
@@ -732,4 +734,192 @@ test "update: a summary finalizes and stays gated until the write commits" {
     try std.testing.expect(!m.sending);
     try std.testing.expect(m.pending_summary_kind == null);
     try std.testing.expect(m.canSend());
+}
+
+// ---- Materials / snippets (Task 12) ----
+
+const snippets = @import("snippets.zig");
+
+test "update: select_snippet sets the selection id" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .select_snippet = 42 }, &fx);
+    try std.testing.expectEqual(@as(i64, 42), m.selected_snippet_id);
+}
+
+test "update: toggle_sort_menu / set_sort switches the sort and closes the menu" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .toggle_sort_menu, &fx);
+    try std.testing.expect(m.sortMenuOpen());
+    main.update(&m, .sort_alphabetical, &fx);
+    try std.testing.expect(!m.sortMenuOpen());
+    try std.testing.expectEqualStrings("Alphabetical", m.sortLabel());
+    main.update(&m, .sort_recent, &fx);
+    try std.testing.expectEqualStrings("Recent", m.sortLabel());
+}
+
+test "update: set_lang_filter selects a language and All clears it" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    // Seed two known languages (as a distinct-languages load would).
+    m.languages[0] = snippets.LanguageEntry.set("python");
+    m.languages[1] = snippets.LanguageEntry.set("zig");
+    m.language_count = 2;
+
+    // filterIndex 1 => languages[0] = python.
+    main.update(&m, .{ .set_lang_filter = 1 }, &fx);
+    try std.testing.expectEqualStrings("python", m.langFilterLabel());
+    // clear_lang_filter => All.
+    main.update(&m, .clear_lang_filter, &fx);
+    try std.testing.expectEqualStrings("All", m.langFilterLabel());
+}
+
+test "update: open_new_snippet opens a blank editor" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .open_new_snippet, &fx);
+    try std.testing.expect(m.editorOpen());
+    try std.testing.expectEqualStrings("New material", m.editorTitleLabel());
+    try std.testing.expect(m.edit_title.isEmpty());
+}
+
+test "update: save_snippet (new) inserts and gates the write" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .open_new_snippet, &fx);
+    m.edit_title.set("My Snippet");
+    m.edit_content.set("print(1)");
+    m.edit_language.set("python");
+    main.update(&m, .save_snippet, &fx);
+    // The editor closes and a write is in flight.
+    try std.testing.expect(!m.editorOpen());
+    try std.testing.expect(m.snippet_writing);
+
+    // The insert result triggers a MAX(id) recovery; feeding that id + done
+    // clears the write gate.
+    main.update(&m, .{ .snippet_inserted = .{ .key = 192, .kind = .exec, .outcome = .ok } }, &fx);
+    try std.testing.expect(m.snippet_writing); // still gated until rowid .done
+}
+
+test "update: selecting a snippet with no detail loaded leaves the detail empty" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    // Selecting sets the id and fires a detail query; until the result lands,
+    // the detail accessors read empty (they gate on selected_detail.id).
+    main.update(&m, .{ .select_snippet = 5 }, &fx);
+    try std.testing.expectEqual(@as(i64, 5), m.selected_snippet_id);
+    try std.testing.expectEqualStrings("", m.selectedContent());
+}
+
+test "update: save_to_snippets inserts from a chat message and gates the write" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    // Seed a loaded conversation (indices set by pushMessage).
+    m.current_chat_id = 2;
+    m.pushMessage(.user, "a question");
+    m.pushMessage(.assistant, "an answer with code");
+
+    // Save the assistant message (index 1) to snippets.
+    main.update(&m, .{ .save_to_snippets = 1 }, &fx);
+    try std.testing.expect(m.snippet_writing);
+    try std.testing.expectEqualStrings("Saved to Materials.", m.snippetStatus());
+}
+
+test "update: save_to_snippets ignores an out-of-range index" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    m.pushMessage(.user, "only one");
+
+    main.update(&m, .{ .save_to_snippets = 5 }, &fx); // no such message
+    try std.testing.expect(!m.snippet_writing);
+}
+
+test "update: start_copilot_chat is a no-op when the runtime isn't ready" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    m.llama_ready = false;
+    m.selected_snippet_id = 1;
+    m.selected_detail = snippets.SnippetDetail.fromSnippet(.{
+        .id = 1, .title = "T", .content = "code", .language = "zig", .annotation = "",
+        .text_expander = "", .origin_chat_id = 0, .origin_message_id = 0, .updated_at = 1,
+    });
+
+    main.update(&m, .start_copilot_chat, &fx);
+    try std.testing.expect(!m.sending);
+}
+
+test "update: start_copilot_chat seeds and sends a chat when ready" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    m.llama_ready = true;
+    m.mcp_ready = false; // straight to completion
+    m.selected_snippet_id = 1;
+    m.selected_detail = snippets.SnippetDetail.fromSnippet(.{
+        .id = 1, .title = "Deploy", .content = "def deploy(): pass", .language = "python",
+        .annotation = "", .text_expander = "", .origin_chat_id = 0, .origin_message_id = 0, .updated_at = 1,
+    });
+
+    main.update(&m, .start_copilot_chat, &fx);
+    // A chat turn began: the seeded prompt is the shown user message + streaming.
+    try std.testing.expect(m.sending);
+    try std.testing.expectEqual(@as(usize, 1), m.message_count);
+    try std.testing.expect(std.mem.indexOf(u8, m.messagesSlice()[0].content(), "Deploy") != null);
+}
+
+test "update: snippet_clip_done reports a copy status" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .snippet_clip_done = .{ .key = 197, .op = .write, .outcome = .ok } }, &fx);
+    try std.testing.expectEqualStrings("Copied to clipboard.", m.snippetStatus());
+}
+
+test "update: lang modal opens from a loaded detail, typeahead pick fills it" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    // Seed a selected detail + a suggestion.
+    m.selected_snippet_id = 3;
+    m.selected_detail = snippets.SnippetDetail.fromSnippet(.{
+        .id = 3, .title = "T", .content = "c", .language = "", .annotation = "",
+        .text_expander = "", .origin_chat_id = 0, .origin_message_id = 0, .updated_at = 1,
+    });
+    m.languages[0] = snippets.LanguageEntry.set("rust");
+    m.language_count = 1;
+
+    main.update(&m, .open_lang_modal, &fx);
+    try std.testing.expect(m.langModalOpen());
+    main.update(&m, .{ .pick_lang_suggestion = 0 }, &fx);
+    try std.testing.expectEqualStrings("rust", m.lang_modal_input.text());
+    main.update(&m, .cancel_lang_modal, &fx);
+    try std.testing.expect(!m.langModalOpen());
 }

@@ -1,14 +1,12 @@
 # Blocks for Developers — Progress & Resumption Notes
 
-Last updated: end of Task 11 (single-click summaries), VERIFIED END-TO-END live
-(two bugs found + fixed during verification — MCP health-check retry + a too-small
-get_activity request buffer; see the Task 11 verification section).
-Committed so far: Task 4 (`01969e5`), Task 5 (`56ae2a2`), Task 6 (`c2afa1b`),
-Task 7 (`e27eb0a`), Task 8 (`887480e`), Task 9 (`7a6961d` + live-verify follow-up
-`2ec4210`); Task 10 + Task 11 implemented (see their sections). Read this first
-when resuming. To continue: open the IDE on this repo folder
-(`/Users/rpbarreira/Projects/GitHub/rpbarreira/blocks-for-developers`) and say
-"read docs/PROGRESS.md and continue from Task 12."
+Last updated: end of Task 12 (Materials / snippets screen + chat cross-linking),
+VERIFIED END-TO-END live. Schema is now user_version 2 (migration 0002 added
+`snippets.text_expander`). To continue: open the IDE on this repo folder and say
+"read docs/PROGRESS.md and continue from Task 13."
+Committed so far: Tasks 4-9 (`01969e5`/`56ae2a2`/`c2afa1b`/`e27eb0a`/`887480e`/
+`7a6961d`+`2ec4210`), Task 10 (`db4ce24`), Task 11 (`0fd1db3`). Task 12 implemented
+(see its section) — commit pending. Read this first when resuming.
 
 **Runtime note for live runs:** the llama.cpp runtime is `llama-server`
 (installed via `brew install llama.cpp`, at `/opt/homebrew/bin/llama-server`).
@@ -144,8 +142,16 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
   Update each pull recent activity from the MCP `get_activity` tool and ask the
   local model to write a canned summary, saved as a chat with its own
   `chats.kind`. 159 tests; `native check` clean. See the Task 11 section.
-- [ ] Task 12 — Materials (snippets) screen + chat cross-linking. ← NEXT
-- [ ] Task 13 — Welcome flow + settings modal completion + polish.
+- [x] **Task 12 — Materials (snippets) screen + chat cross-linking.** DONE.
+  Schema migration `0002` adds `snippets.text_expander` (user_version now 2). New
+  PURE `src/snippets.zig` (list card `SnippetEntry` + full `SnippetDetail` + SQL +
+  statement builders + LIKE search). Materials screen wired into `main.zig`
+  (keys 190-198, a `Screen` nav) + `app.native` (sidebar list with sort +
+  language-filter menus, search, selected-snippet panel with code + All Context
+  = Annotations + Text Expander, editor sheet, set-language typeahead modal),
+  plus Save-to-Snippets from chat + Start-Copilot-Chat + copy-to-clipboard. 184
+  tests; `native check` clean; VERIFIED END-TO-END live. See the Task 12 section.
+- [ ] Task 13 — Welcome flow + settings modal completion + polish. ← NEXT
 
 ---
 
@@ -301,13 +307,28 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
   `insert_sql/delete_sql/list_sql/exists_sql`; `insertStatement(*[3]Value, path, name, now_ms)`,
   `deleteStatement(*[1]Value, id)`; path helpers `normalizePath/defaultName/gitMarkerPath/checkPathShape`.
   `max_repos=128, max_path_bytes=1024, max_name_bytes=256`.
+- **snippets.zig** — Materials ("snippets") data layer, PURE (Task 12).
+  `Snippet.fromRow(cols[9])` -> `{id,title,content,language,annotation,text_expander,
+  origin_chat_id,origin_message_id,updated_at}` (nullable origins decode to 0). TWO
+  model-owned copies: `SnippetEntry` = a LIGHTWEIGHT sidebar card (id/title/language/
+  `cardBlurb`[160]/updated_at/origins — NO body, so the `[max_snippets=64]` list stays
+  small) and `SnippetDetail` = the FULL body of the ONE selected snippet
+  (title/content/language/annotation/text_expander); the Model holds one detail loaded
+  on demand. `LanguageEntry{name,index,filterIndex}` for the filter menu + typeahead.
+  SQL: `list_recent_sql`/`list_alpha_sql` (+ `_by_lang` `?1=lang`), `search_*` LIKE
+  variants (`?1=%term%` [+ `?2=lang`]) + `likePattern`, `distinct_langs_sql`, `get_sql`,
+  `max_id_sql`, `insert_sql`, `update_sql`, `set_language_sql`, `delete_sql`. Caller-owned
+  param builders `insertStatement(*[8]...)` (0 origin -> `null_value`),
+  `updateStatement(*[7])`, `setLanguageStatement(*[3])`, `deleteStatement(*[1])`,
+  `getParams`/`langFilterParams`. `defaultTitle(content)` (first line / "Untitled snippet").
+  Bounds: content 8K, annotation/text_expander 1K, title 200, language 64.
 - **tests.zig** — test root: `comptime { _ = @import("config.zig"); ...db, repos... }`
   plus markup-builds and update-arm tests. Run via `native test --yes`.
 - **schema/0001_initial_schema.sql** + **schema/migrations.lock.json** — see below.
 - **app.native** — current view is the Watched Repositories screen (moves into the
   Settings modal in Task 13).
 
-## Database schema (schema/0001_initial_schema.sql, user_version 1)
+## Database schema (schema/0001_initial_schema.sql + 0002_snippets_text_expander.sql, user_version 2)
 
 All timestamps are Unix-ms INTEGER. Tables (STRICT where possible):
 - `repos(id, path UNIQUE, name, active, last_indexed_oid, added_at, last_indexed_at)`
@@ -319,8 +340,9 @@ All timestamps are Unix-ms INTEGER. Tables (STRICT where possible):
 - `file_snapshots(id, repo_id FK, rel_path, content, diff, content_hash, byte_len, captured_at)`
 - `chats(id, title, preview, kind['chat'|'day_recap'|'top_of_mind'|'standup'], created_at, updated_at)`
 - `messages(id, chat_id FK, role['user'|'assistant'|'system'], content, seq, created_at)`
-- `snippets(id, title, content, language, annotation, origin_chat_id FK SET NULL,
-  origin_message_id FK SET NULL, created_at, updated_at)`
+- `snippets(id, title, content, language, annotation, text_expander, origin_chat_id
+  FK SET NULL, origin_message_id FK SET NULL, created_at, updated_at)` — `text_expander`
+  added by migration `0002` (Task 12).
 - `embeddings(id, source_kind['event'|'file_snapshot'|'message'|'snippet'],
   source_id, model, dim, vector BLOB[raw LE f32], created_at)` + UNIQUE(source_kind, source_id, model)
 - `memory_fts` = `CREATE VIRTUAL TABLE ... USING fts5(ref_kind UNINDEXED, ref_id UNINDEXED, body)`
@@ -332,6 +354,11 @@ shipped migration hashes (committed). **Migration SQL constraints (authorizer):*
 no BEGIN/COMMIT/SAVEPOINT, no runner-owned PRAGMAs (user_version, foreign_keys,
 journal_mode, synchronous, ...); CREATE VIRTUAL TABLE (FTS5) + triggers ARE
 allowed; multi-statement files OK. FK cascades work (the writer sets foreign_keys=ON).
+Task 12 added the FIRST follow-on migration (`0002`): `ALTER TABLE snippets ADD
+COLUMN text_expander TEXT NOT NULL DEFAULT ''` (a constant default keeps the ALTER
+legal on the STRICT table). Each `NNNN_*.sql` must ALSO be added to the `migrations`
+array in `db.zig` (embedded for tests); `native test` regenerates `migrations.lock.json`
+(now 2 hashes + a new schema_hash).
 
 ---
 
@@ -361,7 +388,10 @@ allowed; multi-statement files OK. FK cascades work (the writer sets foreign_key
      curl, 173 model rename mv, 174 llama-server spawn, 175 llama /health fetch),
      180-185 (Task 10: 180 MCP search_memory POST, 181 llama chat `.stream` POST,
      182 chat INSERT, 183 chat MAX(id) query, 184 messages write batch, 185 messages
-     reload query), 186 (Task 11: MCP get_activity POST for a summary's context).
+     reload query), 186 (Task 11: MCP get_activity POST for a summary's context),
+     190-198 (Task 12 materials: 190 snippets list, 191 distinct languages, 192
+     snippet INSERT, 193 snippet MAX(id), 194 update, 195 set-language, 196 delete,
+     197 writeClipboard, 198 selected-snippet detail get).
      TIMER keys (own namespace): 1 = the repeating working-tree scan
      tick, 2 = the one-shot MCP health-check delay, 3 = the one-shot llama health delay.
 2. **ZIG LIFETIME TRAP (will recur!):** a function returning a struct with
@@ -1167,3 +1197,121 @@ After both fixes a clean run passed all four criteria above; 161 tests green;
   is a rolling 24h, not calendar-aware; a real "since yesterday 9am" bound is a
   follow-up once we track summary runs.
 - **Model quality.** Same 8 KiB reply cap and small-model caveats as Task 10 apply.
+
+## Task 12 — Materials (snippets) screen + chat cross-linking (DONE — what was built)
+
+The "Materials" screen from the mockup is live: the user keeps saved code snippets
+("materials"), each with a language tag, a free-form annotation, and a "text
+expander" note, and can search/sort/filter them, copy them to the clipboard, save
+one from a chat message, and start a fresh chat about one.
+
+**Schema change (first follow-on migration).** The mockup's "All Context" panel has
+TWO fields — Annotations (already in the schema) and **Text Expander** (new). Migration
+`0002_snippets_text_expander.sql` adds `text_expander TEXT NOT NULL DEFAULT ''` to
+`snippets`; the runner auto-applies it on launch (a live `app.db` goes user_version
+1 -> 2 automatically). Registered in `db.zig`'s `migrations` array; `migrations.lock.json`
+regenerated to 2 hashes.
+
+**KEY DESIGN DECISION — split the model copy into a list CARD + one DETAIL (avoids a
+multi-MB Model).** The Model is returned by value from `initialModel()` (tests call it
+directly), so a `[max_snippets]` array each holding a full snippet body blows the test
+thread's stack (discovered live: SIGABRT in `initialModel`). So `snippets.zig` has TWO
+types: `SnippetEntry` — a lightweight sidebar card (id/title/language/short blurb/
+origins, no body) held in the `[64]` list — and `SnippetDetail` — the FULL body of the
+ONE selected snippet, loaded on demand via `get_sql` (key 198) into a single
+`selected_detail`. The detail accessors gate on `selected_detail.id == selected_snippet_id`
+so a stale detail never shows.
+
+**Data layer (`snippets.zig`, PURE).** See the source-layout entry above. Mirrors
+`repos.zig`: `*_sql` consts, caller-owned `*[N]db.Value` param builders (lifetime trap),
+`fromRow` decoders, and a real in-memory-DB integration test (insert/list/filter/update/
+delete round-trip + an FK `ON DELETE SET NULL` test proving a deleted origin chat nulls
+`snippets.origin_chat_id` while the snippet survives).
+
+**Wiring (`main.zig`).** Effect keys 190-198 (see the keys note). A `Screen` enum
+(`chat` | `materials`) + `show_chat`/`show_materials` gives a minimal top-level nav so
+the two screens don't stack. Materials state: the `[64]` card list + `[64]` languages,
+`selected_snippet_id` + `selected_detail`, `snippet_sort` (recent/alphabetical), a
+language filter (`""` = All), a `snippet_search` field, transient sort/lang menu-open
+flags, an editor sheet (title/content/language/annotation/text_expander `TextBuffer`s
++ `editing_id`), and a set-language modal (`lang_modal_input` + `lang_modal_id`). Boot
+loads snippets + languages after `repos_listed` `.done`. Writes go INSERT (-> `MAX(id)`
+recovery, same trick as chats) / UPDATE / DELETE / set-language, each followed by a
+list + languages + detail reload; a `snippet_writing` interlock guards the id recovery.
+Search is server-side (LIKE) and reloads on each keystroke.
+
+**Language controls (per the user's clarification).** The sidebar's `{}`-style control
+is a LANGUAGE FILTER menu: "All" first, then the distinct languages the user actually
+has (`distinct_langs_sql`). The main-panel `{}` control is a SET-LANGUAGE MODAL — a
+free-text field (there are too many languages to list), with typeahead SUGGESTIONS
+drawn from the same distinct-languages set. The right-rail "duplicate"-looking icon is
+a COPY action: `fx.writeClipboard` puts the whole snippet on the system pasteboard.
+
+**Cross-linking.** Each chat message has a "Save to Snippets" affordance
+(`save_to_snippets:{index}`) that inserts a snippet from that message with
+`origin_chat_id`/`origin_message_id` set (the FK back-link). "Start Copilot Chat" on a
+selected snippet seeds the chat input with a prompt about it and sends it through the
+Task 10 chat path (persists + streams).
+
+**View (`app.native`).** Restructured into the `Screen` nav + two `<if>`-gated screens.
+Functional-demo layout; the high-fidelity mockup (floating +, right-rail icon buttons,
+avatars, "saved N ago") is Task 13. Menus/modals are `<if>`-gated panels (not native
+`<dialog>`/`<dropdown-menu>`) so their open state is plain, testable Model state.
+
+Tests (184 total, was 161 at end of Task 11): pure `snippets.zig` (row decode incl null
+origins, card vs detail copies, all statement builders, `defaultTitle`, `likePattern`) +
+two real-DB integration tests + `db.zig` migration-0002 column test + `main.zig`
+update-arm tests (select, sort toggle, language filter/All, new-editor, save gating,
+clipboard status, lang-modal open + typeahead pick, save-to-snippets insert + out-of-
+range guard, start-copilot-chat gated/seeded). `native check` clean (0 warnings).
+
+### SDK markup learnings (Task 12)
+- **`on-*` payloads must be a `{binding}`, never a literal.** `set_sort:0` /
+  `switch_screen:chat` are REJECTED at check time. Use distinct void Msgs for fixed
+  choices (`show_chat`/`show_materials`, `sort_recent`/`sort_alphabetical`,
+  `clear_lang_filter`); binding payloads from iterated items are fine
+  (`select_snippet:{s.id}`, `set_lang_filter:{l.filterIndex}`, `save_to_snippets:{msg.index}`).
+  Iterated items therefore need explicit index fields (`MessageEntry.index`,
+  `LanguageEntry.index`/`filterIndex`).
+- **`<code>` takes its content via `source="{binding}"` (NO text children); `language`
+  must be a LITERAL known name (a binding is rejected) so it's omitted here;
+  `line-numbers`/`editable`/`on-input` are supported** (the editable code editor renders
+  as a textbox).
+
+### VERIFIED END-TO-END via automation (+ one bug found and fixed)
+Driven live (`native dev --yes -Dautomation=true` with `BLOCKS_LLAMA_SERVER`, real
+Qwen2.5-1.5B). Confirmed: migration auto-applied user_version 1 -> 2 on launch; the
+Materials tab renders (empty state); **+ New -> Save** created a snippet PERSISTED WITH
+`text_expander` (verified in `app.db`); the detail panel showed the code body + All
+Context (Annotations + Text Expander); **Edit** pre-filled the form and updated (title
+changed, language preserved); **Delete** removed it and returned to the empty state;
+**Copy** wrote the REAL macOS clipboard (`pbpaste` confirmed the content); the
+**set-language modal** opened with a "python" typeahead suggestion and a free-typed
+"dockerfile" persisted; **Start Copilot Chat** seeded a snippet-referencing prompt and
+streamed a real grounded reply, persisted as a new chat.
+
+**Bug found + fixed live:** after creating a snippet, `snippetRowidDone` set the
+selection but never loaded its detail, so the panel stayed on "Select a material". Fixed
+by loading the detail in `snippetRowidDone`'s terminal `.done`.
+
+**Not click-verifiable via the automation harness (NOT a logic bug):** the
+"Save to Snippets" buttons live INSIDE the `<scroll>` transcript, and `native automate
+widget-click` synthesizes a pointer at the widget point that doesn't dispatch for
+scroll-clipped children (every non-scroll button clicked fine). The Save-to-Snippets +
+Start-Copilot-Chat LOGIC is proven by update-arm tests instead.
+
+### Deferred / follow-ups
+- **Save-to-Snippets manual check.** Automation can't click it (scroll-clip harness
+  limit); confirm by hand, or move the affordance out of the scroll in Task 13's
+  high-fidelity chat layout.
+- **High-fidelity Materials UI (Task 13).** The faithful mockup — floating "+", right-
+  rail icon buttons (edit/copy/delete), "saved N ago", avatars, real menu surfaces —
+  lands in Task 13. The current layout also overflows the window vertically (~108 px)
+  because the functional demo stacks sections; Task 13's screen split resolves it.
+- **Snippet embeddings.** `snippets` are not embedded into `embeddings`/`memory_fts`
+  yet (the `source_kind='snippet'` slot exists), so materials aren't in semantic search
+  / MCP `search_memory`. Wire a snippet embed pass when useful.
+- **LIKE escaping.** `likePattern` treats the term as plain text (no `%`/`_` escaping);
+  add an `ESCAPE` clause if literal wildcards in a search term ever matter.
+- **Saved-time + counts.** The sidebar shows a `N`/count badge but not per-snippet
+  "saved N ago"; the language filter badge shows the active filter. Cosmetic.

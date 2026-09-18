@@ -250,6 +250,9 @@ pub const MessageEntry = struct {
     id: i64 = 0,
     role: Role = .user,
     seq: i64 = 0,
+    /// Position in the loaded list — set by the caller after appending, so
+    /// markup can pass it as a payload (e.g. "Save to Snippets" by index).
+    index: i64 = 0,
     content_buf: [max_content_bytes]u8 = undefined,
     content_len: usize = 0,
 

@@ -1,115 +1,246 @@
-<!-- Task 10: the Chat experience is the primary view. It talks to the local
-     llama.cpp runtime (/v1/chat/completions, streamed) and grounds answers in
-     the user's git/file memory via the MCP `search_memory` tool (retrieval-
-     augmented). This is a FUNCTIONAL demo layout; the high-fidelity
-     chat_screen.png (sidebar, single-click summary cards, message bubbles,
-     Save-to-Snippets) is Task 13 polish, once Tasks 11/12 exist. The Task 3
-     Watched Repositories + Task 9 Local model sections remain below and move
-     into the Settings modal in Task 13. -->
+<!-- Blocks — top-level view. A minimal two-screen nav (Chat / Materials) so the
+     screens don't stack in one scroll. This is a FUNCTIONAL demo layout; the
+     high-fidelity chat_screen.png / materials mockup (sidebars, bubbles,
+     avatars, floating +, right-rail icon buttons) is Task 13 polish. The
+     Task 3 Watched Repositories + Task 9 Local model sections live under the
+     Chat screen for now and move into the Settings modal in Task 13. -->
 <column gap="12" padding="20" grow="1">
   <row cross="center" gap="8">
     <text size="heading" grow="1">Blocks</text>
+    <button size="sm" variant="secondary" on-press="show_chat">Chat</button>
+    <button size="sm" variant="secondary" on-press="show_materials">Materials</button>
     <text>{usernameText}</text>
   </row>
 
-  <!-- Task 11: single-click summary cards. Each pulls the developer's recent
-       activity from the MCP get_activity tool and asks the local model to
-       write a canned summary (Day Recap / What's Top of Mind / Standup Update),
-       saved as its own chat kind. Disabled while a turn is in flight or the
-       runtime isn't ready (same gate as Send). -->
-  <row gap="8" cross="center">
-    <for each="summaryCards" key="tag" as="c">
-      <button variant="secondary" size="sm" on-press="start_summary:{c.tag}" disabled="{summaryDisabled}">{c.label}</button>
-    </for>
-  </row>
+  <!-- ============================ CHAT SCREEN ============================ -->
+  <if test="{onChatScreen}">
+    <column gap="12" grow="1">
+      <!-- Task 11: single-click summary cards. Each pulls recent activity from
+           the MCP get_activity tool and asks the model for a canned summary. -->
+      <row gap="8" cross="center">
+        <for each="summaryCards" key="tag" as="c">
+          <button variant="secondary" size="sm" on-press="start_summary:{c.tag}" disabled="{summaryDisabled}">{c.label}</button>
+        </for>
+      </row>
 
-  <!-- Conversation transcript. -->
-  <scroll grow="1">
-    <column gap="10">
-      <if test="{chatEmpty}">
-        <status-bar>Ask Blocks about your recent work — commits, file changes, what you were doing.</status-bar>
-      </if>
-      <for each="messagesSlice" key="id" as="msg">
-        <column gap="2">
-          <status-bar>{msg.roleLabel}</status-bar>
-          <text>{msg.content}</text>
+      <!-- Conversation transcript. Each message offers Save to Snippets. -->
+      <scroll grow="1">
+        <column gap="10">
+          <if test="{chatEmpty}">
+            <status-bar>Ask Blocks about your recent work — commits, file changes, what you were doing.</status-bar>
+          </if>
+          <for each="messagesSlice" key="id" as="msg">
+            <column gap="2">
+              <row cross="center" gap="8">
+                <status-bar grow="1">{msg.roleLabel}</status-bar>
+                <button size="sm" variant="ghost" on-press="save_to_snippets:{msg.index}">Save to Snippets</button>
+              </row>
+              <text>{msg.content}</text>
+            </column>
+          </for>
+          <!-- The in-progress assistant reply, as tokens stream in. -->
+          <if test="{isStreaming}">
+            <column gap="2">
+              <status-bar>Blocks</status-bar>
+              <text>{streamingText}</text>
+            </column>
+          </if>
         </column>
-      </for>
-      <!-- The in-progress assistant reply, as tokens stream in. -->
-      <if test="{isStreaming}">
-        <column gap="2">
-          <status-bar>Blocks</status-bar>
-          <text>{streamingText}</text>
-        </column>
+      </scroll>
+
+      <status-bar>{chatStatusText}</status-bar>
+      <row gap="8" cross="center">
+        <text-field
+          placeholder="Ask about your recent work…"
+          on-input="chat_input_edit"
+          on-submit="send_chat"
+          grow="1" />
+        <button variant="primary" on-press="send_chat" disabled="{sendDisabled}">Send</button>
+      </row>
+
+      <!-- Watched repositories (Task 3) — moves into Settings in Task 13. -->
+      <text size="heading">Watched Repositories</text>
+      <text>Blocks indexes the git history and file changes of the repositories you watch.</text>
+      <row gap="8" cross="center">
+        <text-field
+          placeholder="/path/to/your/repo"
+          on-input="repo_input_edit"
+          on-submit="add_repo_clicked"
+          grow="1" />
+        <button variant="primary" on-press="add_repo_clicked" disabled="{isAddingRepo}">Add</button>
+      </row>
+      <if test="{repoError}">
+        <text>{repoError}</text>
       </if>
+      <column gap="4">
+        <for each="reposSlice" key="id" as="r">
+          <row gap="8" padding="8" cross="center">
+            <column grow="1" gap="2">
+              <text>{r.name}</text>
+              <status-bar>{r.path}</status-bar>
+            </column>
+            <button size="sm" variant="ghost" on-press="remove_repo:{r.id}">Remove</button>
+          </row>
+        </for>
+      </column>
+
+      <!-- Task 9: local model management. Moves into Settings in Task 13. -->
+      <column gap="6" padding="8">
+        <text size="heading">Local model</text>
+        <text>Blocks chats with a model that runs entirely on your machine.</text>
+        <column gap="4">
+          <for each="modelChoices" key="index" as="m">
+            <row gap="8" padding="6" cross="center">
+              <column grow="1" gap="2">
+                <text>{m.name}</text>
+                <status-bar>{m.blurb}</status-bar>
+              </column>
+              <if test="{m.selected}">
+                <text>Selected</text>
+              </if>
+              <button size="sm" variant="ghost" on-press="select_model:{m.index}">Choose</button>
+            </row>
+          </for>
+        </column>
+        <row gap="8" cross="center">
+          <status-bar grow="1">{modelStatusText}</status-bar>
+          <if test="{canDownload}">
+            <button variant="primary" size="sm" on-press="download_model">Download</button>
+          </if>
+        </row>
+      </column>
     </column>
-  </scroll>
-
-  <status-bar>{chatStatusText}</status-bar>
-  <row gap="8" cross="center">
-    <text-field
-      placeholder="Ask about your recent work…"
-      on-input="chat_input_edit"
-      on-submit="send_chat"
-      grow="1" />
-    <button variant="primary" on-press="send_chat" disabled="{sendDisabled}">Send</button>
-  </row>
-
-  <!-- Watched repositories (Task 3) — moves into Settings in Task 13. -->
-  <text size="heading">Watched Repositories</text>
-  <text>Blocks indexes the git history and file changes of the repositories you watch.</text>
-
-  <row gap="8" cross="center">
-    <text-field
-      placeholder="/path/to/your/repo"
-      on-input="repo_input_edit"
-      on-submit="add_repo_clicked"
-      grow="1" />
-    <button variant="primary" on-press="add_repo_clicked" disabled="{isAddingRepo}">Add</button>
-  </row>
-
-  <if test="{repoError}">
-    <text>{repoError}</text>
   </if>
 
-  <column gap="4">
-    <for each="reposSlice" key="id" as="r">
-      <row gap="8" padding="8" cross="center">
-        <column grow="1" gap="2">
-          <text>{r.name}</text>
-          <status-bar>{r.path}</status-bar>
-        </column>
-        <button size="sm" variant="ghost" on-press="remove_repo:{r.id}">Remove</button>
+  <!-- ========================= MATERIALS SCREEN ========================= -->
+  <if test="{onMaterialsScreen}">
+    <column gap="12" grow="1">
+      <!-- Find + new material. -->
+      <row gap="8" cross="center">
+        <text-field
+          placeholder="Find materials…"
+          on-input="snippet_search_edit"
+          grow="1" />
+        <button variant="primary" size="sm" on-press="open_new_snippet">+ New</button>
       </row>
-    </for>
-  </column>
 
-  <!-- Task 9: local model management. A compact picker over the curated
-       catalog + a download/runtime status line. Moves into Settings in Task 13. -->
-  <column gap="6" padding="8">
-    <text size="heading">Local model</text>
-    <text>Blocks chats with a model that runs entirely on your machine.</text>
-    <column gap="4">
-      <for each="modelChoices" key="index" as="m">
-        <row gap="8" padding="6" cross="center">
-          <column grow="1" gap="2">
-            <text>{m.name}</text>
-            <status-bar>{m.blurb}</status-bar>
-          </column>
-          <if test="{m.selected}">
-            <text>Selected</text>
+      <row gap="16" grow="1">
+        <!-- Sidebar: Saved Materials list with sort + language filter. -->
+        <column gap="8" grow="1">
+          <row cross="center" gap="8">
+            <text size="heading" grow="1">Saved Materials</text>
+            <badge>{snippetCount}</badge>
+            <button size="sm" variant="ghost" on-press="toggle_lang_menu">{langFilterLabel}</button>
+            <button size="sm" variant="ghost" on-press="toggle_sort_menu">{sortLabel}</button>
+          </row>
+
+          <!-- SORT BY menu. -->
+          <if test="{sortMenuOpen}">
+            <column gap="2" padding="6">
+              <status-bar>Sort by</status-bar>
+              <button size="sm" variant="ghost" on-press="sort_recent">Recent</button>
+              <button size="sm" variant="ghost" on-press="sort_alphabetical">Alphabetical</button>
+            </column>
           </if>
-          <button size="sm" variant="ghost" on-press="select_model:{m.index}">Choose</button>
-        </row>
-      </for>
+
+          <!-- Language filter menu: "All" first, then the languages in use. -->
+          <if test="{langMenuOpen}">
+            <column gap="2" padding="6">
+              <status-bar>Language</status-bar>
+              <button size="sm" variant="ghost" on-press="clear_lang_filter">All</button>
+              <for each="languageList" key="name" as="l">
+                <button size="sm" variant="ghost" on-press="set_lang_filter:{l.filterIndex}">{l.name}</button>
+              </for>
+            </column>
+          </if>
+
+          <if test="{hasSnippets}">
+            <column gap="4">
+              <for each="snippetList" key="id" as="s">
+                <column gap="2" padding="8" on-press="select_snippet:{s.id}">
+                  <text>{s.title}</text>
+                  <status-bar>{s.cardBlurb}</status-bar>
+                </column>
+              </for>
+            </column>
+          </if>
+          <if test="{noSnippets}">
+            <status-bar>No materials yet. Save a snippet from a chat, or add one with + New.</status-bar>
+          </if>
+        </column>
+
+        <!-- Main panel: the selected material. -->
+        <column gap="8" grow="1">
+          <if test="{snippetSelected}">
+            <column gap="8" grow="1">
+              <row cross="center" gap="8">
+                <text size="heading" grow="1">{selectedTitle}</text>
+                <button size="sm" variant="ghost" on-press="open_lang_modal">{selectedLanguageLabel}</button>
+              </row>
+              <row gap="8" cross="center">
+                <button size="sm" variant="secondary" on-press="start_copilot_chat">Start Copilot Chat</button>
+                <button size="sm" variant="ghost" on-press="open_edit_snippet">Edit</button>
+                <button size="sm" variant="ghost" on-press="copy_snippet">Copy</button>
+                <button size="sm" variant="ghost" on-press="delete_snippet">Delete</button>
+              </row>
+
+              <code source="{selectedContent}" line-numbers="true" />
+
+              <!-- All Context: Annotations + Text Expander. -->
+              <text size="heading">All Context</text>
+              <column gap="2" padding="8">
+                <status-bar>Annotations</status-bar>
+                <text>{selectedAnnotation}</text>
+              </column>
+              <column gap="2" padding="8">
+                <status-bar>Text Expander</status-bar>
+                <text>{selectedTextExpander}</text>
+              </column>
+            </column>
+          </if>
+          <if test="{noSnippetSelected}">
+            <status-bar>Select a material to view it, or create one with + New.</status-bar>
+          </if>
+        </column>
+      </row>
+
+      <status-bar>{snippetStatus}</status-bar>
     </column>
-    <row gap="8" cross="center">
-      <status-bar grow="1">{modelStatusText}</status-bar>
-      <if test="{canDownload}">
-        <button variant="primary" size="sm" on-press="download_model">Download</button>
-      </if>
-    </row>
-  </column>
+  </if>
+
+  <!-- ===================== EDITOR SHEET (add/edit) ====================== -->
+  <if test="{editorOpen}">
+    <column gap="8" padding="12">
+      <text size="heading">{editorTitleLabel}</text>
+      <text-field placeholder="Title" on-input="edit_title_edit" />
+      <text-field placeholder="Language (e.g. python, zig)" on-input="edit_language_edit" />
+      <code source="{editContent}" editable="true" on-input="edit_content_edit" />
+      <text-field placeholder="Annotation" on-input="edit_annotation_edit" />
+      <text-field placeholder="Text expander" on-input="edit_text_expander_edit" />
+      <row gap="8" cross="center">
+        <button variant="primary" size="sm" on-press="save_snippet">Save</button>
+        <button variant="ghost" size="sm" on-press="cancel_editor">Cancel</button>
+      </row>
+    </column>
+  </if>
+
+  <!-- ================= SET-LANGUAGE MODAL (typeahead) =================== -->
+  <if test="{langModalOpen}">
+    <column gap="8" padding="12">
+      <text size="heading">Set language</text>
+      <text-field placeholder="Type a language…" on-input="lang_modal_edit" on-submit="save_lang_modal" />
+      <status-bar>Used before</status-bar>
+      <row gap="6" cross="center">
+        <for each="languageList" key="name" as="l">
+          <button size="sm" variant="ghost" on-press="pick_lang_suggestion:{l.index}">{l.name}</button>
+        </for>
+      </row>
+      <row gap="8" cross="center">
+        <button variant="primary" size="sm" on-press="save_lang_modal">Save</button>
+        <button variant="ghost" size="sm" on-press="cancel_lang_modal">Cancel</button>
+      </row>
+    </column>
+  </if>
 
   <status-bar>{dataDirText}</status-bar>
 </column>
