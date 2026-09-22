@@ -41,15 +41,15 @@
           <text wrap="true">Blocks for Developers runs on a model that lives on your machine. We've recommended the most capable one your computer can run — download it, or pick another.</text>
 
           <scroll grow="1">
-            <column gap="8">
+            <column gap="6">
               <for each="modelChoices" key="index" as="m">
                 <!-- Each option is a card; the SELECTED one is bordered
                      (via `selected`), the others rest quiet. Tapping a card
-                     selects that model. Kept compact (tight padding + a
-                     single caption row for size/RAM) so all three fit
-                     without scrolling. -->
+                     selects that model. Kept compact (tight padding/gaps,
+                     default-size name, single caption for size/RAM) so all
+                     three fit without scrolling. -->
                 <card selected="{m.selected}" on-press="select_model:{m.index}">
-                  <column gap="4" padding="10">
+                  <column gap="2" padding="8">
                     <row cross="center" gap="8">
                       <text size="heading" grow="1">{m.name}</text>
                       <if test="{m.recommended}">
