@@ -102,6 +102,11 @@ const key_snip_setlang: u64 = 195; // UPDATE just the language (set-language mod
 const key_snip_delete: u64 = 196; // DELETE a snippet
 const key_snip_clip: u64 = 197; // writeClipboard the selected snippet
 const key_snip_detail: u64 = 198; // query the selected snippet's full body
+// Config rewrites AFTER first-run (Task 13). A separate key/Msg from the
+// first-run `key_write_config`/`.wrote_config` so persisting a model change
+// or completing onboarding never re-runs the first-run arm (which clears
+// `onboarded`). See `config_persisted`.
+const key_config_persist: u64 = 200; // rewrite config.json (model change / onboarding)
 
 /// The loopback port the MCP child binds (passed explicitly so the app
 /// knows where to reach it without first reading the endpoint file).
@@ -130,6 +135,12 @@ const mcp_health_max_attempts: u32 = 20;
 /// The loopback port the llama.cpp runtime binds. Task 10's chat POSTs to
 /// its OpenAI-compatible endpoint here; for now we only health-check it.
 const llama_port: u16 = 39_018;
+
+/// Human-readable loopback URLs shown in Settings › Model Context Protocol
+/// (mockup 3). Kept in sync with `mcp_port` / `llama_port` above. Static so
+/// the accessors can return borrowed slices without owned storage.
+const mcp_url = "http://127.0.0.1:39017/";
+const llama_url = "http://127.0.0.1:39018/v1";
 /// Delay before the FIRST llama health check. Model load (mmap + warmup)
 /// takes noticeably longer than the MCP child's bind.
 const llama_health_delay_ms: u64 = 1_500;
@@ -164,6 +175,20 @@ const SnippetSort = enum { recent, alphabetical };
 /// Which top-level screen is showing. A minimal nav so the Chat and Materials
 /// views don't stack in one scroll (Task 13 does the high-fidelity shell).
 const Screen = enum { chat, materials };
+
+/// The two-step first-run onboarding flow (Task 13). Shown as a full-screen
+/// overlay while `!onboarded`: a welcome splash, then a model picker. The
+/// user picks + installs a model, then lands in the app.
+const OnboardStep = enum { welcome, pick_model };
+
+/// The welcome-splash description (mockup 4).
+const welcome_blurb =
+    "Blocks runs in the background on your computer, forming a searchable memory " ++
+    "of the history of your local git repositories so you can build better context " ++
+    "and store materials that help you be more productive.";
+
+/// Which settings section is open in the Settings modal (mockup 3).
+const SettingsSection = enum { all, about, mcp, local_model };
 /// Whole-exchange timeout for the streamed completion (a long reply on a
 /// small local model can still take a while); the stream lifetime counts.
 const chat_stream_timeout_ms: u32 = 120_000;
@@ -250,15 +275,37 @@ pub const ChangedPath = struct {
     }
 };
 
-/// One row in the model picker's `<for each>`. Built fresh each rebuild
-/// from the static catalog + the current selection (no owned storage — the
-/// name/blurb slices borrow the comptime catalog strings, which live for
-/// the whole program).
+/// One row in the model picker's `<for each>` (Task 9 picker + Task 13
+/// onboarding/settings cards). Built by `refreshModelChoices` from the
+/// static catalog + the current selection. The `name`/`blurb`/`tierLabel`
+/// slices borrow comptime catalog strings; `size`/`ram` are computed into
+/// this struct's own inline buffers (so the view slice stays valid across
+/// rebuilds without an allocator).
 pub const ModelChoice = struct {
     index: usize,
     name: []const u8,
     blurb: []const u8,
     selected: bool,
+    /// True for the single recommended model (a starred badge in the card).
+    recommended: bool = false,
+    /// The tier badge label ("Premium" / "Balanced" / "Basic").
+    tierLabel: []const u8 = "",
+    /// Inline-owned "N GB"/"N MB" size label.
+    size_buf: [16]u8 = undefined,
+    size_len: usize = 0,
+    /// Inline-owned "Needs N GB RAM" label ("" when unknown).
+    ram_buf: [24]u8 = undefined,
+    ram_len: usize = 0,
+
+    pub fn sizeLabel(self: *const ModelChoice) []const u8 {
+        return self.size_buf[0..self.size_len];
+    }
+    pub fn ramLabel(self: *const ModelChoice) []const u8 {
+        return self.ram_buf[0..self.ram_len];
+    }
+    pub fn hasRam(self: *const ModelChoice) bool {
+        return self.ram_len > 0;
+    }
 };
 
 /// One single-click summary card (Task 11) for the view's `<for each>`.
@@ -280,10 +327,16 @@ const summary_cards = [_]SummaryCard{
 };
 
 pub const Model = struct {
-    /// True when the config file already existed at boot (returning user).
-    /// Read by `persistSelectedModel` to preserve the flag when rewriting
-    /// config.json on a model change.
+    /// True when the user has completed onboarding (config already existed at
+    /// boot, OR they just finished the welcome flow). Drives whether the
+    /// full-screen onboarding overlay is shown. Read by `persistConfig` to
+    /// preserve the flag when rewriting config.json on a model change.
     onboarded: bool = false,
+    /// Which onboarding step is showing while `!onboarded` (Task 13).
+    onboard_step: OnboardStep = .welcome,
+    /// Settings modal open state + which section is selected (Task 13).
+    settings_open: bool = false,
+    settings_section: SettingsSection = .all,
     /// Detected OS username, shown next to the avatar. Borrowed from the
     /// process-lifetime boot arena.
     username: []const u8 = "developer",
@@ -526,16 +579,25 @@ pub const Model = struct {
     pub fn modelChoices(self: *const Model) []const ModelChoice {
         return self.model_choices[0..models.catalog.len];
     }
-    /// Refill `model_choices` from the static catalog + current selection.
-    fn refreshModelChoices(self: *Model) void {
+    /// Refill `model_choices` from the static catalog + current selection,
+    /// computing each card's size + RAM labels into its inline buffers.
+    /// Public so view-build tests can seed a Model with populated cards.
+    pub fn refreshModelChoices(self: *Model) void {
         const sel = self.selectedModel();
         for (models.catalog, 0..) |m, i| {
-            self.model_choices[i] = .{
+            var choice = ModelChoice{
                 .index = i,
                 .name = m.display_name,
                 .blurb = m.blurb,
                 .selected = std.mem.eql(u8, m.id, sel),
+                .recommended = m.recommended,
+                .tierLabel = m.tier.label(),
             };
+            const size = models.formatSize(&choice.size_buf, m.size_bytes);
+            choice.size_len = size.len;
+            const ram = models.formatRam(&choice.ram_buf, m.min_ram_bytes);
+            choice.ram_len = ram.len;
+            self.model_choices[i] = choice;
         }
     }
     /// Display name of the selected model (falls back to its id).
@@ -653,6 +715,72 @@ pub const Model = struct {
     }
     pub fn onMaterialsScreen(self: *const Model) bool {
         return self.screen == .materials;
+    }
+
+    // ---- Onboarding accessors (Task 13) ----
+    /// True while the full-screen onboarding overlay should be shown.
+    pub fn needsOnboarding(self: *const Model) bool {
+        return !self.onboarded;
+    }
+    pub fn onWelcomeStep(self: *const Model) bool {
+        return !self.onboarded and self.onboard_step == .welcome;
+    }
+    pub fn onPickModelStep(self: *const Model) bool {
+        return !self.onboarded and self.onboard_step == .pick_model;
+    }
+    /// The welcome-splash description paragraph (mockup 4).
+    pub fn welcomeBlurb(self: *const Model) []const u8 {
+        _ = self;
+        return welcome_blurb;
+    }
+    /// The onboarding "Install" button label: kicks off (or reflects) the
+    /// selected model's download.
+    pub fn installLabel(self: *const Model) []const u8 {
+        if (self.model_present or self.llama_ready) return "Continue";
+        if (self.downloading) return "Downloading…";
+        return "Install";
+    }
+    /// The onboarding Install/Continue button is disabled while a download
+    /// is mid-flight (the label shows the progress via `modelStatusText`).
+    pub fn installDisabled(self: *const Model) bool {
+        return self.downloading;
+    }
+
+    // ---- Settings modal accessors (Task 13) ----
+    pub fn settingsOpen(self: *const Model) bool {
+        return self.settings_open;
+    }
+    pub fn settingsAbout(self: *const Model) bool {
+        return self.settings_section == .about or self.settings_section == .all;
+    }
+    pub fn settingsMcp(self: *const Model) bool {
+        return self.settings_section == .mcp or self.settings_section == .all;
+    }
+    pub fn settingsLocalModel(self: *const Model) bool {
+        return self.settings_section == .local_model or self.settings_section == .all;
+    }
+    pub fn settingsRepos(self: *const Model) bool {
+        // Watched Repositories live under the "All" and "About" sections.
+        return self.settings_section == .all or self.settings_section == .about;
+    }
+    /// The app version string, shown in Settings › About (mockup 3).
+    pub fn appVersionText(self: *const Model) []const u8 {
+        _ = self;
+        return app_version;
+    }
+    /// The MCP server URL, shown in Settings › MCP with a copy button.
+    pub fn mcpUrlText(self: *const Model) []const u8 {
+        _ = self;
+        return mcp_url;
+    }
+    /// The local runtime (OpenAI-compatible) URL, shown in Settings › MCP.
+    pub fn llamaUrlText(self: *const Model) []const u8 {
+        _ = self;
+        return llama_url;
+    }
+    /// The launch-at-login toggle label for the Settings row.
+    pub fn loginToggleLabel(self: *const Model) []const u8 {
+        return if (self.login_enabled) "On" else "Off";
     }
 
     // ---- Materials / snippets accessors (Task 12) ----
@@ -862,6 +990,7 @@ pub const Model = struct {
         "download_progress",  "download_failed",    "llama_started",  "llama_ready",
         "llama_failed",       "selectedModel",       "model_choices",
         "selectedModelName",  "downloadPercent",     "llama_health_attempts",
+        "refreshModelChoices",
         // Chat experience (Task 10). chat_input is bound (text-field), and
         // messagesSlice/streamingText/isStreaming/canSend/chatStatusText/
         // chatEmpty are bound in markup — the rest are update/effect state.
@@ -870,9 +999,14 @@ pub const Model = struct {
         "context_buf",        "context_len",        "sending",        "streaming",
         "finalizing",         "chat_error_buf",     "chat_error_len", "pushMessage",
         "canSend",
-        // Single-click summaries (Task 11). `summaryDisabled` is bound in
-        // markup; `pending_summary_kind` is per-turn update state.
-        "pending_summary_kind",
+        // Single-click summaries (Task 11). `pending_summary_kind` is
+        // per-turn update state; `summaryDisabled` is retained for tests
+        // (the Task 13 cards are tappable columns gated in `startSummary`).
+        "pending_summary_kind", "summaryDisabled",
+        // Onboarding + Settings (Task 13). The accessors (needsOnboarding,
+        // onWelcomeStep, settingsOpen, appVersionText, …) are bound in
+        // markup; these are the update-only enum/flag fields.
+        "onboard_step",         "settings_open",       "settings_section",
         // Navigation + Materials / snippets (Task 12). The list/menu/editor
         // accessors are bound in markup; these are the update/effect-only
         // fields + the text-field buffers (driven via on-input, not bound).
@@ -967,6 +1101,20 @@ pub const Msg = union(enum) {
     show_chat, // top-level nav: show the Chat screen
     show_materials, // top-level nav: show the Materials screen
 
+    // Onboarding + Settings (Task 13)
+    onboard_next, // welcome "Get Started" -> the model-picker step
+    onboard_finish, // model-picker "Install"/"Continue" -> enter the app
+    open_settings, // open the Settings modal
+    close_settings, // close the Settings modal
+    settings_all, // Settings nav: All
+    settings_about, // Settings nav: About
+    settings_mcp, // Settings nav: Model Context Protocol
+    settings_local_model, // Settings nav: Local Model
+    copy_mcp_url, // copy the MCP server URL to the clipboard
+    copy_llama_url, // copy the runtime URL to the clipboard
+    url_clip_done: native_sdk.EffectClipboardResult, // URL clipboard write result
+    config_persisted: native_sdk.EffectFileResult, // config.json rewrite (model/onboarding)
+
     // Materials / snippets (Task 12)
     snippets_listed: native_sdk.EffectDbResult, // snippets list query page/done
     languages_listed: native_sdk.EffectDbResult, // distinct-languages query page/done
@@ -1032,6 +1180,10 @@ pub const Msg = union(enum) {
         "snippets_listed",  "languages_listed",  "snippet_clip_done",
         "snippet_inserted", "snippet_rowid_done", "snippet_write_done",
         "snippet_detail_loaded",
+        // Task 13 effect-delivered arms (onboard_next/onboard_finish/
+        // open_settings/close_settings/settings_*/copy_*_url ARE bound as
+        // markup handlers, so they are intentionally omitted).
+        "url_clip_done", "config_persisted",
     };
 };
 
@@ -1104,8 +1256,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .stat_config => |res| {
             if (res.outcome == .ok and res.exists) {
                 // Returning user: config already present. Read it to learn
-                // the selected model (then stat the model file).
-                model.onboarded = true;
+                // the selected model AND the onboarded flag (`config_read_
+                // done` sets both). We must NOT infer onboarded from mere
+                // file existence — a user who quit mid-onboarding has a
+                // config with `onboarded:false` and should see the flow.
                 readConfig(fx);
             } else {
                 // First run: create the directory tree + default config.
@@ -1127,6 +1281,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .config_read_done => |res| {
             if (res.outcome == .ok and res.bytes.len > 0) {
                 if (models.parseSelectedModel(res.bytes)) |id| model.setSelectedModel(id);
+                // Adopt the persisted onboarded flag. Absent (a config that
+                // predates the flag) is treated as NOT onboarded, so the
+                // welcome flow runs once and then persists `true`.
+                model.onboarded = models.parseOnboarded(res.bytes) orelse false;
             }
             model.refreshModelChoices();
             // Now that we know which model is selected, see if it's present.
@@ -1145,7 +1303,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.download_failed = false;
             model.download_progress = 0;
             // Persist the choice, then re-check presence for the new model.
-            persistSelectedModel(model, fx);
+            persistConfig(model, fx);
             statSelectedModel(model, fx);
         },
         .download_model => startDownload(model, fx),
@@ -1247,6 +1405,42 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         // ---- Navigation (Task 12) ----
         .show_chat => model.screen = .chat,
         .show_materials => model.screen = .materials,
+
+        // ---- Onboarding + Settings (Task 13) ----
+        .onboard_next => model.onboard_step = .pick_model,
+        .onboard_finish => {
+            // Complete onboarding: mark it done, persist the flag (+ the
+            // selected model), and — if the model isn't on disk yet — kick
+            // off its download so the user lands in a working app.
+            model.onboarded = true;
+            persistConfig(model, fx);
+            if (!model.model_present and !model.downloading) startDownload(model, fx);
+        },
+        .open_settings => model.settings_open = true,
+        .close_settings => model.settings_open = false,
+        .settings_all => model.settings_section = .all,
+        .settings_about => model.settings_section = .about,
+        .settings_mcp => model.settings_section = .mcp,
+        .settings_local_model => model.settings_section = .local_model,
+        .copy_mcp_url => fx.writeClipboard(.{
+            .key = key_snip_clip,
+            .text = mcp_url,
+            .on_result = Effects.clipboardMsg(.url_clip_done),
+        }),
+        .copy_llama_url => fx.writeClipboard(.{
+            .key = key_snip_clip,
+            .text = llama_url,
+            .on_result = Effects.clipboardMsg(.url_clip_done),
+        }),
+        .url_clip_done => |res| {
+            if (res.outcome == .ok) model.setSnippetStatus("Copied URL to clipboard.");
+        },
+        .config_persisted => |res| {
+            // A model-change / onboarding config rewrite completed. Nothing
+            // to do on success; on failure we simply keep the in-memory
+            // state (the next rewrite will retry).
+            _ = res;
+        },
 
         // ---- Materials / snippets (Task 12) ----
         .snippets_listed => |res| snippetsListed(model, res),
@@ -1676,17 +1870,19 @@ fn readConfig(fx: *Effects) void {
     });
 }
 
-/// Persist the current selection by rewriting config.json. We keep the
-/// existing username + version + onboarded state and swap the model id.
-fn persistSelectedModel(model: *const Model, fx: *Effects) void {
+/// Persist the current config (selected model + onboarded flag) by
+/// rewriting config.json. Uses `key_config_persist`/`.config_persisted`
+/// (NOT the first-run `key_write_config`/`.wrote_config`) so it never
+/// re-runs the first-run arm that clears `onboarded`.
+fn persistConfig(model: *const Model, fx: *Effects) void {
     const paths = boot_paths orelse return;
     const arena = boot_arena.allocator();
     const json = bootstrap.configJson(arena, model.username, app_version, model.selectedModel(), model.onboarded) catch return;
     fx.writeFile(.{
-        .key = key_write_config,
+        .key = key_config_persist,
         .path = paths.config,
         .bytes = json,
-        .on_result = Effects.fileMsg(.wrote_config),
+        .on_result = Effects.fileMsg(.config_persisted),
     });
 }
 
@@ -2988,6 +3184,18 @@ fn loadReposPage(model: *Model, res: native_sdk.EffectDbResult) void {
 pub const AppUi = native_sdk.canvas.Ui(Msg);
 pub const app_markup = @embedFile("app.native");
 
+/// Custom vector icons registered at boot (see `main`). The welcome-splash
+/// sparkle (mockup 4) has no built-in equivalent, so we parse our own SVG
+/// (in the framework's stroke/fill icon dialect) and expose it to markup as
+/// `app:sparkle`. Parsed at comptime — a malformed SVG is a compile error.
+const sparkle_icon = canvas.svg_icon.parseComptime(@embedFile("assets/icons/sparkle.svg"));
+/// Reflected by the model contract (`native check`) to validate `app:`
+/// icon references in markup, and handed to `registerAppIcons` in `main`.
+/// MUST be `pub const app_icons` on the app root for the contract to see it.
+pub const app_icons = [_]canvas.icons.Entry{
+    .{ .name = "sparkle", .icon = &sparkle_icon },
+};
+
 const BlocksApp = native_sdk.UiApp(Model, Msg);
 
 pub fn initialModel() Model {
@@ -3001,6 +3209,11 @@ pub fn main(init: std.process.Init) !void {
     // Detect the username once, up front, from the real environment.
     const home = config.detectHome(env.lookup);
     boot_username = config.detectUsername(env.lookup, home);
+
+    // Register our custom vector icons (the welcome-splash sparkle isn't in
+    // the built-in set) so markup can draw them via `app:<name>`. Registered
+    // before the runtime starts, per the icons API contract.
+    canvas.icons.registerAppIcons(&app_icons);
 
     const app_state = try BlocksApp.create(std.heap.page_allocator, .{
         .name = "blocks",

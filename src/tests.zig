@@ -68,15 +68,30 @@ test "the boot shell view builds against the model" {
     try std.testing.expect(found_username);
 }
 
-test "update: existing config marks the user onboarded" {
-    var m = main.Model{};
+test "update: config read adopts the persisted onboarded flag" {
+    // The onboarded flag comes from the config CONTENTS, not from mere file
+    // existence — a user who quit mid-onboarding (onboarded:false) must see
+    // the flow again.
+    var onboarded = main.Model{};
     var fx = main.Effects.init(std.testing.allocator);
     defer fx.deinit();
     fx.executor = .fake;
 
-    // A successful stat with exists=true = returning user.
-    main.update(&m, .{ .stat_config = .{ .key = 100, .op = .stat, .outcome = .ok, .exists = true } }, &fx);
-    try std.testing.expect(m.onboarded);
+    // stat alone does NOT mark onboarded (it only routes to readConfig).
+    main.update(&onboarded, .{ .stat_config = .{ .key = 100, .op = .stat, .outcome = .ok, .exists = true } }, &fx);
+    try std.testing.expect(!onboarded.onboarded);
+
+    // A config that says onboarded:true flips the flag.
+    const cfg_true = "{ \"onboarded\": true, \"selected_model\": \"qwen2.5-3b-instruct-q4\" }";
+    main.update(&onboarded, .{ .config_read_done = .{ .key = 170, .op = .read, .outcome = .ok, .bytes = cfg_true } }, &fx);
+    try std.testing.expect(onboarded.onboarded);
+
+    // A config that says onboarded:false leaves the user in onboarding.
+    var pending = main.Model{};
+    const cfg_false = "{ \"onboarded\": false, \"selected_model\": \"qwen2.5-3b-instruct-q4\" }";
+    main.update(&pending, .{ .config_read_done = .{ .key = 170, .op = .read, .outcome = .ok, .bytes = cfg_false } }, &fx);
+    try std.testing.expect(!pending.onboarded);
+    try std.testing.expect(pending.needsOnboarding());
 }
 
 test "update: a successful first-run config write leaves the user not onboarded" {
@@ -87,6 +102,128 @@ test "update: a successful first-run config write leaves the user not onboarded"
 
     main.update(&m, .{ .wrote_config = .{ .key = 101, .op = .write, .outcome = .ok } }, &fx);
     try std.testing.expect(!m.onboarded);
+}
+
+// ---- Onboarding flow (Task 13) ----
+
+test "update: a fresh model needs onboarding and starts on the welcome step" {
+    const m = main.Model{};
+    try std.testing.expect(m.needsOnboarding());
+    try std.testing.expect(m.onWelcomeStep());
+    try std.testing.expect(!m.onPickModelStep());
+}
+
+test "update: 'Get Started' advances to the model-picker step" {
+    var m = main.Model{};
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .onboard_next, &fx);
+    try std.testing.expect(m.needsOnboarding()); // still onboarding…
+    try std.testing.expect(m.onPickModelStep()); // …but now on the picker
+    try std.testing.expect(!m.onWelcomeStep());
+}
+
+test "update: finishing onboarding marks the user onboarded" {
+    var m = main.Model{};
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .onboard_next, &fx);
+    main.update(&m, .onboard_finish, &fx);
+    try std.testing.expect(m.onboarded);
+    try std.testing.expect(!m.needsOnboarding());
+}
+
+test "update: a config-persist result never clears the onboarded flag" {
+    // Regression for the wrote_config bug: persisting a model change / the
+    // onboarding flag must NOT route through the first-run arm.
+    var m = main.Model{ .onboarded = true };
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .config_persisted = .{ .key = 200, .op = .write, .outcome = .ok } }, &fx);
+    try std.testing.expect(m.onboarded);
+}
+
+// ---- Settings modal (Task 13) ----
+
+test "update: opening and closing the Settings modal toggles its visibility" {
+    var m = main.Model{};
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    try std.testing.expect(!m.settingsOpen());
+    main.update(&m, .open_settings, &fx);
+    try std.testing.expect(m.settingsOpen());
+    main.update(&m, .close_settings, &fx);
+    try std.testing.expect(!m.settingsOpen());
+}
+
+test "update: 'All' shows every settings section; a section narrows to one" {
+    var m = main.Model{};
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    // Default is All -> every pane visible.
+    try std.testing.expect(m.settingsAbout());
+    try std.testing.expect(m.settingsMcp());
+    try std.testing.expect(m.settingsLocalModel());
+    try std.testing.expect(m.settingsRepos());
+
+    // Selecting MCP shows only the MCP pane.
+    main.update(&m, .settings_mcp, &fx);
+    try std.testing.expect(m.settingsMcp());
+    try std.testing.expect(!m.settingsAbout());
+    try std.testing.expect(!m.settingsLocalModel());
+
+    // Selecting Local Model shows only that pane.
+    main.update(&m, .settings_local_model, &fx);
+    try std.testing.expect(m.settingsLocalModel());
+    try std.testing.expect(!m.settingsMcp());
+
+    // Back to All.
+    main.update(&m, .settings_all, &fx);
+    try std.testing.expect(m.settingsAbout());
+    try std.testing.expect(m.settingsMcp());
+    try std.testing.expect(m.settingsLocalModel());
+}
+
+test "update: copying an MCP URL reports success via the clipboard result" {
+    var m = main.Model{};
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .copy_mcp_url, &fx);
+    main.update(&m, .{ .url_clip_done = .{ .key = 197, .op = .write, .outcome = .ok } }, &fx);
+    try std.testing.expect(std.mem.indexOf(u8, m.snippetStatus(), "Copied") != null);
+}
+
+test "the onboarding + settings views build against the model" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Onboarding (welcome) view builds.
+    var welcome = main.Model{ .username = "rui" };
+    welcome.refreshModelChoices();
+    _ = try buildTree(arena, &welcome);
+
+    // Pick-model step builds.
+    var picker = main.Model{ .username = "rui", .onboard_step = .pick_model };
+    picker.refreshModelChoices();
+    _ = try buildTree(arena, &picker);
+
+    // Onboarded app with the Settings modal open builds.
+    var settings = main.Model{ .username = "rui", .onboarded = true, .settings_open = true };
+    settings.refreshModelChoices();
+    _ = try buildTree(arena, &settings);
 }
 
 // ---- Tray + launch-at-login (Task 6) ----

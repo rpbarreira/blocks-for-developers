@@ -1,12 +1,13 @@
 # Blocks for Developers — Progress & Resumption Notes
 
-Last updated: end of Task 12 (Materials / snippets screen + chat cross-linking),
-VERIFIED END-TO-END live. Schema is now user_version 2 (migration 0002 added
-`snippets.text_expander`). To continue: open the IDE on this repo folder and say
-"read docs/PROGRESS.md and continue from Task 13."
+Last updated: end of Task 13 (Welcome/onboarding flow + Settings modal + UI
+polish), VERIFIED END-TO-END live via automation. Schema is still user_version 2
+(migration 0002 added `snippets.text_expander`). This was the FINAL v1 task — all
+14 tasks (0-13) are now implemented. To continue (polish / packaging), open the IDE
+on this repo folder and read this file first.
 Committed so far: Tasks 4-9 (`01969e5`/`56ae2a2`/`c2afa1b`/`e27eb0a`/`887480e`/
-`7a6961d`+`2ec4210`), Task 10 (`db4ce24`), Task 11 (`0fd1db3`). Task 12 implemented
-(see its section) — commit pending. Read this first when resuming.
+`7a6961d`+`2ec4210`), Task 10 (`db4ce24`), Task 11 (`0fd1db3`). Task 12 + Task 13
+implemented (see their sections) — commit pending. Read this first when resuming.
 
 **Runtime note for live runs:** the llama.cpp runtime is `llama-server`
 (installed via `brew install llama.cpp`, at `/opt/homebrew/bin/llama-server`).
@@ -151,15 +152,31 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
   = Annotations + Text Expander, editor sheet, set-language typeahead modal),
   plus Save-to-Snippets from chat + Start-Copilot-Chat + copy-to-clipboard. 184
   tests; `native check` clean; VERIFIED END-TO-END live. See the Task 12 section.
-- [ ] Task 13 — Welcome flow + settings modal completion + polish. ← NEXT
+- [x] **Task 13 — Welcome flow + settings modal completion + polish.** DONE.
+  Full-screen onboarding (welcome splash -> pick-a-local-model) gated on the
+  persisted `onboarded` flag, a Settings modal (About / Model Context Protocol /
+  Local Model + Watched Repositories) moved out of the chat screen, model catalog
+  cards with size + RAM + tier badges, and a custom `app:sparkle` vector icon.
+  Fixed a real boot bug (onboarded was inferred from config-file EXISTENCE; now
+  read from the config CONTENTS) + the Task 9 `wrote_config` clobber. 198 tests;
+  `native check` clean; VERIFIED END-TO-END live via automation. See the Task 13
+  section. This was the FINAL v1 task — Tasks 0-13 are all implemented.
 
 ---
 
 ## Source layout (all under `src/`)
 
-- **main.zig** — the app: Model/Msg/`update`/`initFx`, window/manifest wiring,
-  boot sequence, and (currently) the Watched Repositories screen. `main(init)`
-  detects username, then `UiApp.create(...)` + `runner.runWithOptions(...)`.
+- **main.zig** — the app: Model/Msg/`update`/`initFx`, window/manifest wiring, the
+  boot sequence, and the full app shell (onboarding + chat + materials + settings).
+  `main(init)` detects username, registers `app_icons` (`app:sparkle`), then
+  `UiApp.create(...)` + `runner.runWithOptions(...)`. BOOT/ONBOARDING (Task 13): the
+  `onboarded` flag is read from the config CONTENTS (`models.parseOnboarded` in
+  `config_read_done`), NOT inferred from config-file existence — so a user who quit
+  mid-onboarding still sees the welcome flow. Model has `onboard_step`/`settings_open`/
+  `settings_section` + the `needsOnboarding`/`onWelcomeStep`/`settings*`/`appVersionText`/
+  `mcpUrlText`/`llamaUrlText`/`loginToggleLabel` accessors; `persistConfig` (key 200)
+  rewrites config.json for a model change / onboarding completion WITHOUT re-running
+  the first-run arm.
 - **config.zig** — PURE, unit-tested. `Paths.resolve(alloc, bundle_id, lookup)`
   -> `{data_dir, db, models, config}` via `native_sdk.app_dirs` (macOS `.data` =
   `<HOME>/Library/Application Support/<bundle_id>`). `detectUsername(lookup, home)`
@@ -262,10 +279,15 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
   dispatcher (`handleRpc`) routing `initialize`/`tools/list`/`tools/call`/`ping` into
   the pure core; `runGetCommits`/`runGetActivity`/`runSearchMemory`. Built by
   `mcp/build.zig` (plain `zig build`, OUTSIDE the SDK graph). See the Task 8 section.
-- **models.zig** — local model management + llama.cpp runtime, PURE (Task 9).
-  `CatalogModel{id, display_name, blurb, url, file_name, size_bytes, sha256,
-  context_length}` + `catalog` (3 curated instruct GGUFs) + `default_model_id`
-  (`qwen2.5-3b-instruct-q4`) + `findModel(id)`. Path builders (caller-owned bufs):
+- **models.zig** — local model management + llama.cpp runtime, PURE (Task 9; extended
+  in Task 13). `CatalogModel{id, display_name, blurb, url, file_name, size_bytes,
+  sha256, context_length, tier, min_ram_bytes, recommended}` + `catalog` (3 curated
+  instruct GGUFs) + `default_model_id` (`qwen2.5-3b-instruct-q4`) + `findModel(id)`.
+  Task 13 added the `Tier{premium,balanced,basic}` enum (`.label()`), the RAM/tier/
+  recommended fields (Qwen2.5-3B=premium+recommended, Llama-3.2-3B=balanced,
+  Qwen2.5-1.5B=basic), `recommendedModelId()`, and the display helpers `formatSize(buf,
+  bytes)` (`"3.5 GB"`/`"769 MB"`/`"—"`) + `formatRam(buf, bytes)` (`"Needs N GB RAM"`).
+  Path builders (caller-owned bufs):
   `modelFilePath`/`partFilePath` (`<models>/<file>[.part]`). Argv builders (fixed
   `*_argv_len`, caller-owned bufs): `downloadArgv` (`curl -fL --silent --show-error
   --progress-bar --output <part> --url <url> --no-buffer`), `renameArgv`
@@ -274,7 +296,9 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
   `parseProgress(line)` pulls the trailing `NN.N%` out of a curl bar line → 0..1.
   `resolveServerBinary(env)` = `$BLOCKS_LLAMA_SERVER` else `default_server_binary`
   (`vendor/llama/bin/llama-server`). `parseSelectedModel(json)` reads the config
-  `selected_model` via a tiny hand `jsonStringField`. All unit-tested.
+  `selected_model` via a tiny hand `jsonStringField`. Task 13 added
+  `parseOnboarded(json)` (the sibling `jsonBoolField`) reading the `onboarded`
+  bool (null when absent -> caller defaults to not-onboarded). All unit-tested.
 - **chat.zig** — chat data layer + local-LLM protocol shaping, PURE (Task 10).
   `Role{user,assistant,system}` (`.name`/`.fromName`). CHATS/MESSAGES: `chat_insert_sql`
   (kind='chat', created=updated), `chat_touch_sql` (preview+updated_at), `max_chat_id_sql`
@@ -325,8 +349,17 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
 - **tests.zig** — test root: `comptime { _ = @import("config.zig"); ...db, repos... }`
   plus markup-builds and update-arm tests. Run via `native test --yes`.
 - **schema/0001_initial_schema.sql** + **schema/migrations.lock.json** — see below.
-- **app.native** — current view is the Watched Repositories screen (moves into the
-  Settings modal in Task 13).
+- **app.native** — the full app shell (Task 13): a `<if needsOnboarding>` onboarding
+  overlay (welcome splash + pick-a-local-model), the main app (`<if onboarded>`) with a
+  header (Chat/Materials nav + Settings gear), a Chat screen (sidebar + single-click
+  summary cards + transcript + composer), a Materials screen, and a `<if settingsOpen>`
+  Settings modal (About / MCP / Local Model + Watched Repositories). Editor sheet +
+  set-language modal are still `<if>`-gated panels.
+- **assets/icons/sparkle.svg** (embedded from `src/assets/icons/`) — the welcome-splash
+  sparkle, parsed at comptime (`canvas.svg_icon.parseComptime`), registered as
+  `app:sparkle` via `pub const app_icons` + `canvas.icons.registerAppIcons(&app_icons)`
+  in `main`. The built-in icon set has no sparkle; custom SVGs must live UNDER `src/`
+  (the package root) for `@embedFile` to reach them.
 
 ## Database schema (schema/0001_initial_schema.sql + 0002_snippets_text_expander.sql, user_version 2)
 
@@ -389,6 +422,8 @@ array in `db.zig` (embedded for tests); `native test` regenerates `migrations.lo
      180-185 (Task 10: 180 MCP search_memory POST, 181 llama chat `.stream` POST,
      182 chat INSERT, 183 chat MAX(id) query, 184 messages write batch, 185 messages
      reload query), 186 (Task 11: MCP get_activity POST for a summary's context),
+     200 (Task 13: rewrite config.json for a model change / onboarding completion
+     — SEPARATE from the first-run 101 so it never re-runs the first-run arm),
      190-198 (Task 12 materials: 190 snippets list, 191 distinct languages, 192
      snippet INSERT, 193 snippet MAX(id), 194 update, 195 set-language, 196 delete,
      197 writeClipboard, 198 selected-snippet detail get).
@@ -1315,3 +1350,172 @@ Start-Copilot-Chat LOGIC is proven by update-arm tests instead.
   add an `ESCAPE` clause if literal wildcards in a search term ever matter.
 - **Saved-time + counts.** The sidebar shows a `N`/count badge but not per-snippet
   "saved N ago"; the language filter badge shows the active filter. Cosmetic.
+
+## Task 13 — Welcome flow + settings modal completion + polish (DONE — what was built)
+
+The FINAL v1 task turns the functional-demo shell into the real product surface: a
+first-run onboarding flow, a proper Settings modal, model-picker cards with size/RAM/
+tier metadata, and a custom vector icon. The Watched Repositories (Task 3) and Local
+model (Task 9) sections MOVED OUT of the chat screen into Settings. All five provided
+mockups were followed (welcome, pick-a-local-model, chat, materials, settings).
+
+**KEY DECISION — onboarding is gated on the PERSISTED `onboarded` flag, read from
+config CONTENTS (fixes a real boot bug found live).** The Task 1 boot code set
+`model.onboarded = true` in the `stat_config` arm whenever the config file EXISTED —
+so onboarding would never show for anyone who already had a `config.json` (i.e. every
+returning user, AND anyone who quit mid-onboarding). Task 13 changed this: `stat_config`
+only routes to `readConfig`, and `config_read_done` sets `model.onboarded =
+models.parseOnboarded(bytes) orelse false`. A config that predates the flag (or omits
+it) reads as NOT onboarded, so the flow runs once and then persists `true`. Verified
+live: with `config.json` `"onboarded": false`, the app boots into the welcome overlay;
+after "Continue" it boots into the app.
+
+**KEY DECISION — a SEPARATE config-write path so persisting never clears `onboarded`.**
+The Task 9 `persistSelectedModel` wrote config.json via the FIRST-RUN key/Msg
+(`key_write_config`/`.wrote_config`), and the `.wrote_config` arm sets `onboarded=false`
+(correct only on a first run). So changing the model — or completing onboarding — would
+clobber the flag. Renamed to `persistConfig`, now writing via a NEW `key_config_persist`
+(200) + `.config_persisted` Msg (a no-op success arm). `select_model` and
+`onboard_finish` both call it. Regression-tested (`config_persisted` never clears
+`onboarded`).
+
+**KEY DECISION — real catalog kept; mockup's Gemma names NOT adopted.** The mockups show
+"Gemma 4 E2B / Gemma 3 1B / Qwen3 0.6B". The real `models.catalog` (Qwen2.5-3B /
+Llama-3.2-3B / Qwen2.5-1.5B) has VERIFIED-WORKING download URLs (the 1.5B is the model
+downloaded + run end-to-end in Tasks 9-12). Renaming would break the verified flow, so
+the catalog stays functional and Task 13 only adds the VISUAL metadata the cards need:
+per-model `tier` (`Tier{premium,balanced,basic}`), `min_ram_bytes`, and a `recommended`
+flag. Card labels are computed by `models.formatSize`/`formatRam` and surfaced through
+`ModelChoice` (now carries `recommended`/`tierLabel` + inline `sizeLabel()`/`ramLabel()`/
+`hasRam()`).
+
+**Onboarding flow** (`OnboardStep{welcome, pick_model}`, `app.native` `<if
+needsOnboarding>`):
+1. WELCOME (mockup 4): a large `app:sparkle` icon (64x64), the "Blocks for Developers"
+   heading, and the `welcomeBlurb` paragraph — constrained to a `max-width="620"`
+   centered column with `text-alignment="center"` and `wrap="true"` so it forms a tidy
+   centered block (NOT a full-width line). "Get Started" -> `onboard_next` ->
+   `onboard_step = .pick_model`.
+2. PICK A LOCAL MODEL (mockup 5): a `<for each="modelChoices">` of cards, each with
+   name + `Recommended`/`{tierLabel}`/`Selected` badges, blurb, `{sizeLabel}` +
+   `{ramLabel}` (`<if hasRam>`); tapping a card = `select_model:{index}`. A
+   `{modelStatusText}` line + an Install/Continue button (`installLabel` = "Install"
+   when missing / "Downloading…" mid-download / "Continue" when present) ->
+   `onboard_finish`: sets `onboarded=true`, `persistConfig`, and (if the model isn't on
+   disk) `startDownload`, then drops into the app.
+
+**Settings modal** (`app.native` `<if settingsOpen>`, mockup 3): opened by the header
+gear (`open_settings`), closed by `close_settings`. A left nav (`settings_all`/
+`settings_about`/`settings_mcp`/`settings_local_model` -> `SettingsSection`) drives which
+pane shows; the `settings*` accessors are written so `all` shows EVERY pane and a
+specific section narrows to one (`settingsAbout` = `all|about`, etc.). Panes:
+- ABOUT: "Version" `{appVersionText}` (= `app_version`), the data-dir path
+  `{dataDirText}` (for backup — the locked "Settings shows the data path" decision), and
+  a "Start Blocks at login" row wired to the existing `toggle_login` (label `On`/`Off`
+  via `loginToggleLabel`).
+- WATCHED REPOSITORIES: the Task 3 add-field + repo list (`reposSlice`/`add_repo_clicked`/
+  `remove_repo`), moved here from the chat screen.
+- MODEL CONTEXT PROTOCOL: read-only `{mcpUrlText}` (`http://127.0.0.1:39017/`) and
+  `{llamaUrlText}` (`http://127.0.0.1:39018/v1`) in `<code>` with Copy buttons
+  (`copy_mcp_url`/`copy_llama_url` -> `writeClipboard` -> `url_clip_done`).
+- LOCAL MODEL: the same model-picker cards + Download (`download_model`, shown when
+  `canDownload`).
+
+**Chat screen polish**: a left sidebar (`+ New chat` + a TODAY placeholder for the future
+chat list), a "SINGLE-CLICK SUMMARIES" label over the three summary cards (now tappable
+`<column on-press="start_summary:{c.tag}">` with label + blurb — `summaryDisabled` is no
+longer bound since `startSummary` self-gates on `sending`/`llama_ready`), the transcript,
+and the composer ("Paste code, or ask a technical question…"). Materials screen tidied
+(search on top, `+ New` under the sidebar list).
+
+**Custom vector icon (`app:sparkle`)**: the built-in icon set (`canvas.icons.
+known_icon_names`) has no sparkle. Authored `src/assets/icons/sparkle.svg` in the
+framework's stroke/fill icon dialect (two filled 4-point stars, cubic-bezier paths),
+parsed at comptime with `canvas.svg_icon.parseComptime(@embedFile(...))`, exposed as
+`pub const app_icons` on the app root (the model contract reflects THIS decl to validate
+`app:` names) and installed with `canvas.icons.registerAppIcons(&app_icons)` in `main`
+before the runtime starts. Referenced in markup as `<icon name="app:sparkle" .../>`.
+
+Model state added: `onboard_step: OnboardStep`, `settings_open: bool`,
+`settings_section: SettingsSection`. New Msgs: `onboard_next`, `onboard_finish`,
+`open_settings`, `close_settings`, `settings_all|about|mcp|local_model`, `copy_mcp_url`,
+`copy_llama_url`, `url_clip_done` (clipboard result), `config_persisted` (file result).
+`ModelChoice` extended (recommended/tierLabel/size+ram buffers). `refreshModelChoices` is
+now `pub` (view-build tests seed it).
+
+Tests (198 total, was 184 at end of Task 12): `models.zig` (tier labels, one-recommended
+invariant, `formatSize`/`formatRam`, `parseOnboarded` true/false/absent), `main.zig`
+update-arm tests via the fake executor (needsOnboarding/onWelcomeStep defaults;
+`onboard_next` -> pick-model; `onboard_finish` -> onboarded; `config_read_done` adopts the
+persisted flag — stat alone does NOT; `config_persisted` never clears `onboarded`;
+settings open/close; `settings_all|mcp|local_model` section gating; `copy_mcp_url` ->
+`url_clip_done` "Copied"), and a view-build test that renders the welcome / pick-model /
+settings-open trees. `native check` clean (0 warnings; `app:sparkle` validated against the
+refreshed model contract).
+
+### SDK markup learnings (Task 13)
+- **The bundled font is ASCII-ish — `native check` REFUSES any glyph outside its
+  coverage (an ERROR, not a warning): "character outside the bundled font's coverage …
+  renders as a tofu box".** Decorative unicode (✦ ★ ◈ ⌨ 🔍 ⚙ ✕ ⓘ ⚭) is rejected. Use
+  plain words, a built-in `<icon name="…"/>` (closed vocabulary: `canvas.icons.
+  known_icon_names` — plus/x/check/search/settings/trash/download/copy/edit/…), or a
+  registered `app:<name>` icon. (The `·` middle dot in the Task 11 summary blurbs IS
+  covered, so it stayed.)
+- **Custom icons must live UNDER `src/`** (the package root) for `@embedFile` — a
+  `../assets/…` path fails with "embed of file outside package path". Moved the SVG to
+  `src/assets/icons/`. Register via `pub const app_icons` + `registerAppIcons`; the model
+  contract reads the `pub const app_icons` decl name, so `native test` must refresh the
+  contract before `native check` accepts an `app:` reference.
+- **`<icon>` sizing**: `size="lg"` renders ~20px; for a hero icon set explicit
+  `width`/`height` (numbers) — e.g. `width="64" height="64"`.
+- **Text wrapping + alignment**: a bare `<text>` paints ONE line (overflow ellipsis).
+  `wrap="true"` word-wraps and reserves height; `text-alignment="start|center|end"`
+  aligns it. A text leaf grows to its CONTAINER width, so to get a narrow centered
+  paragraph, constrain the parent (`max-width`) — otherwise it wraps at the window edge
+  with each line left-hugging.
+- **Modals stay `<if test>`-gated panels** (no dedicated dialog element used): the
+  onboarding overlay, Settings modal, editor sheet, and set-language modal are all plain
+  conditional subtrees, so their open state is testable Model state.
+
+### VERIFIED END-TO-END via automation (+ the boot bug found and fixed live)
+Driven live (`native dev --yes -Dautomation=true` with `BLOCKS_LLAMA_SERVER`, real
+Qwen2.5-1.5B; `config.json` moved aside to force a first run, restored afterward). All
+confirmed against the widget snapshot + `app.db`/config:
+- WELCOME renders the 64x64 sparkle image, the heading, the centered wrapped blurb (620px
+  wide, 3 lines), and Get Started.
+- PICK-MODEL renders all three cards with the right badges + `1.7 GB`/`1.8 GB`/`1.0 GB`
+  sizes + `Needs 8/8/4 GB RAM`; tapping the 1.5B card moved the `Selected` badge and
+  persisted `selected_model` to config with `onboarded` STILL false (no clobber).
+- The 1.5B model was detected present -> button flipped to "Continue"; clicking it wrote
+  `onboarded: true` to config and dropped into the main app (header + chat sidebar +
+  summary cards + composer).
+- SETTINGS: opened from the gear; About showed Version `0.1.0` + the real data-dir path +
+  the login toggle; selecting "Local Model" hid Watched Repositories (section narrowing);
+  the MCP pane showed both loopback URLs and the first Copy button put
+  `http://127.0.0.1:39017/` on the REAL macOS clipboard (`pbpaste` confirmed); Close
+  dismissed the modal; Materials still rendered.
+
+**The bug the live run surfaced (fixed in this change):** the app booted straight into
+the main screen even with `config.json` `"onboarded": false`, because the Task 1
+`stat_config` arm set `onboarded=true` on file EXISTENCE. Fixed by reading the flag from
+config contents in `config_read_done` (see the KEY DECISION above); re-verified the
+welcome flow then showed correctly. 198 tests green; `native check` clean.
+
+### Deferred / follow-ups
+- **Chat history sidebar.** The sidebar shows `+ New chat` + a TODAY placeholder but not
+  the real per-day chat list from the `chats` table (mockup 1 groups by date). Wire a
+  chats-list query + a `select_chat` nav + date grouping. `+ New chat` currently just
+  routes to the chat screen (a fresh chat is still created on first send).
+- **Packaging (the big remaining v1 item).** `native package` must: build + vendor the
+  MCP child (`mcp/zig-out/bin/blocks-mcp`) and a Metal-enabled `llama-server` (+
+  `.metallib`) into the `.app`, and resolve their paths from the bundle exe-dir (the
+  SDK effects channel still has no self-path helper — see the Task 8/9 deferrals). The
+  packaged-build login item (SMAppService) also can't be exercised under `native dev`.
+- **Onboarding <-> download UX.** `onboard_finish` starts the download and enters the
+  app immediately; there's no in-onboarding progress bar/percent (the chat status shows
+  "Downloading…"). A progress meter on the pick-model step + a cancel would be nicer.
+- **High-fidelity Materials (from Task 12).** Floating "+", right-rail icon buttons, and
+  "saved N ago" are still functional-layout, not pixel-faithful.
+- **Settings polish.** No model-delete/disk-usage UI; the login toggle is a text button
+  (`On`/`Off`), not a native switch; MCP URLs are static strings (not read from the live
+  `mcp-endpoint.json` port, which can differ on an `AddressInUse` scan).

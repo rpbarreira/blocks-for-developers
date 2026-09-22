@@ -31,6 +31,24 @@ const std = @import("std");
 /// post-download sanity check and to show a total in the progress UI.
 /// `sha256` (lowercase hex, or "" when unknown) enables integrity
 /// verification when present.
+/// A model's quality/resource tier, shown as a badge in the picker cards
+/// (mockup: "Premium" / "Balanced" / "Basic"). Independent of the
+/// `recommended` flag (a single model is recommended within its tier set).
+pub const Tier = enum {
+    premium,
+    balanced,
+    basic,
+
+    /// The badge label shown on the picker card.
+    pub fn label(self: Tier) []const u8 {
+        return switch (self) {
+            .premium => "Premium",
+            .balanced => "Balanced",
+            .basic => "Basic",
+        };
+    }
+};
+
 pub const CatalogModel = struct {
     /// Stable id persisted in config.json (never shown raw to the user).
     id: []const u8,
@@ -48,6 +66,14 @@ pub const CatalogModel = struct {
     sha256: []const u8 = "",
     /// Context length the runtime should be launched with.
     context_length: u32 = 4096,
+    /// Quality/resource tier, shown as a badge in the picker.
+    tier: Tier = .balanced,
+    /// Recommended RAM to run this model comfortably, in bytes. Shown as
+    /// "Needs N GB RAM" in the picker card.
+    min_ram_bytes: u64 = 0,
+    /// True for the single "Recommended" model (mockup: a starred badge).
+    /// The onboarding picker defaults its selection to this one.
+    recommended: bool = false,
 };
 
 /// The v1 model catalog. Kept intentionally small and curated: a couple of
@@ -60,29 +86,36 @@ pub const catalog = [_]CatalogModel{
     .{
         .id = "qwen2.5-3b-instruct-q4",
         .display_name = "Qwen2.5 3B Instruct",
-        .blurb = "3B params · Q4_K_M · fast, great default",
+        .blurb = "Best quality. Recommended. A capable 3B model quantized to Q4_K_M for fast local answers.",
         .url = "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf",
         .file_name = "qwen2.5-3b-instruct-q4_k_m.gguf",
         .size_bytes = 1_929_903_104,
         .context_length = 8192,
+        .tier = .premium,
+        .min_ram_bytes = 8 * 1024 * 1024 * 1024,
+        .recommended = true,
     },
     .{
         .id = "llama-3.2-3b-instruct-q4",
         .display_name = "Llama 3.2 3B Instruct",
-        .blurb = "3B params · Q4_K_M · balanced",
+        .blurb = "Balanced size and quality. A solid alternative if you prefer the Llama family.",
         .url = "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
         .file_name = "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
         .size_bytes = 2_019_377_696,
         .context_length = 8192,
+        .tier = .balanced,
+        .min_ram_bytes = 8 * 1024 * 1024 * 1024,
     },
     .{
         .id = "qwen2.5-1.5b-instruct-q4",
         .display_name = "Qwen2.5 1.5B Instruct",
-        .blurb = "1.5B params · Q4_K_M · lightest, lowest RAM",
+        .blurb = "Smallest and fastest. A lighter choice if disk or memory is tight.",
         .url = "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf",
         .file_name = "qwen2.5-1.5b-instruct-q4_k_m.gguf",
         .size_bytes = 1_117_320_736, // verified against the real download
         .context_length = 8192,
+        .tier = .basic,
+        .min_ram_bytes = 4 * 1024 * 1024 * 1024,
     },
 };
 
@@ -96,6 +129,41 @@ pub fn findModel(id: []const u8) ?*const CatalogModel {
         if (std.mem.eql(u8, m.id, id)) return m;
     }
     return null;
+}
+
+/// The catalog id of the recommended model (falls back to the default).
+pub fn recommendedModelId() []const u8 {
+    for (&catalog) |*m| {
+        if (m.recommended) return m.id;
+    }
+    return default_model_id;
+}
+
+// ----------------------------------------------------- display helpers
+
+const gib: u64 = 1024 * 1024 * 1024;
+const mib: u64 = 1024 * 1024;
+
+/// Format a byte size as a compact human string ("3.1 GB" / "769 MB") into
+/// `buf`, returning the slice. GB for >= 1 GiB (one decimal), else whole MB.
+/// Pure + allocation-free (caller owns `buf`, needs ~16 bytes).
+pub fn formatSize(buf: []u8, bytes: u64) []const u8 {
+    if (bytes == 0) return std.fmt.bufPrint(buf, "—", .{}) catch "—";
+    if (bytes >= gib) {
+        const whole = bytes / gib;
+        const frac = ((bytes % gib) * 10) / gib; // one decimal digit
+        return std.fmt.bufPrint(buf, "{d}.{d} GB", .{ whole, frac }) catch "—";
+    }
+    const mb = (bytes + mib - 1) / mib; // round up to whole MB
+    return std.fmt.bufPrint(buf, "{d} MB", .{mb}) catch "—";
+}
+
+/// Format the RAM recommendation as "Needs N GB RAM" into `buf`, rounding
+/// up to whole GB. Returns "" when unknown (0). Caller owns `buf` (~24 bytes).
+pub fn formatRam(buf: []u8, min_ram_bytes: u64) []const u8 {
+    if (min_ram_bytes == 0) return "";
+    const gb = (min_ram_bytes + gib - 1) / gib; // round up to whole GB
+    return std.fmt.bufPrint(buf, "Needs {d} GB RAM", .{gb}) catch "";
 }
 
 // ------------------------------------------------------- on-disk layout
@@ -251,6 +319,35 @@ pub fn parseSelectedModel(json: []const u8) ?[]const u8 {
     return jsonStringField(json, "selected_model");
 }
 
+/// Read the boolean `onboarded` flag from a `config.json` blob. Returns
+/// null when the key is absent/malformed (caller decides the default —
+/// a config that predates the flag is treated as NOT onboarded, so the
+/// welcome flow re-runs once and then persists `true`). Sibling of
+/// `parseSelectedModel`; scans for `"onboarded"`, skips `:` + whitespace,
+/// and reads a `true`/`false` literal.
+pub fn parseOnboarded(json: []const u8) ?bool {
+    return jsonBoolField(json, "onboarded");
+}
+
+fn jsonBoolField(json: []const u8, key: []const u8) ?bool {
+    var needle_buf: [128]u8 = undefined;
+    if (key.len + 2 > needle_buf.len) return null;
+    needle_buf[0] = '"';
+    @memcpy(needle_buf[1 .. 1 + key.len], key);
+    needle_buf[1 + key.len] = '"';
+    const needle = needle_buf[0 .. key.len + 2];
+
+    const key_at = std.mem.indexOf(u8, json, needle) orelse return null;
+    var i = key_at + needle.len;
+    while (i < json.len and (json[i] == ' ' or json[i] == '\t')) i += 1;
+    if (i >= json.len or json[i] != ':') return null;
+    i += 1;
+    while (i < json.len and (json[i] == ' ' or json[i] == '\t')) i += 1;
+    if (std.mem.startsWith(u8, json[i..], "true")) return true;
+    if (std.mem.startsWith(u8, json[i..], "false")) return false;
+    return null;
+}
+
 /// Minimal extractor for a top-level `"key": "value"` string field. Finds
 /// `"<key>"`, skips `:` and whitespace, and reads the following quoted
 /// string (honoring `\"` escapes by scanning to the first unescaped `"`).
@@ -295,6 +392,44 @@ test "findModel resolves known ids and rejects unknown" {
 
 test "catalog default id is present in the catalog" {
     try testing.expect(findModel(default_model_id) != null);
+}
+
+test "exactly one catalog model is recommended and it is the default" {
+    var count: usize = 0;
+    for (&catalog) |*m| {
+        if (m.recommended) count += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), count);
+    try testing.expectEqualStrings(default_model_id, recommendedModelId());
+}
+
+test "every catalog model carries a tier and a RAM recommendation" {
+    for (&catalog) |*m| {
+        try testing.expect(m.min_ram_bytes > 0);
+        try testing.expect(m.tier.label().len > 0);
+    }
+}
+
+test "formatSize renders GB with one decimal and whole MB" {
+    var buf: [16]u8 = undefined;
+    // 3.5 GiB -> "3.5 GB" (frac digit is (bytes%gib)*10/gib).
+    try testing.expectEqualStrings("3.5 GB", formatSize(&buf, 3 * gib + gib / 2));
+    try testing.expectEqualStrings("1.7 GB", formatSize(&buf, 1_929_903_104));
+    try testing.expectEqualStrings("769 MB", formatSize(&buf, 769 * mib));
+    try testing.expectEqualStrings("—", formatSize(&buf, 0));
+}
+
+test "formatRam rounds up to whole GB and is empty when unknown" {
+    var buf: [24]u8 = undefined;
+    try testing.expectEqualStrings("Needs 8 GB RAM", formatRam(&buf, 8 * gib));
+    try testing.expectEqualStrings("Needs 4 GB RAM", formatRam(&buf, 4 * gib));
+    try testing.expectEqualStrings("", formatRam(&buf, 0));
+}
+
+test "Tier labels match the mockup badges" {
+    try testing.expectEqualStrings("Premium", Tier.premium.label());
+    try testing.expectEqualStrings("Balanced", Tier.balanced.label());
+    try testing.expectEqualStrings("Basic", Tier.basic.label());
 }
 
 test "modelFilePath and partFilePath join under the models dir" {
@@ -383,4 +518,17 @@ test "parseSelectedModel returns null when the key is absent" {
         \\{ "version": "0.1.0", "username": "rui" }
     ;
     try testing.expect(parseSelectedModel(cfg) == null);
+}
+
+test "parseOnboarded reads the boolean flag" {
+    const yes =
+        \\{ "onboarded": true, "selected_model": "x" }
+    ;
+    const no =
+        \\{ "onboarded": false, "selected_model": "x" }
+    ;
+    try testing.expectEqual(@as(?bool, true), parseOnboarded(yes));
+    try testing.expectEqual(@as(?bool, false), parseOnboarded(no));
+    // Absent -> null (caller defaults to not-onboarded so the flow re-runs).
+    try testing.expectEqual(@as(?bool, null), parseOnboarded("{ \"version\": \"0.1.0\" }"));
 }

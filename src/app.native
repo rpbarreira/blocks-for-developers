@@ -1,210 +1,250 @@
-<!-- Blocks — top-level view. A minimal two-screen nav (Chat / Materials) so the
-     screens don't stack in one scroll. This is a FUNCTIONAL demo layout; the
-     high-fidelity chat_screen.png / materials mockup (sidebars, bubbles,
-     avatars, floating +, right-rail icon buttons) is Task 13 polish. The
-     Task 3 Watched Repositories + Task 9 Local model sections live under the
-     Chat screen for now and move into the Settings modal in Task 13. -->
-<column gap="12" padding="20" grow="1">
-  <row cross="center" gap="8">
-    <text size="heading" grow="1">Blocks</text>
-    <button size="sm" variant="secondary" on-press="show_chat">Chat</button>
-    <button size="sm" variant="secondary" on-press="show_materials">Materials</button>
-    <text>{usernameText}</text>
-  </row>
+<!-- Blocks — top-level view (Task 13 high-fidelity shell).
+     Structure:
+       1. Onboarding overlay (welcome -> pick a local model), shown while
+          the user has not completed onboarding.
+       2. The main app: a header (avatar + New chat + Settings gear + nav)
+          over a Chat screen (sidebar + single-click summaries + transcript
+          + composer) and a Materials screen.
+       3. A Settings modal (About / Model Context Protocol / Local Model +
+          Watched Repositories), reached from the gear.
+     Modals/overlays are plain <if test> gated panels (the SDK has no
+     dedicated dialog element); their open state is testable Model state. -->
+<column grow="1">
 
-  <!-- ============================ CHAT SCREEN ============================ -->
-  <if test="{onChatScreen}">
-    <column gap="12" grow="1">
-      <!-- Task 11: single-click summary cards. Each pulls recent activity from
-           the MCP get_activity tool and asks the model for a canned summary. -->
-      <row gap="8" cross="center">
-        <for each="summaryCards" key="tag" as="c">
-          <button variant="secondary" size="sm" on-press="start_summary:{c.tag}" disabled="{summaryDisabled}">{c.label}</button>
-        </for>
-      </row>
+  <!-- ======================= ONBOARDING OVERLAY ======================= -->
+  <if test="{needsOnboarding}">
+    <column gap="16" padding="28" grow="1">
 
-      <!-- Conversation transcript. Each message offers Save to Snippets. -->
-      <scroll grow="1">
-        <column gap="10">
-          <if test="{chatEmpty}">
-            <status-bar>Ask Blocks about your recent work — commits, file changes, what you were doing.</status-bar>
-          </if>
-          <for each="messagesSlice" key="id" as="msg">
-            <column gap="2">
-              <row cross="center" gap="8">
-                <status-bar grow="1">{msg.roleLabel}</status-bar>
-                <button size="sm" variant="ghost" on-press="save_to_snippets:{msg.index}">Save to Snippets</button>
-              </row>
-              <text>{msg.content}</text>
-            </column>
-          </for>
-          <!-- The in-progress assistant reply, as tokens stream in. -->
-          <if test="{isStreaming}">
-            <column gap="2">
-              <status-bar>Blocks</status-bar>
-              <text>{streamingText}</text>
-            </column>
-          </if>
+      <!-- Step 1: welcome splash (mockup 4). -->
+      <if test="{onWelcomeStep}">
+        <column gap="16" grow="1" cross="center">
+          <column grow="1" />
+          <icon name="app:sparkle" width="64" height="64" />
+          <text size="heading" text-alignment="center">Blocks for Developers</text>
+          <!-- Constrain the blurb to a narrow column so it wraps into a
+               tidy, centered block (like the mockup) instead of spanning
+               the full window width. -->
+          <column max-width="620" cross="center">
+            <text wrap="true" text-alignment="center">{welcomeBlurb}</text>
+          </column>
+          <column grow="1" />
+          <button variant="primary" on-press="onboard_next">Get Started</button>
         </column>
-      </scroll>
-
-      <status-bar>{chatStatusText}</status-bar>
-      <row gap="8" cross="center">
-        <text-field
-          placeholder="Ask about your recent work…"
-          on-input="chat_input_edit"
-          on-submit="send_chat"
-          grow="1" />
-        <button variant="primary" on-press="send_chat" disabled="{sendDisabled}">Send</button>
-      </row>
-
-      <!-- Watched repositories (Task 3) — moves into Settings in Task 13. -->
-      <text size="heading">Watched Repositories</text>
-      <text>Blocks indexes the git history and file changes of the repositories you watch.</text>
-      <row gap="8" cross="center">
-        <text-field
-          placeholder="/path/to/your/repo"
-          on-input="repo_input_edit"
-          on-submit="add_repo_clicked"
-          grow="1" />
-        <button variant="primary" on-press="add_repo_clicked" disabled="{isAddingRepo}">Add</button>
-      </row>
-      <if test="{repoError}">
-        <text>{repoError}</text>
       </if>
-      <column gap="4">
-        <for each="reposSlice" key="id" as="r">
-          <row gap="8" padding="8" cross="center">
-            <column grow="1" gap="2">
-              <text>{r.name}</text>
-              <status-bar>{r.path}</status-bar>
-            </column>
-            <button size="sm" variant="ghost" on-press="remove_repo:{r.id}">Remove</button>
-          </row>
-        </for>
-      </column>
 
-      <!-- Task 9: local model management. Moves into Settings in Task 13. -->
-      <column gap="6" padding="8">
-        <text size="heading">Local model</text>
-        <text>Blocks chats with a model that runs entirely on your machine.</text>
-        <column gap="4">
-          <for each="modelChoices" key="index" as="m">
-            <row gap="8" padding="6" cross="center">
-              <column grow="1" gap="2">
-                <text>{m.name}</text>
-                <status-bar>{m.blurb}</status-bar>
-              </column>
-              <if test="{m.selected}">
-                <text>Selected</text>
-              </if>
-              <button size="sm" variant="ghost" on-press="select_model:{m.index}">Choose</button>
-            </row>
-          </for>
-        </column>
-        <row gap="8" cross="center">
-          <status-bar grow="1">{modelStatusText}</status-bar>
-          <if test="{canDownload}">
-            <button variant="primary" size="sm" on-press="download_model">Download</button>
-          </if>
-        </row>
-      </column>
-    </column>
-  </if>
+      <!-- Step 2: pick a local model (mockup 5). -->
+      <if test="{onPickModelStep}">
+        <column gap="12" grow="1">
+          <text size="heading">Pick a local model</text>
+          <text>Blocks for Developers runs on a model that lives on your machine. We've recommended the most capable one your computer can run — download it, or pick another.</text>
 
-  <!-- ========================= MATERIALS SCREEN ========================= -->
-  <if test="{onMaterialsScreen}">
-    <column gap="12" grow="1">
-      <!-- Find + new material. -->
-      <row gap="8" cross="center">
-        <text-field
-          placeholder="Find materials…"
-          on-input="snippet_search_edit"
-          grow="1" />
-        <button variant="primary" size="sm" on-press="open_new_snippet">+ New</button>
-      </row>
-
-      <row gap="16" grow="1">
-        <!-- Sidebar: Saved Materials list with sort + language filter. -->
-        <column gap="8" grow="1">
-          <row cross="center" gap="8">
-            <text size="heading" grow="1">Saved Materials</text>
-            <badge>{snippetCount}</badge>
-            <button size="sm" variant="ghost" on-press="toggle_lang_menu">{langFilterLabel}</button>
-            <button size="sm" variant="ghost" on-press="toggle_sort_menu">{sortLabel}</button>
-          </row>
-
-          <!-- SORT BY menu. -->
-          <if test="{sortMenuOpen}">
-            <column gap="2" padding="6">
-              <status-bar>Sort by</status-bar>
-              <button size="sm" variant="ghost" on-press="sort_recent">Recent</button>
-              <button size="sm" variant="ghost" on-press="sort_alphabetical">Alphabetical</button>
-            </column>
-          </if>
-
-          <!-- Language filter menu: "All" first, then the languages in use. -->
-          <if test="{langMenuOpen}">
-            <column gap="2" padding="6">
-              <status-bar>Language</status-bar>
-              <button size="sm" variant="ghost" on-press="clear_lang_filter">All</button>
-              <for each="languageList" key="name" as="l">
-                <button size="sm" variant="ghost" on-press="set_lang_filter:{l.filterIndex}">{l.name}</button>
-              </for>
-            </column>
-          </if>
-
-          <if test="{hasSnippets}">
-            <column gap="4">
-              <for each="snippetList" key="id" as="s">
-                <column gap="2" padding="8" on-press="select_snippet:{s.id}">
-                  <text>{s.title}</text>
-                  <status-bar>{s.cardBlurb}</status-bar>
+          <scroll grow="1">
+            <column gap="10">
+              <for each="modelChoices" key="index" as="m">
+                <column gap="6" padding="14" on-press="select_model:{m.index}">
+                  <row cross="center" gap="8">
+                    <text size="heading" grow="1">{m.name}</text>
+                    <if test="{m.recommended}">
+                      <badge>Recommended</badge>
+                    </if>
+                    <badge>{m.tierLabel}</badge>
+                  </row>
+                  <text>{m.blurb}</text>
+                  <row gap="12" cross="center">
+                    <status-bar>{m.sizeLabel}</status-bar>
+                    <if test="{m.hasRam}">
+                      <status-bar>{m.ramLabel}</status-bar>
+                    </if>
+                    <status-bar grow="1"></status-bar>
+                    <if test="{m.selected}">
+                      <badge>Selected</badge>
+                    </if>
+                  </row>
                 </column>
               </for>
             </column>
-          </if>
-          <if test="{noSnippets}">
-            <status-bar>No materials yet. Save a snippet from a chat, or add one with + New.</status-bar>
-          </if>
+          </scroll>
+
+          <status-bar>{modelStatusText}</status-bar>
+          <button variant="primary" on-press="onboard_finish" disabled="{installDisabled}">{installLabel}</button>
         </column>
+      </if>
 
-        <!-- Main panel: the selected material. -->
-        <column gap="8" grow="1">
-          <if test="{snippetSelected}">
-            <column gap="8" grow="1">
-              <row cross="center" gap="8">
-                <text size="heading" grow="1">{selectedTitle}</text>
-                <button size="sm" variant="ghost" on-press="open_lang_modal">{selectedLanguageLabel}</button>
-              </row>
-              <row gap="8" cross="center">
-                <button size="sm" variant="secondary" on-press="start_copilot_chat">Start Copilot Chat</button>
-                <button size="sm" variant="ghost" on-press="open_edit_snippet">Edit</button>
-                <button size="sm" variant="ghost" on-press="copy_snippet">Copy</button>
-                <button size="sm" variant="ghost" on-press="delete_snippet">Delete</button>
-              </row>
+    </column>
+  </if>
 
-              <code source="{selectedContent}" line-numbers="true" />
+  <!-- ============================ MAIN APP ============================ -->
+  <if test="{onboarded}">
+    <column grow="1">
 
-              <!-- All Context: Annotations + Text Expander. -->
-              <text size="heading">All Context</text>
-              <column gap="2" padding="8">
-                <status-bar>Annotations</status-bar>
-                <text>{selectedAnnotation}</text>
-              </column>
-              <column gap="2" padding="8">
-                <status-bar>Text Expander</status-bar>
-                <text>{selectedTextExpander}</text>
-              </column>
-            </column>
-          </if>
-          <if test="{noSnippetSelected}">
-            <status-bar>Select a material to view it, or create one with + New.</status-bar>
-          </if>
-        </column>
+      <!-- Top bar: avatar/username, New chat, nav, Settings gear. -->
+      <row cross="center" gap="8" padding="12">
+        <text size="heading" grow="1">Blocks</text>
+        <button size="sm" variant="secondary" on-press="show_chat">Chat</button>
+        <button size="sm" variant="secondary" on-press="show_materials">Materials</button>
+        <button size="sm" variant="ghost" on-press="open_settings">Settings</button>
+        <text>{usernameText}</text>
       </row>
 
-      <status-bar>{snippetStatus}</status-bar>
+      <!-- ========================= CHAT SCREEN ========================= -->
+      <if test="{onChatScreen}">
+        <row gap="0" grow="1">
+
+          <!-- Left sidebar: New chat + (future) history. -->
+          <column gap="10" padding="12" grow="1">
+            <button variant="secondary" on-press="show_chat">+ New chat</button>
+            <status-bar>TODAY</status-bar>
+            <status-bar>Your conversations are saved locally.</status-bar>
+          </column>
+
+          <!-- Main chat column. -->
+          <column gap="12" padding="16" grow="1">
+
+            <!-- Single-click summary cards (Task 11). -->
+            <status-bar>SINGLE-CLICK SUMMARIES</status-bar>
+            <row gap="8" cross="center">
+              <for each="summaryCards" key="tag" as="c">
+                <column gap="2" padding="10" grow="1" on-press="start_summary:{c.tag}">
+                  <text>{c.label}</text>
+                  <status-bar>{c.blurb}</status-bar>
+                </column>
+              </for>
+            </row>
+
+            <!-- Conversation transcript. Each message offers Save to Snippets. -->
+            <scroll grow="1">
+              <column gap="12">
+                <if test="{chatEmpty}">
+                  <status-bar>Ask Blocks about your recent work — commits, file changes, what you were doing.</status-bar>
+                </if>
+                <for each="messagesSlice" key="id" as="msg">
+                  <column gap="4" padding="8">
+                    <row cross="center" gap="8">
+                      <text grow="1">{msg.roleLabel}</text>
+                      <button size="sm" variant="ghost" on-press="save_to_snippets:{msg.index}">Save to Snippets</button>
+                    </row>
+                    <text>{msg.content}</text>
+                  </column>
+                </for>
+                <!-- The in-progress assistant reply, as tokens stream in. -->
+                <if test="{isStreaming}">
+                  <column gap="4" padding="8">
+                    <text>Blocks</text>
+                    <text>{streamingText}</text>
+                  </column>
+                </if>
+              </column>
+            </scroll>
+
+            <status-bar>{chatStatusText}</status-bar>
+            <row gap="8" cross="center">
+              <text-field
+                placeholder="Paste code, or ask a technical question…"
+                on-input="chat_input_edit"
+                on-submit="send_chat"
+                grow="1" />
+              <button variant="primary" on-press="send_chat" disabled="{sendDisabled}">Send</button>
+            </row>
+          </column>
+        </row>
+      </if>
+
+      <!-- ======================= MATERIALS SCREEN ======================= -->
+      <if test="{onMaterialsScreen}">
+        <column gap="12" padding="16" grow="1">
+          <!-- Centered search. -->
+          <row gap="8" cross="center">
+            <text-field
+              placeholder="Find materials…"
+              on-input="snippet_search_edit"
+              grow="1" />
+          </row>
+
+          <row gap="16" grow="1">
+            <!-- Sidebar: Saved Materials list with sort + language filter. -->
+            <column gap="8" grow="1">
+              <row cross="center" gap="8">
+                <text size="heading" grow="1">Saved Materials</text>
+                <badge>{snippetCount}</badge>
+                <button size="sm" variant="ghost" on-press="toggle_lang_menu">{langFilterLabel}</button>
+                <button size="sm" variant="ghost" on-press="toggle_sort_menu">{sortLabel}</button>
+              </row>
+
+              <!-- SORT BY menu. -->
+              <if test="{sortMenuOpen}">
+                <column gap="2" padding="6">
+                  <status-bar>SORT BY</status-bar>
+                  <button size="sm" variant="ghost" on-press="sort_recent">Recent</button>
+                  <button size="sm" variant="ghost" on-press="sort_alphabetical">Alphabetical</button>
+                </column>
+              </if>
+
+              <!-- Language filter menu: "All" first, then the languages in use. -->
+              <if test="{langMenuOpen}">
+                <column gap="2" padding="6">
+                  <status-bar>Language</status-bar>
+                  <button size="sm" variant="ghost" on-press="clear_lang_filter">All</button>
+                  <for each="languageList" key="name" as="l">
+                    <button size="sm" variant="ghost" on-press="set_lang_filter:{l.filterIndex}">{l.name}</button>
+                  </for>
+                </column>
+              </if>
+
+              <if test="{hasSnippets}">
+                <column gap="4">
+                  <for each="snippetList" key="id" as="s">
+                    <column gap="2" padding="8" on-press="select_snippet:{s.id}">
+                      <text>{s.title}</text>
+                      <status-bar>{s.cardBlurb}</status-bar>
+                    </column>
+                  </for>
+                </column>
+              </if>
+              <if test="{noSnippets}">
+                <status-bar>No materials yet. Save a snippet from a chat, or add one with + New.</status-bar>
+              </if>
+
+              <button variant="primary" size="sm" on-press="open_new_snippet">+ New</button>
+            </column>
+
+            <!-- Main panel: the selected material. -->
+            <column gap="8" grow="1">
+              <if test="{snippetSelected}">
+                <column gap="8" grow="1">
+                  <row cross="center" gap="8">
+                    <text size="heading" grow="1">{selectedTitle}</text>
+                    <button size="sm" variant="ghost" on-press="open_lang_modal">{selectedLanguageLabel}</button>
+                    <button size="sm" variant="ghost" on-press="open_edit_snippet">Edit</button>
+                    <button size="sm" variant="ghost" on-press="copy_snippet">Copy</button>
+                    <button size="sm" variant="ghost" on-press="delete_snippet">Delete</button>
+                  </row>
+                  <row gap="8" cross="center">
+                    <button size="sm" variant="secondary" on-press="start_copilot_chat">Start Copilot Chat</button>
+                  </row>
+
+                  <code source="{selectedContent}" line-numbers="true" />
+
+                  <!-- All Context: Annotations + Text Expander. -->
+                  <text size="heading">All Context</text>
+                  <column gap="2" padding="8">
+                    <status-bar>ANNOTATIONS</status-bar>
+                    <text>{selectedAnnotation}</text>
+                  </column>
+                  <column gap="2" padding="8">
+                    <status-bar>TEXT EXPANDER</status-bar>
+                    <text>{selectedTextExpander}</text>
+                  </column>
+                </column>
+              </if>
+              <if test="{noSnippetSelected}">
+                <status-bar>Select a material to view it, or create one with + New.</status-bar>
+              </if>
+            </column>
+          </row>
+
+          <status-bar>{snippetStatus}</status-bar>
+        </column>
+      </if>
     </column>
   </if>
 
@@ -242,5 +282,131 @@
     </column>
   </if>
 
-  <status-bar>{dataDirText}</status-bar>
+  <!-- ========================= SETTINGS MODAL ========================== -->
+  <if test="{settingsOpen}">
+    <column gap="12" padding="20" grow="1">
+      <row cross="center" gap="8">
+        <button size="sm" variant="ghost" on-press="close_settings">Close</button>
+        <text size="display" grow="1">Settings</text>
+      </row>
+
+      <row gap="20" grow="1">
+        <!-- Left nav. -->
+        <column gap="4" padding="8">
+          <button size="sm" variant="ghost" on-press="settings_all">All</button>
+          <button size="sm" variant="ghost" on-press="settings_about">About</button>
+          <button size="sm" variant="ghost" on-press="settings_mcp">Model Context Protocol (MCP)</button>
+          <button size="sm" variant="ghost" on-press="settings_local_model">Local Model</button>
+        </column>
+
+        <!-- Right pane, section-gated. -->
+        <scroll grow="1">
+          <column gap="16" grow="1">
+
+            <!-- About. -->
+            <if test="{settingsAbout}">
+              <column gap="6" padding="12">
+                <status-bar>SETTINGS APPLET</status-bar>
+                <text>Version</text>
+                <text>{appVersionText}</text>
+                <status-bar>Data folder (all Blocks data lives here — back this up):</status-bar>
+                <status-bar>{dataDirText}</status-bar>
+                <row cross="center" gap="8">
+                  <text grow="1">Start Blocks at login</text>
+                  <button size="sm" variant="ghost" on-press="toggle_login">{loginToggleLabel}</button>
+                </row>
+              </column>
+            </if>
+
+            <!-- Watched Repositories (moved out of the chat screen). -->
+            <if test="{settingsRepos}">
+              <column gap="6" padding="12">
+                <text size="heading">Watched Repositories</text>
+                <text>Blocks indexes the git history and file changes of the repositories you watch.</text>
+                <row gap="8" cross="center">
+                  <text-field
+                    placeholder="/path/to/your/repo"
+                    on-input="repo_input_edit"
+                    on-submit="add_repo_clicked"
+                    grow="1" />
+                  <button variant="primary" on-press="add_repo_clicked" disabled="{isAddingRepo}">Add</button>
+                </row>
+                <if test="{repoError}">
+                  <text>{repoError}</text>
+                </if>
+                <column gap="4">
+                  <for each="reposSlice" key="id" as="r">
+                    <row gap="8" padding="8" cross="center">
+                      <column grow="1" gap="2">
+                        <text>{r.name}</text>
+                        <status-bar>{r.path}</status-bar>
+                      </column>
+                      <button size="sm" variant="ghost" on-press="remove_repo:{r.id}">Remove</button>
+                    </row>
+                  </for>
+                </column>
+              </column>
+            </if>
+
+            <!-- Model Context Protocol. -->
+            <if test="{settingsMcp}">
+              <column gap="6" padding="12">
+                <status-bar>MODEL CONTEXT PROTOCOL (MCP)</status-bar>
+                <text>Server URLs</text>
+                <row cross="center" gap="8">
+                  <code source="{mcpUrlText}" />
+                  <button size="sm" variant="ghost" on-press="copy_mcp_url">Copy</button>
+                </row>
+                <status-bar>Local runtime (OpenAI-compatible):</status-bar>
+                <row cross="center" gap="8">
+                  <code source="{llamaUrlText}" />
+                  <button size="sm" variant="ghost" on-press="copy_llama_url">Copy</button>
+                </row>
+              </column>
+            </if>
+
+            <!-- Local Model picker. -->
+            <if test="{settingsLocalModel}">
+              <column gap="8" padding="12">
+                <text size="heading">Local Model</text>
+                <text>Blocks chats with a model that runs entirely on your machine.</text>
+                <column gap="10">
+                  <for each="modelChoices" key="index" as="m">
+                    <column gap="6" padding="12" on-press="select_model:{m.index}">
+                      <row cross="center" gap="8">
+                        <text grow="1">{m.name}</text>
+                        <if test="{m.recommended}">
+                          <badge>Recommended</badge>
+                        </if>
+                        <badge>{m.tierLabel}</badge>
+                      </row>
+                      <text>{m.blurb}</text>
+                      <row gap="12" cross="center">
+                        <status-bar>{m.sizeLabel}</status-bar>
+                        <if test="{m.hasRam}">
+                          <status-bar>{m.ramLabel}</status-bar>
+                        </if>
+                        <status-bar grow="1"></status-bar>
+                        <if test="{m.selected}">
+                          <badge>Selected</badge>
+                        </if>
+                      </row>
+                    </column>
+                  </for>
+                </column>
+                <row gap="8" cross="center">
+                  <status-bar grow="1">{modelStatusText}</status-bar>
+                  <if test="{canDownload}">
+                    <button variant="primary" size="sm" on-press="download_model">Download</button>
+                  </if>
+                </row>
+              </column>
+            </if>
+
+          </column>
+        </scroll>
+      </row>
+    </column>
+  </if>
+
 </column>
