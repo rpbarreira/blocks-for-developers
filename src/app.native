@@ -36,31 +36,31 @@
       <if test="{onPickModelStep}">
         <column gap="12" grow="1">
           <text size="heading">Pick a local model</text>
-          <text>Blocks for Developers runs on a model that lives on your machine. We've recommended the most capable one your computer can run — download it, or pick another.</text>
+          <!-- Wrap the subtitle so the full sentence is readable (not a
+               single truncated line). -->
+          <text wrap="true">Blocks for Developers runs on a model that lives on your machine. We've recommended the most capable one your computer can run — download it, or pick another.</text>
 
           <scroll grow="1">
-            <column gap="10">
+            <column gap="8">
               <for each="modelChoices" key="index" as="m">
-                <column gap="6" padding="14" on-press="select_model:{m.index}">
-                  <row cross="center" gap="8">
-                    <text size="heading" grow="1">{m.name}</text>
-                    <if test="{m.recommended}">
-                      <badge>Recommended</badge>
-                    </if>
-                    <badge>{m.tierLabel}</badge>
-                  </row>
-                  <text>{m.blurb}</text>
-                  <row gap="12" cross="center">
-                    <status-bar>{m.sizeLabel}</status-bar>
-                    <if test="{m.hasRam}">
-                      <status-bar>{m.ramLabel}</status-bar>
-                    </if>
-                    <status-bar grow="1"></status-bar>
-                    <if test="{m.selected}">
-                      <badge>Selected</badge>
-                    </if>
-                  </row>
-                </column>
+                <!-- Each option is a card; the SELECTED one is bordered
+                     (via `selected`), the others rest quiet. Tapping a card
+                     selects that model. Kept compact (tight padding + a
+                     single caption row for size/RAM) so all three fit
+                     without scrolling. -->
+                <card selected="{m.selected}" on-press="select_model:{m.index}">
+                  <column gap="4" padding="10">
+                    <row cross="center" gap="8">
+                      <text size="heading" grow="1">{m.name}</text>
+                      <if test="{m.recommended}">
+                        <badge>Recommended</badge>
+                      </if>
+                      <badge>{m.tierLabel}</badge>
+                    </row>
+                    <text wrap="true">{m.blurb}</text>
+                    <text>{m.specLine}</text>
+                  </column>
+                </card>
               </for>
             </column>
           </scroll>

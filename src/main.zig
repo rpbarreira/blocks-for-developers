@@ -296,6 +296,11 @@ pub const ModelChoice = struct {
     /// Inline-owned "Needs N GB RAM" label ("" when unknown).
     ram_buf: [24]u8 = undefined,
     ram_len: usize = 0,
+    /// Inline-owned one-line spec caption combining size + RAM, e.g.
+    /// "1.7 GB · Needs 8 GB RAM" (just the size when RAM is unknown). Kept
+    /// as ONE line so a card stays compact (all three fit without scroll).
+    spec_buf: [48]u8 = undefined,
+    spec_len: usize = 0,
 
     pub fn sizeLabel(self: *const ModelChoice) []const u8 {
         return self.size_buf[0..self.size_len];
@@ -305,6 +310,9 @@ pub const ModelChoice = struct {
     }
     pub fn hasRam(self: *const ModelChoice) bool {
         return self.ram_len > 0;
+    }
+    pub fn specLine(self: *const ModelChoice) []const u8 {
+        return self.spec_buf[0..self.spec_len];
     }
 };
 
@@ -597,6 +605,13 @@ pub const Model = struct {
             choice.size_len = size.len;
             const ram = models.formatRam(&choice.ram_buf, m.min_ram_bytes);
             choice.ram_len = ram.len;
+            // One-line caption: "<size> · <ram>" (or just the size when RAM
+            // is unknown). Built from the two labels just computed.
+            const spec = if (ram.len > 0)
+                std.fmt.bufPrint(&choice.spec_buf, "{s} · {s}", .{ size, ram }) catch size
+            else
+                std.fmt.bufPrint(&choice.spec_buf, "{s}", .{size}) catch size;
+            choice.spec_len = spec.len;
             self.model_choices[i] = choice;
         }
     }
