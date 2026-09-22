@@ -188,7 +188,7 @@ const welcome_blurb =
     "and store materials that help you be more productive.";
 
 /// Which settings section is open in the Settings modal (mockup 3).
-const SettingsSection = enum { all, about, mcp, local_model };
+const SettingsSection = enum { all, about, repos, mcp, local_model };
 /// Whole-exchange timeout for the streamed completion (a long reply on a
 /// small local model can still take a while); the stream lifetime counts.
 const chat_stream_timeout_ms: u32 = 120_000;
@@ -801,8 +801,8 @@ pub const Model = struct {
         return self.settings_section == .local_model or self.settings_section == .all;
     }
     pub fn settingsRepos(self: *const Model) bool {
-        // Watched Repositories live under the "All" and "About" sections.
-        return self.settings_section == .all or self.settings_section == .about;
+        // Watched Repositories are their own section (also shown under "All").
+        return self.settings_section == .all or self.settings_section == .repos;
     }
     /// The app version string, shown in Settings › About (mockup 3).
     pub fn appVersionText(self: *const Model) []const u8 {
@@ -1158,10 +1158,12 @@ pub const Msg = union(enum) {
     close_settings, // close the Settings modal
     settings_all, // Settings nav: All
     settings_about, // Settings nav: About
+    settings_repos, // Settings nav: Watched Repositories
     settings_mcp, // Settings nav: Model Context Protocol
     settings_local_model, // Settings nav: Local Model
     copy_mcp_url, // copy the MCP server URL to the clipboard
     copy_llama_url, // copy the runtime URL to the clipboard
+    copy_data_dir, // copy the app-data folder path to the clipboard
     url_clip_done: native_sdk.EffectClipboardResult, // URL clipboard write result
     config_persisted: native_sdk.EffectFileResult, // config.json rewrite (model/onboarding)
 
@@ -1241,8 +1243,9 @@ pub const Msg = union(enum) {
         // now that Watched Repositories lives only in the settings window.)
         "url_clip_done",   "config_persisted",
         "close_settings",  "settings_all",       "settings_about",
-        "settings_mcp",    "settings_local_model", "copy_mcp_url",
-        "copy_llama_url",  "download_model",
+        "settings_repos",  "settings_mcp",       "settings_local_model",
+        "copy_mcp_url",
+        "copy_llama_url",  "copy_data_dir",      "download_model",
         "repo_input_edit", "add_repo_clicked",   "remove_repo",
     };
 };
@@ -1489,6 +1492,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .close_settings => model.settings_open = false,
         .settings_all => model.settings_section = .all,
         .settings_about => model.settings_section = .about,
+        .settings_repos => model.settings_section = .repos,
         .settings_mcp => model.settings_section = .mcp,
         .settings_local_model => model.settings_section = .local_model,
         .copy_mcp_url => fx.writeClipboard(.{
@@ -1499,6 +1503,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .copy_llama_url => fx.writeClipboard(.{
             .key = key_snip_clip,
             .text = llama_url,
+            .on_result = Effects.clipboardMsg(.url_clip_done),
+        }),
+        .copy_data_dir => fx.writeClipboard(.{
+            .key = key_snip_clip,
+            .text = model.data_dir,
             .on_result = Effects.clipboardMsg(.url_clip_done),
         }),
         .url_clip_done => |res| {
@@ -2890,11 +2899,10 @@ fn badge(ui: *BlocksApp.Ui, text: []const u8) BlocksApp.Ui.Node {
 /// is active.
 fn settingsNavRow(ui: *BlocksApp.Ui, label: []const u8, active: bool, msg: Msg) BlocksApp.Ui.Node {
     return ui.button(.{
-        .variant = .ghost,
+        .variant = if (active) .secondary else .ghost,
         .selected = active,
         .on_press = msg,
         .grow = 1,
-        .main = .start,
     }, label);
 }
 
@@ -2936,21 +2944,26 @@ fn blocksWindowView(ui: *BlocksApp.Ui, model: *const Model, window_label: []cons
     const nav = ui.column(.{ .gap = 4, .padding = 8, .width = 240 }, .{
         settingsNavRow(ui, "All", model.settings_section == .all, .settings_all),
         settingsNavRow(ui, "About", model.settings_section == .about, .settings_about),
+        settingsNavRow(ui, "Watched Repositories", model.settings_section == .repos, .settings_repos),
         settingsNavRow(ui, "Model Context Protocol (MCP)", model.settings_section == .mcp, .settings_mcp),
         settingsNavRow(ui, "Local Model", model.settings_section == .local_model, .settings_local_model),
     });
 
     // --- Right pane sections (each gated so "All" shows everything) ---
-    var panes: [4]BlocksApp.Ui.Node = undefined;
+    var panes: [5]BlocksApp.Ui.Node = undefined;
     var pn: usize = 0;
 
     if (model.settingsAbout()) {
         panes[pn] = ui.column(.{ .gap = 6, .padding = 12 }, .{
-            ui.statusBar(.{}, "SETTINGS APPLET"),
             ui.text(.{}, "Version"),
             ui.text(.{ .size = .heading }, model.appVersionText()),
-            ui.statusBar(.{}, "Data folder (all Blocks data lives here — back this up):"),
-            ui.statusBar(.{}, model.dataDirText()),
+            ui.spacer(12),
+            ui.text(.{}, "Data folder (all Blocks data lives here — back this up):"),
+            ui.row(.{ .cross = .center, .gap = 8 }, .{
+                ui.statusBar(.{ .grow = 1 }, model.dataDirText()),
+                ui.button(.{ .variant = .ghost, .size = .sm, .on_press = .copy_data_dir }, "Copy"),
+            }),
+            ui.spacer(12),
             ui.row(.{ .cross = .center, .gap = 8 }, .{
                 ui.text(.{ .grow = 1 }, "Start Blocks at login"),
                 ui.button(.{ .variant = .ghost, .on_press = .toggle_login }, model.loginToggleLabel()),
@@ -3013,10 +3026,7 @@ fn blocksWindowView(ui: *BlocksApp.Ui, model: *const Model, window_label: []cons
     });
 
     return ui.column(.{ .gap = 12, .padding = 20, .grow = 1 }, .{
-        ui.row(.{ .cross = .center, .gap = 8 }, .{
-            ui.button(.{ .variant = .ghost, .size = .sm, .on_press = .close_settings }, "Close"),
-            ui.text(.{ .size = .display, .grow = 1 }, "Settings"),
-        }),
+        ui.text(.{ .size = .heading }, "Settings"),
         body,
     });
 }
