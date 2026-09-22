@@ -176,7 +176,10 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
   `settings_section` + the `needsOnboarding`/`onWelcomeStep`/`settings*`/`appVersionText`/
   `mcpUrlText`/`llamaUrlText`/`loginToggleLabel` accessors; `persistConfig` (key 200)
   rewrites config.json for a model change / onboarding completion WITHOUT re-running
-  the first-run arm.
+  the first-run arm. SETTINGS WINDOW (Task 13): `blocksWindows` (windows_fn) declares a
+  SECONDARY OS window when `settings_open`, and `blocksWindowView` (window_view) builds
+  its tree in Zig with the `Ui.*` builders (markup binds only the main canvas). Wired
+  into `BlocksApp.create` via `.windows_fn`/`.window_view`.
 - **config.zig** — PURE, unit-tested. `Paths.resolve(alloc, bundle_id, lookup)`
   -> `{data_dir, db, models, config}` via `native_sdk.app_dirs` (macOS `.data` =
   `<HOME>/Library/Application Support/<bundle_id>`). `detectUsername(lookup, home)`
@@ -349,12 +352,14 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
 - **tests.zig** — test root: `comptime { _ = @import("config.zig"); ...db, repos... }`
   plus markup-builds and update-arm tests. Run via `native test --yes`.
 - **schema/0001_initial_schema.sql** + **schema/migrations.lock.json** — see below.
-- **app.native** — the full app shell (Task 13): a `<if needsOnboarding>` onboarding
+- **app.native** — the MAIN-window shell (Task 13): a `<if needsOnboarding>` onboarding
   overlay (welcome splash + pick-a-local-model), the main app (`<if onboarded>`) with a
-  header (Chat/Materials nav + Settings gear), a Chat screen (sidebar + single-click
-  summary cards + transcript + composer), a Materials screen, and a `<if settingsOpen>`
-  Settings modal (About / MCP / Local Model + Watched Repositories). Editor sheet +
-  set-language modal are still `<if>`-gated panels.
+  header (Chat/Materials nav + a Settings button), a Chat screen (sidebar + single-click
+  summary cards + transcript + composer), and a Materials screen. Editor sheet +
+  set-language modal are still `<if>`-gated panels. The SETTINGS UI is NOT here — it's a
+  SEPARATE OS window built in Zig (`window_view`/`windows_fn` in main.zig), because a
+  UiApp binds markup to exactly ONE canvas (the main window). The header "Settings"
+  button just dispatches `open_settings`.
 - **assets/icons/sparkle.svg** (embedded from `src/assets/icons/`) — the welcome-splash
   sparkle, parsed at comptime (`canvas.svg_icon.parseComptime`), registered as
   `app:sparkle` via `pub const app_icons` + `canvas.icons.registerAppIcons(&app_icons)`
@@ -1404,11 +1409,16 @@ needsOnboarding>`):
    `onboard_finish`: sets `onboarded=true`, `persistConfig`, and (if the model isn't on
    disk) `startDownload`, then drops into the app.
 
-**Settings modal** (`app.native` `<if settingsOpen>`, mockup 3): opened by the header
-gear (`open_settings`), closed by `close_settings`. A left nav (`settings_all`/
-`settings_about`/`settings_mcp`/`settings_local_model` -> `SettingsSection`) drives which
-pane shows; the `settings*` accessors are written so `all` shows EVERY pane and a
-specific section narrows to one (`settingsAbout` = `all|about`, etc.). Panes:
+**Settings — a SEPARATE OS window** (mockup 3; updated after the first inline-modal
+pass). It is NOT an inline `<if>` overlay: the header "Settings" button dispatches
+`open_settings` (`settings_open = true`), `blocksWindows` (a UiApp `windows_fn`) then
+declares a secondary 900x640 window, and `blocksWindowView` (a `window_view`) builds its
+canvas tree in Zig (a UiApp binds MARKUP to only ONE canvas — the main window — so a
+second window's content must be Zig-built with the `Ui.*` builders). A left nav
+(`settings_all`/`settings_about`/`settings_mcp`/`settings_local_model` ->
+`SettingsSection`) drives which pane shows; the `settings*` accessors are written so
+`all` shows EVERY pane and a specific section narrows to one (`settingsAbout` =
+`all|about`, etc.). Panes:
 - ABOUT: "Version" `{appVersionText}` (= `app_version`), the data-dir path
   `{dataDirText}` (for backup — the locked "Settings shows the data path" decision), and
   a "Start Blocks at login" row wired to the existing `toggle_login` (label `On`/`Off`
@@ -1474,8 +1484,42 @@ refreshed model contract).
   paragraph, constrain the parent (`max-width`) — otherwise it wraps at the window edge
   with each line left-hugging.
 - **Modals stay `<if test>`-gated panels** (no dedicated dialog element used): the
-  onboarding overlay, Settings modal, editor sheet, and set-language modal are all plain
-  conditional subtrees, so their open state is testable Model state.
+  onboarding overlay, editor sheet, and set-language modal are all plain conditional
+  subtrees, so their open state is testable Model state. (The Settings UI is the
+  exception — it's a separate OS window, see below.)
+
+### The Settings window — a model-declared SECONDARY OS window (Task 13)
+The Settings UI opens in its OWN native window (per the mockup / the user's request),
+not an in-canvas overlay. The SDK mechanism (see `runtime/ui_app.zig` +
+`runtime/ui_app_window_tests.zig`):
+- A `UiApp(Model, Msg)` binds MARKUP to exactly ONE canvas (the main window). Secondary
+  windows are declared by `Options.windows_fn(model, scratch) -> []WindowDescriptor`
+  (PRESENCE in the returned slice IS liveness — the runtime reconciles declared vs live
+  windows after every rebuild) and their canvas tree is built in Zig by
+  `Options.window_view(ui, model, window_label)`. There is NO second markup file for a
+  window; `blocksWindowView` uses the `Ui.*` builders (`ui.column/row/scroll/text/
+  button/statusBar`, `ui.el(.card, …)`, `ui.el(.badge, …)`, `ui.each(items, key_fn,
+  view_fn)`).
+- Open = the `open_settings` Msg sets `settings_open = true`; the next rebuild's
+  `windows_fn` declares the window; the runtime creates it. Close = `close_settings`
+  clears the flag (also the `WindowDescriptor.on_close` for the user's native close),
+  the reconcile closes the window.
+
+**THE REINSTALL GOTCHA (and the fix).** Re-declaring a window under the SAME
+`canvas_label` after a close does NOT re-install its canvas in a live GPU session — the
+recreated window's install frame never arrives, so a reopen renders a BLANK canvas
+(0 widgets). Diagnosed by logging `settings_open` in `windows_fn`: the model flag
+round-trips correctly (false->true->false->true), so it's a runtime reconcile edge, not
+model logic. `close_policy = .quit` and `.hide` both hit it; a persistent-declaration +
+`fx.showWindow`/`fx.hideWindow` approach reopened fine but the window FLASHED at launch
+(the `windows_fn` create wins over an `initFx` `hideWindow`). THE FIX: keep presence-
+based declaration (no launch flash) but hand the window a FRESH canvas label each open —
+`settings-canvas-<n>`, where `n` is a `settings_open_count` bumped in the `open_settings`
+arm (`refreshSettingsCanvasLabel` writes `settings_canvas_buf`; `windows_fn` reads
+`settingsCanvasLabel()`). A new label = a clean install, so every reopen renders. The
+`window_view` is keyed by the WINDOW label, so the varying canvas label is invisible to
+it. (A closed `.quit` window's empty shell may briefly linger before the OS releases it
+— benign; the SDK's own window test explicitly tolerates a lingering `!open` shell.)
 
 ### VERIFIED END-TO-END via automation (+ the boot bug found and fixed live)
 Driven live (`native dev --yes -Dautomation=true` with `BLOCKS_LLAMA_SERVER`, real
@@ -1489,11 +1533,16 @@ confirmed against the widget snapshot + `app.db`/config:
 - The 1.5B model was detected present -> button flipped to "Continue"; clicking it wrote
   `onboarded: true` to config and dropped into the main app (header + chat sidebar +
   summary cards + composer).
-- SETTINGS: opened from the gear; About showed Version `0.1.0` + the real data-dir path +
-  the login toggle; selecting "Local Model" hid Watched Repositories (section narrowing);
-  the MCP pane showed both loopback URLs and the first Copy button put
-  `http://127.0.0.1:39017/` on the REAL macOS clipboard (`pbpaste` confirmed); Close
-  dismissed the modal; Materials still rendered.
+- SETTINGS (re-verified after moving it to a separate window): clicking the header
+  "Settings" opened a genuine SECOND OS window (`window @w2 "Settings" 900x640` with its
+  own `settings-canvas-<n>` gpu surface, confirmed in the automation snapshot's window
+  list) — and NO settings window exists at launch. The left nav's "All" showed Version
+  `0.1.0` + the real data-dir path + the login toggle + Watched Repositories (the current
+  repo listed) + the MCP URLs; selecting "Local Model" / "MCP" narrowed to that section;
+  the MCP Copy button put `http://127.0.0.1:39017/` on the REAL macOS clipboard (`pbpaste`
+  confirmed). Open -> close -> reopen all rendered (72 widgets each open; 0 after close) —
+  the fresh-canvas-label fix. The on-screen visibility (hidden at launch / after close)
+  was confirmed by the user, since automation enumerates hidden windows too.
 
 **The bug the live run surfaced (fixed in this change):** the app booted straight into
 the main screen even with `config.json` `"onboarded": false`, because the Task 1

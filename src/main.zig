@@ -206,6 +206,11 @@ const host_login_set = "native-sdk.launch-at-login.set";
 /// The window label the tray "Open Blocks" action reveals. Matches the
 /// `shell_windows` entry below.
 const main_window_label = "main";
+/// The Settings window (Task 13): a model-declared SECONDARY OS window
+/// (opened via `windows_fn` when `settings_open`, built by `window_view`).
+/// Its canvas label MUST be distinct from the main canvas.
+const settings_window_label = "settings";
+const settings_canvas_label = "settings-canvas";
 // Timer keys live in their OWN namespace (never collide with the above).
 const key_snap_timer: u64 = 1; // the repeating scan/debounce tick
 const key_mcp_health_timer: u64 = 2; // one-shot delay before the MCP health check
@@ -342,9 +347,17 @@ pub const Model = struct {
     onboarded: bool = false,
     /// Which onboarding step is showing while `!onboarded` (Task 13).
     onboard_step: OnboardStep = .welcome,
-    /// Settings modal open state + which section is selected (Task 13).
+    /// Settings window open state + which section is selected (Task 13).
     settings_open: bool = false,
     settings_section: SettingsSection = .all,
+    /// Bumped on each Settings OPEN so the window gets a fresh canvas label
+    /// (`settings-canvas-<n>`) — a re-declare under the same label doesn't
+    /// re-install the canvas in a live session, so each open is a new one.
+    settings_open_count: u32 = 0,
+    /// Inline storage for the current `settings-canvas-<n>` label, (re)written
+    /// by `refreshSettingsCanvasLabel` on each open. `windows_fn` reads it.
+    settings_canvas_buf: [40]u8 = undefined,
+    settings_canvas_len: usize = 0,
     /// Detected OS username, shown next to the avatar. Borrowed from the
     /// process-lifetime boot arena.
     username: []const u8 = "developer",
@@ -765,6 +778,19 @@ pub const Model = struct {
     pub fn settingsOpen(self: *const Model) bool {
         return self.settings_open;
     }
+    /// The current Settings-window canvas label (`settings-canvas-<n>`),
+    /// read by `windows_fn`. Falls back to the base label before the first
+    /// open (count 0).
+    pub fn settingsCanvasLabel(self: *const Model) []const u8 {
+        if (self.settings_canvas_len == 0) return settings_canvas_label;
+        return self.settings_canvas_buf[0..self.settings_canvas_len];
+    }
+    /// Rewrite `settings_canvas_buf` to `settings-canvas-<open_count>`; called
+    /// from the `open_settings` arm (which owns a mutable Model).
+    fn refreshSettingsCanvasLabel(self: *Model) void {
+        const s = std.fmt.bufPrint(&self.settings_canvas_buf, "{s}-{d}", .{ settings_canvas_label, self.settings_open_count }) catch settings_canvas_label;
+        self.settings_canvas_len = s.len;
+    }
     pub fn settingsAbout(self: *const Model) bool {
         return self.settings_section == .about or self.settings_section == .all;
     }
@@ -1018,10 +1044,19 @@ pub const Model = struct {
         // per-turn update state; `summaryDisabled` is retained for tests
         // (the Task 13 cards are tappable columns gated in `startSummary`).
         "pending_summary_kind", "summaryDisabled",
-        // Onboarding + Settings (Task 13). The accessors (needsOnboarding,
-        // onWelcomeStep, settingsOpen, appVersionText, …) are bound in
-        // markup; these are the update-only enum/flag fields.
+        // Onboarding + Settings (Task 13). needsOnboarding/onWelcomeStep/
+        // onPickModelStep/welcomeBlurb/installLabel/installDisabled are bound
+        // in the onboarding markup; the SETTINGS accessors below are read
+        // only by the Zig-built settings WINDOW (`window_view` in main.zig),
+        // not markup — so they live here alongside the update-only fields.
         "onboard_step",         "settings_open",       "settings_section",
+        "settings_open_count",  "settings_canvas_buf", "settings_canvas_len",
+        "settingsOpen",         "settingsAbout",       "settingsMcp",
+        "settingsLocalModel",   "settingsRepos",       "appVersionText",
+        "mcpUrlText",           "llamaUrlText",        "loginToggleLabel",
+        "dataDirText",          "repoError",           "isAddingRepo",
+        "reposSlice",           "canDownload",         "settingsCanvasLabel",
+        "refreshSettingsCanvasLabel",
         // Navigation + Materials / snippets (Task 12). The list/menu/editor
         // accessors are bound in markup; these are the update/effect-only
         // fields + the text-field buffers (driven via on-input, not bound).
@@ -1195,10 +1230,20 @@ pub const Msg = union(enum) {
         "snippets_listed",  "languages_listed",  "snippet_clip_done",
         "snippet_inserted", "snippet_rowid_done", "snippet_write_done",
         "snippet_detail_loaded",
-        // Task 13 effect-delivered arms (onboard_next/onboard_finish/
-        // open_settings/close_settings/settings_*/copy_*_url ARE bound as
-        // markup handlers, so they are intentionally omitted).
-        "url_clip_done", "config_persisted",
+        // Task 13. onboard_next/onboard_finish/open_settings are bound in
+        // the main markup; the SETTINGS-window controls (close_settings,
+        // settings_all/about/mcp/local_model, copy_*_url, download_model,
+        // toggle_login, and the repos add/remove/input Msgs) are dispatched
+        // from the Zig-built settings window (`window_view`), not markup, so
+        // they're listed here. url_clip_done/config_persisted are effect
+        // results. (toggle_login was already listed above under Task 6;
+        // add_repo_clicked/repo_input_edit/remove_repo move here from Task 3
+        // now that Watched Repositories lives only in the settings window.)
+        "url_clip_done",   "config_persisted",
+        "close_settings",  "settings_all",       "settings_about",
+        "settings_mcp",    "settings_local_model", "copy_mcp_url",
+        "copy_llama_url",  "download_model",
+        "repo_input_edit", "add_repo_clicked",   "remove_repo",
     };
 };
 
@@ -1431,7 +1476,16 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             persistConfig(model, fx);
             if (!model.model_present and !model.downloading) startDownload(model, fx);
         },
-        .open_settings => model.settings_open = true,
+        .open_settings => {
+            // Bump the open counter so `blocksWindows` hands the window a
+            // fresh canvas label (`settings-canvas-<n>`) — a clean install
+            // each time (see the note in `blocksWindows`).
+            if (!model.settings_open) {
+                model.settings_open_count +%= 1;
+                model.refreshSettingsCanvasLabel();
+            }
+            model.settings_open = true;
+        },
         .close_settings => model.settings_open = false,
         .settings_all => model.settings_section = .all,
         .settings_about => model.settings_section = .about,
@@ -2789,6 +2843,205 @@ fn onTrayCommand(name: []const u8) ?Msg {
     return null;
 }
 
+// ---------------------------------------------- Settings window (Task 13)
+
+/// Declare the model-declared secondary windows that should exist RIGHT
+/// NOW. Presence in the returned slice IS liveness: the runtime creates the
+/// Settings window when `settings_open` flips true (the `open_settings` Msg)
+/// and closes it when the slice no longer contains it (`close_settings`).
+/// The user's red-button close dispatches `on_close = .close_settings`, so
+/// the model clears the flag and the reconcile does not resurrect it.
+fn blocksWindows(model: *const Model, scratch: *BlocksApp.WindowsScratch) []const BlocksApp.WindowDescriptor {
+    var count: usize = 0;
+    if (model.settings_open) {
+        scratch.windows[count] = .{
+            .label = settings_window_label,
+            // A FRESH canvas label per open (`settings-canvas-<n>`): removing
+            // the window from this slice to close it destroys its slot, and a
+            // re-declare under the SAME canvas label never re-installs the
+            // canvas in a live GPU session (the recreated window's install
+            // frame doesn't arrive) — so each open gets a NEW canvas label,
+            // which the runtime treats as a clean install. The `window_view`
+            // is keyed by the WINDOW label, so it builds regardless.
+            .canvas_label = model.settingsCanvasLabel(),
+            .title = "Settings",
+            .width = 900,
+            .height = 640,
+            .min_width = 720,
+            .min_height = 480,
+            .titlebar = .hidden_inset,
+            .close_policy = .quit,
+            .on_close = .close_settings,
+        };
+        count += 1;
+    }
+    return scratch.windows[0..count];
+}
+
+/// A small pill badge (there is no `badge` sugar on `Ui`; badge is a
+/// text-bearing widget kind).
+fn badge(ui: *BlocksApp.Ui, text: []const u8) BlocksApp.Ui.Node {
+    var node = ui.el(.badge, .{}, .{});
+    node.widget.text = text;
+    return node;
+}
+
+/// One left-nav row: a ghost button that reads as selected when its section
+/// is active.
+fn settingsNavRow(ui: *BlocksApp.Ui, label: []const u8, active: bool, msg: Msg) BlocksApp.Ui.Node {
+    return ui.button(.{
+        .variant = .ghost,
+        .selected = active,
+        .on_press = msg,
+        .grow = 1,
+        .main = .start,
+    }, label);
+}
+
+/// One model card in the Settings › Local Model picker (mirrors the
+/// onboarding card: name at heading, badges, blurb, spec caption, bordered
+/// when selected, tapping selects).
+fn settingsModelCard(ui: *BlocksApp.Ui, choice: *const ModelChoice) BlocksApp.Ui.Node {
+    var header_children: [3]BlocksApp.Ui.Node = undefined;
+    var hc: usize = 0;
+    header_children[hc] = ui.text(.{ .size = .heading, .grow = 1 }, choice.name);
+    hc += 1;
+    if (choice.recommended) {
+        header_children[hc] = badge(ui, "Recommended");
+        hc += 1;
+    }
+    header_children[hc] = badge(ui, choice.tierLabel);
+    hc += 1;
+
+    return ui.el(.card, .{
+        .selected = choice.selected,
+        .on_press = .{ .select_model = choice.index },
+    }, .{
+        ui.column(.{ .gap = 2, .padding = 8 }, .{
+            ui.row(.{ .cross = .center, .gap = 8 }, header_children[0..hc]),
+            ui.text(.{ .wrap = true }, choice.blurb),
+            ui.text(.{}, choice.specLine()),
+        }),
+    });
+}
+
+/// Build the Settings window's canvas tree (Task 13). A left nav (All /
+/// About / MCP / Local Model, the active row highlighted) + a right scroll
+/// pane; "All" shows every section, a specific choice narrows to one. Driven
+/// by the SAME Model/Msg/update loop as the main window.
+fn blocksWindowView(ui: *BlocksApp.Ui, model: *const Model, window_label: []const u8) BlocksApp.Ui.Node {
+    std.debug.assert(std.mem.eql(u8, window_label, settings_window_label));
+
+    // --- Left nav ---
+    const nav = ui.column(.{ .gap = 4, .padding = 8, .width = 240 }, .{
+        settingsNavRow(ui, "All", model.settings_section == .all, .settings_all),
+        settingsNavRow(ui, "About", model.settings_section == .about, .settings_about),
+        settingsNavRow(ui, "Model Context Protocol (MCP)", model.settings_section == .mcp, .settings_mcp),
+        settingsNavRow(ui, "Local Model", model.settings_section == .local_model, .settings_local_model),
+    });
+
+    // --- Right pane sections (each gated so "All" shows everything) ---
+    var panes: [4]BlocksApp.Ui.Node = undefined;
+    var pn: usize = 0;
+
+    if (model.settingsAbout()) {
+        panes[pn] = ui.column(.{ .gap = 6, .padding = 12 }, .{
+            ui.statusBar(.{}, "SETTINGS APPLET"),
+            ui.text(.{}, "Version"),
+            ui.text(.{ .size = .heading }, model.appVersionText()),
+            ui.statusBar(.{}, "Data folder (all Blocks data lives here — back this up):"),
+            ui.statusBar(.{}, model.dataDirText()),
+            ui.row(.{ .cross = .center, .gap = 8 }, .{
+                ui.text(.{ .grow = 1 }, "Start Blocks at login"),
+                ui.button(.{ .variant = .ghost, .on_press = .toggle_login }, model.loginToggleLabel()),
+            }),
+        });
+        pn += 1;
+    }
+
+    if (model.settingsRepos()) {
+        panes[pn] = ui.column(.{ .gap = 6, .padding = 12 }, .{
+            ui.text(.{ .size = .heading }, "Watched Repositories"),
+            ui.text(.{ .wrap = true }, "Blocks indexes the git history and file changes of the repositories you watch."),
+            ui.row(.{ .cross = .center, .gap = 8 }, .{
+                ui.textField(.{ .placeholder = "/path/to/your/repo", .on_input = BlocksApp.Ui.inputMsg(.repo_input_edit), .on_submit = .add_repo_clicked, .grow = 1 }),
+                ui.button(.{ .variant = .primary, .on_press = .add_repo_clicked, .disabled = model.isAddingRepo() }, "Add"),
+            }),
+            ui.column(.{ .gap = 4 }, ui.each(model.reposSlice(), repoKey, repoRow)),
+        });
+        pn += 1;
+    }
+
+    if (model.settingsMcp()) {
+        panes[pn] = ui.column(.{ .gap = 6, .padding = 12 }, .{
+            ui.statusBar(.{}, "MODEL CONTEXT PROTOCOL (MCP)"),
+            ui.text(.{}, "Server URLs"),
+            ui.row(.{ .cross = .center, .gap = 8 }, .{
+                ui.text(.{ .grow = 1 }, model.mcpUrlText()),
+                ui.button(.{ .variant = .ghost, .size = .sm, .on_press = .copy_mcp_url }, "Copy"),
+            }),
+            ui.statusBar(.{}, "Local runtime (OpenAI-compatible):"),
+            ui.row(.{ .cross = .center, .gap = 8 }, .{
+                ui.text(.{ .grow = 1 }, model.llamaUrlText()),
+                ui.button(.{ .variant = .ghost, .size = .sm, .on_press = .copy_llama_url }, "Copy"),
+            }),
+        });
+        pn += 1;
+    }
+
+    if (model.settingsLocalModel()) {
+        panes[pn] = ui.column(.{ .gap = 8, .padding = 12 }, .{
+            ui.text(.{ .size = .heading }, "Local Model"),
+            ui.text(.{ .wrap = true }, "Blocks chats with a model that runs entirely on your machine."),
+            ui.column(.{ .gap = 8 }, ui.each(model.modelChoices(), modelChoiceKey, settingsModelCardEach)),
+            ui.row(.{ .cross = .center, .gap = 8 }, .{
+                ui.statusBar(.{ .grow = 1 }, model.modelStatusText()),
+                if (model.canDownload())
+                    ui.button(.{ .variant = .primary, .size = .sm, .on_press = .download_model }, "Download")
+                else
+                    ui.spacer(0),
+            }),
+        });
+        pn += 1;
+    }
+
+    const body = ui.row(.{ .gap = 20, .grow = 1 }, .{
+        nav,
+        ui.scroll(.{ .grow = 1 }, .{
+            ui.column(.{ .gap = 16, .grow = 1 }, panes[0..pn]),
+        }),
+    });
+
+    return ui.column(.{ .gap = 12, .padding = 20, .grow = 1 }, .{
+        ui.row(.{ .cross = .center, .gap = 8 }, .{
+            ui.button(.{ .variant = .ghost, .size = .sm, .on_press = .close_settings }, "Close"),
+            ui.text(.{ .size = .display, .grow = 1 }, "Settings"),
+        }),
+        body,
+    });
+}
+
+// Key + row builders for the `ui.each` loops above. `each` passes the *Ui
+// (self) and each item as a `*const T` pointer to the view fn.
+fn repoKey(entry: *const repos.RepoEntry) canvas.UiKey {
+    return .{ .int = @intCast(entry.id) };
+}
+fn repoRow(ui: *BlocksApp.Ui, entry: *const repos.RepoEntry) BlocksApp.Ui.Node {
+    return ui.row(.{ .gap = 8, .padding = 8, .cross = .center }, .{
+        ui.column(.{ .grow = 1, .gap = 2 }, .{
+            ui.text(.{}, entry.name()),
+            ui.statusBar(.{}, entry.path()),
+        }),
+        ui.button(.{ .variant = .ghost, .size = .sm, .on_press = .{ .remove_repo = entry.id } }, "Remove"),
+    });
+}
+fn modelChoiceKey(choice: *const ModelChoice) canvas.UiKey {
+    return .{ .index = choice.index };
+}
+fn settingsModelCardEach(ui: *BlocksApp.Ui, choice: *const ModelChoice) BlocksApp.Ui.Node {
+    return settingsModelCard(ui, choice);
+}
+
 // -------------------------------------------------- git history capture
 
 /// Begin a capture pass over the loaded repo list from the top.
@@ -3240,6 +3493,11 @@ pub fn main(init: std.process.Init) !void {
         // Menu-bar tray: a model-derived menu (Open / Start at Login / Quit).
         .status_item_fn = statusItem,
         .on_command = onTrayCommand,
+        // Settings lives in a SEPARATE OS window (Task 13): declared by
+        // `windows_fn` when `settings_open`, built by `window_view`. Markup
+        // only binds the main canvas, so the settings tree is Zig-built.
+        .windows_fn = blocksWindows,
+        .window_view = blocksWindowView,
     });
     defer app_state.destroy();
     app_state.model = initialModel();
