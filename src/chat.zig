@@ -200,6 +200,126 @@ pub const message_insert_sql =
 /// deleted mid-turn, so the greatest id is the chat we just inserted.
 pub const max_chat_id_sql = "SELECT MAX(id) FROM chats;";
 
+/// All chats, most-recently-updated first — the history sidebar list.
+/// Columns match `chat_select_columns`.
+pub const chats_list_sql =
+    "SELECT " ++ chat_select_columns ++ " FROM chats ORDER BY updated_at DESC;";
+
+/// A decoded `chats` row. Slices borrow the page bytes — copy what the model
+/// keeps (see `ChatEntry`).
+pub const Chat = struct {
+    id: i64,
+    title: []const u8,
+    preview: []const u8,
+    kind: []const u8,
+    created_at: i64,
+    updated_at: i64,
+
+    pub fn fromRow(cols: []const db.ColumnValue) ?Chat {
+        if (cols.len < 6) return null;
+        return .{
+            .id = cols[0].asInt() orelse return null,
+            .title = cols[1].asText() orelse "",
+            .preview = cols[2].asText() orelse "",
+            .kind = cols[3].asText() orelse "chat",
+            .created_at = cols[4].asInt() orelse 0,
+            .updated_at = cols[5].asInt() orelse 0,
+        };
+    }
+};
+
+/// Bounds for the model-owned chat-history list (fixed inline storage).
+pub const max_chats = 256; // history rows kept loaded for the sidebar
+pub const chat_title_bytes = title_max_bytes; // title cap (matches excerptTitle)
+pub const chat_preview_bytes = 120; // one-line preview under the title
+
+/// Coarse date bucket for grouping the history list (Today / Yesterday /
+/// Earlier). The sidebar prints a header when the bucket changes between
+/// consecutive rows (the list is ordered newest-first).
+pub const DateGroup = enum {
+    today,
+    yesterday,
+    earlier,
+
+    pub fn label(self: DateGroup) []const u8 {
+        return switch (self) {
+            .today => "TODAY",
+            .yesterday => "YESTERDAY",
+            .earlier => "EARLIER",
+        };
+    }
+};
+
+/// Classify a timestamp (Unix-ms) into a `DateGroup` relative to `now_ms`,
+/// using local-day boundaries derived from a UTC-day approximation. We only
+/// need coarse buckets, so day granularity from the epoch is sufficient and
+/// dependency-free.
+pub fn dateGroup(ts_ms: i64, now_ms: i64) DateGroup {
+    const day_ms: i64 = 24 * 60 * 60 * 1000;
+    const today_day = @divFloor(now_ms, day_ms);
+    const ts_day = @divFloor(ts_ms, day_ms);
+    const delta = today_day - ts_day;
+    if (delta <= 0) return .today;
+    if (delta == 1) return .yesterday;
+    return .earlier;
+}
+
+/// A model-owned copy of a chat-history row with inline storage, so the
+/// loaded sidebar list survives across updates without an allocator.
+pub const ChatEntry = struct {
+    id: i64 = 0,
+    kind_is_summary: bool = false,
+    /// True when this row is the currently-open chat — drives the sidebar
+    /// highlight (`card selected`). Recomputed whenever the active chat or
+    /// the list changes.
+    active: bool = false,
+    /// The coarse date bucket (computed at load time against "now").
+    group: DateGroup = .today,
+    /// True when this is the first row of its date bucket — the view prints
+    /// the group header only for these (the list is newest-first).
+    group_head: bool = false,
+    updated_at: i64 = 0,
+    title_buf: [chat_title_bytes]u8 = undefined,
+    title_len: usize = 0,
+    preview_buf: [chat_preview_bytes]u8 = undefined,
+    preview_len: usize = 0,
+
+    pub fn title(self: *const ChatEntry) []const u8 {
+        return self.title_buf[0..self.title_len];
+    }
+    pub fn preview(self: *const ChatEntry) []const u8 {
+        return self.preview_buf[0..self.preview_len];
+    }
+    /// The date-group header label to show above this row (empty unless this
+    /// row is the head of its bucket).
+    pub fn groupLabel(self: *const ChatEntry) []const u8 {
+        return if (self.group_head) self.group.label() else "";
+    }
+    /// Whether this row is the head of its date bucket (prints a header).
+    pub fn groupHead(self: *const ChatEntry) bool {
+        return self.group_head;
+    }
+    /// Whether this row has a non-empty preview line.
+    pub fn hasPreview(self: *const ChatEntry) bool {
+        return self.preview_len > 0;
+    }
+
+    pub fn fromChat(c: Chat, now_ms: i64) ChatEntry {
+        var e = ChatEntry{
+            .id = c.id,
+            .updated_at = c.updated_at,
+            .group = dateGroup(c.updated_at, now_ms),
+        };
+        e.kind_is_summary = !std.mem.eql(u8, c.kind, "chat");
+        const t = if (c.title.len > 0) c.title else "Untitled chat";
+        e.title_len = @min(t.len, chat_title_bytes);
+        @memcpy(e.title_buf[0..e.title_len], t[0..e.title_len]);
+        e.preview_len = @min(c.preview.len, chat_preview_bytes);
+        @memcpy(e.preview_buf[0..e.preview_len], c.preview[0..e.preview_len]);
+        return e;
+    }
+};
+
 pub fn messageInsertStatement(
     buf: *[5]db.Value,
     chat_id: i64,
@@ -902,6 +1022,41 @@ test "excerptTitle trims, takes the first line, and caps length" {
     try testing.expectEqualStrings("first line", excerptTitle("first line\nsecond line"));
     const long = "x" ** 200;
     try testing.expectEqual(@as(usize, title_max_bytes), excerptTitle(long).len);
+}
+
+test "dateGroup buckets by local-day delta from now" {
+    const day: i64 = 24 * 60 * 60 * 1000;
+    const now: i64 = 100 * day + (day / 2); // midday of day 100
+    try testing.expectEqual(DateGroup.today, dateGroup(now, now));
+    try testing.expectEqual(DateGroup.today, dateGroup(100 * day + 10, now));
+    try testing.expectEqual(DateGroup.yesterday, dateGroup(99 * day + 10, now));
+    try testing.expectEqual(DateGroup.earlier, dateGroup(98 * day + 10, now));
+    try testing.expectEqual(DateGroup.earlier, dateGroup(0, now));
+}
+
+test "ChatEntry.fromChat copies title/preview, flags summaries, computes group" {
+    const day: i64 = 24 * 60 * 60 * 1000;
+    const now: i64 = 100 * day;
+    const c = Chat{
+        .id = 7,
+        .title = "Work Progress Update",
+        .preview = "Neovim setup discussed.",
+        .kind = "standup",
+        .created_at = 99 * day,
+        .updated_at = 99 * day,
+    };
+    const e = ChatEntry.fromChat(c, now);
+    try testing.expectEqual(@as(i64, 7), e.id);
+    try testing.expectEqualStrings("Work Progress Update", e.title());
+    try testing.expectEqualStrings("Neovim setup discussed.", e.preview());
+    try testing.expect(e.kind_is_summary);
+    try testing.expectEqual(DateGroup.yesterday, e.group);
+
+    const plain = Chat{ .id = 8, .title = "", .preview = "", .kind = "chat", .created_at = now, .updated_at = now };
+    const pe = ChatEntry.fromChat(plain, now);
+    try testing.expectEqualStrings("Untitled chat", pe.title());
+    try testing.expect(!pe.kind_is_summary);
+    try testing.expectEqual(DateGroup.today, pe.group);
 }
 
 test "Message.fromRow decodes a messages row" {

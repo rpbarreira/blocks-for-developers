@@ -77,73 +77,151 @@
   <if test="{onboarded}">
     <column grow="1">
 
-      <!-- Top bar: avatar/username, New chat, nav, Settings gear. -->
+      <!-- A slim spacer above the top bar so the "Blocks" title clears the
+           macOS window traffic-light controls. -->
+      <column height="16" />
+
+      <!-- Top bar: title + nav. -->
       <row cross="center" gap="8" padding="12">
         <text size="heading" grow="1">Blocks</text>
-        <button size="sm" variant="secondary" on-press="show_chat">Chat</button>
-        <button size="sm" variant="secondary" on-press="show_materials">Materials</button>
+        <button size="sm" variant="ghost" on-press="show_chat">Chat</button>
+        <button size="sm" variant="ghost" on-press="show_materials">Materials</button>
         <button size="sm" variant="ghost" on-press="open_settings">Settings</button>
-        <text>{usernameText}</text>
       </row>
 
       <!-- ========================= CHAT SCREEN ========================= -->
       <if test="{onChatScreen}">
         <row gap="0" grow="1">
 
-          <!-- Left sidebar: New chat + (future) history. -->
-          <column gap="10" padding="12" grow="1">
-            <button variant="secondary" on-press="show_chat">+ New chat</button>
-            <status-bar>TODAY</status-bar>
-            <status-bar>Your conversations are saved locally.</status-bar>
+          <!-- Left sidebar: identity header + New chat + date-grouped history. -->
+          <column gap="10" padding="12" width="300" background="surface_subtle">
+
+            <!-- Panel header: avatar circle + username. -->
+            <row cross="center" gap="8">
+              <avatar>{avatarInitials}</avatar>
+              <text grow="1">{usernameText}</text>
+            </row>
+
+            <button variant="secondary" on-press="new_chat" icon="plus">New chat</button>
+
+            <!-- Chat history, newest-first. A date-group header prints above
+                 the first row of each bucket; the active chat is highlighted. -->
+            <scroll grow="1">
+              <column gap="4">
+                <if test="{hasChats}">
+                  <for each="chatList" key="id" as="c">
+                    <column gap="4">
+                      <if test="{c.groupHead}">
+                        <status-bar>{c.groupLabel}</status-bar>
+                      </if>
+                      <card selected="{c.active}" on-press="select_chat:{c.id}">
+                        <row cross="start" gap="6" padding="8">
+                          <icon name="file-text" width="14" height="14" foreground="text_muted" />
+                          <!-- Title + preview as a growing column so the
+                               title wraps to multiple lines instead of
+                               truncating (a wrappable text needs a bounded
+                               width, which the column gives it). -->
+                          <column gap="2" grow="1">
+                            <text wrap="true">{c.title}</text>
+                            <if test="{c.hasPreview}">
+                              <text size="sm" foreground="text_muted" wrap="true">{c.preview}</text>
+                            </if>
+                          </column>
+                        </row>
+                      </card>
+                    </column>
+                  </for>
+                </if>
+                <else>
+                  <status-bar>Your conversations are saved locally.</status-bar>
+                </else>
+              </column>
+            </scroll>
           </column>
 
           <!-- Main chat column. -->
           <column gap="12" padding="16" grow="1">
 
             <!-- Single-click summary cards (Task 11). -->
-            <status-bar>SINGLE-CLICK SUMMARIES</status-bar>
-            <row gap="8" cross="center">
+            <text size="sm" foreground="text_muted">SINGLE-CLICK SUMMARIES</text>
+            <row gap="12" cross="stretch">
               <for each="summaryCards" key="tag" as="c">
-                <column gap="2" padding="10" grow="1" on-press="start_summary:{c.tag}">
-                  <text>{c.label}</text>
-                  <status-bar>{c.blurb}</status-bar>
-                </column>
+                <card grow="1" on-press="start_summary:{c.tag}">
+                  <column gap="6" padding="12">
+                    <icon name="{c.icon}" width="20" height="20" foreground="accent" />
+                    <text>{c.label}</text>
+                    <text size="sm" foreground="text_muted" wrap="true">{c.blurb}</text>
+                  </column>
+                </card>
               </for>
             </row>
 
-            <!-- Conversation transcript. Each message offers Save to Snippets. -->
+            <!-- Conversation title (shown once a chat is active). -->
+            <if test="{hasChatTitle}">
+              <text size="heading">{chatTitleText}</text>
+            </if>
+
+            <!-- Conversation transcript. User messages are right-aligned blue
+                 bubbles with an avatar; assistant replies are left-aligned
+                 plain text with a bot glyph. Each message offers Save to Snippets. -->
             <scroll grow="1">
-              <column gap="12">
+              <column gap="16">
                 <if test="{chatEmpty}">
-                  <status-bar>Ask Blocks about your recent work — commits, file changes, what you were doing.</status-bar>
+                  <row cross="center" gap="6">
+                    <text foreground="text_muted">Or use the input below</text>
+                    <icon name="arrow-down" width="16" height="16" foreground="text_muted" />
+                  </row>
                 </if>
                 <for each="messagesSlice" key="id" as="msg">
-                  <column gap="4" padding="8">
-                    <row cross="center" gap="8">
-                      <text grow="1">{msg.roleLabel}</text>
-                      <button size="sm" variant="ghost" on-press="save_to_snippets:{msg.index}">Save to Snippets</button>
+                  <if test="{msg.isUser}">
+                    <!-- User: right-aligned bubble + avatar (no Save to
+                         Snippets — that's offered on model replies only). -->
+                    <row main="end" cross="start" gap="8">
+                      <column cross="end" gap="2" grow="1">
+                        <column background="accent" foreground="accent_text" radius="lg" padding="10" cross="start">
+                          <text foreground="accent_text" wrap="true">{msg.content}</text>
+                        </column>
+                      </column>
+                      <avatar>{avatarInitials}</avatar>
                     </row>
-                    <text>{msg.content}</text>
-                  </column>
+                  </if>
+                  <else>
+                    <!-- Assistant: left-aligned, bot glyph, plain text. -->
+                    <row main="start" cross="start" gap="8">
+                      <icon name="terminal" width="18" height="18" foreground="text_muted" />
+                      <column gap="2" grow="1" cross="start">
+                        <text wrap="true">{msg.content}</text>
+                        <button size="sm" variant="ghost" foreground="info" on-press="save_to_snippets:{msg.index}">Save to Snippets</button>
+                      </column>
+                    </row>
+                  </else>
                 </for>
                 <!-- The in-progress assistant reply, as tokens stream in. -->
                 <if test="{isStreaming}">
-                  <column gap="4" padding="8">
-                    <text>Blocks</text>
-                    <text>{streamingText}</text>
-                  </column>
+                  <row main="start" cross="start" gap="8">
+                    <icon name="terminal" width="18" height="18" foreground="text_muted" />
+                    <text grow="1" wrap="true">{streamingText}</text>
+                  </row>
                 </if>
               </column>
             </scroll>
 
-            <status-bar>{chatStatusText}</status-bar>
-            <row gap="8" cross="center">
+            <!-- A muted status line (thinking / searching / errors) shown only
+                 when there's something worth saying — no box. -->
+            <if test="{showChatStatus}">
+              <text size="sm" foreground="text_muted">{chatStatusText}</text>
+            </if>
+
+            <!-- Composer: a single rounded input with a leading glyph and a
+                 trailing send button (no separate Send label). -->
+            <row cross="center" gap="8" background="surface_subtle" radius="lg" padding="6">
+              <icon name="terminal" width="18" height="18" foreground="text_muted" />
               <text-field
-                placeholder="Paste code, or ask a technical question…"
+                placeholder="Ask Blocks about your recent work"
                 on-input="chat_input_edit"
                 on-submit="send_chat"
                 grow="1" />
-              <button variant="primary" on-press="send_chat" disabled="{sendDisabled}">Send</button>
+              <button variant="ghost" size="icon" icon="send" label="Send" on-press="send_chat" disabled="{sendDisabled}" />
             </row>
           </column>
         </row>

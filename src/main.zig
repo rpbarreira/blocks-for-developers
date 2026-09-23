@@ -90,6 +90,7 @@ const key_chat_insert: u64 = 182; // INSERT a new chats row
 const key_chat_rowid: u64 = 183; // SELECT last_insert_rowid() for the new chat
 const key_chat_write: u64 = 184; // INSERT the turn's messages + touch the chat
 const key_messages_list: u64 = 185; // load a chat's messages
+const key_chats_list: u64 = 187; // load the chat-history sidebar list
 // Single-click summaries (Task 11). Share the spawn/fetch/file key space.
 const key_mcp_activity: u64 = 186; // POST get_activity tools/call for a summary's context
 // Materials / snippets (Task 12). Share the spawn/fetch/file/db key space.
@@ -328,15 +329,18 @@ pub const SummaryCard = struct {
     tag: []const u8,
     label: []const u8,
     blurb: []const u8,
+    /// Built-in icon name for the card's leading glyph (mockup: a colored
+    /// icon per card). Drawn via `<icon name="{c.icon}">`.
+    icon: []const u8,
 };
 
 /// The fixed set of summary cards, one per `chat.SummaryKind`. `tag` MUST be
 /// the exact enum tag name (`@tagName`) so markup's `stringToEnum` coercion
-/// resolves it.
+/// resolves it. Blurbs + icons mirror the chat mockup.
 const summary_cards = [_]SummaryCard{
-    .{ .tag = @tagName(chat.SummaryKind.day_recap), .label = "Day Recap", .blurb = "What you worked on recently" },
-    .{ .tag = @tagName(chat.SummaryKind.top_of_mind), .label = "What's Top of Mind", .blurb = "The threads to pick back up" },
-    .{ .tag = @tagName(chat.SummaryKind.standup), .label = "Standup Update", .blurb = "Yesterday · Today · Blockers" },
+    .{ .tag = @tagName(chat.SummaryKind.day_recap), .label = "Day Recap", .blurb = "Accomplishments and what's still open", .icon = "clock" },
+    .{ .tag = @tagName(chat.SummaryKind.top_of_mind), .label = "What's Top of Mind", .blurb = "Recurring themes by intensity", .icon = "alert" },
+    .{ .tag = @tagName(chat.SummaryKind.standup), .label = "Standup Update", .blurb = "Progress, plans, and blockers", .icon = "check-circle" },
 };
 
 pub const Model = struct {
@@ -361,6 +365,10 @@ pub const Model = struct {
     /// Detected OS username, shown next to the avatar. Borrowed from the
     /// process-lifetime boot arena.
     username: []const u8 = "developer",
+    /// The avatar initials (derived from `username` at boot), shown in the
+    /// sidebar avatar circle. Inline-owned (1-2 bytes).
+    avatar_initials_buf: [4]u8 = undefined,
+    avatar_initials_len: usize = 0,
     /// Absolute app-data directory (all data lives here), shown in
     /// Settings for backup. Borrowed from the boot arena.
     data_dir: []const u8 = "",
@@ -494,6 +502,16 @@ pub const Model = struct {
     chat_input: canvas.TextBuffer(chat_input_capacity) = .{},
     /// The active chat's id (0 = none yet; a row is created on first send).
     current_chat_id: i64 = 0,
+    /// The chat-history sidebar list (most-recently-updated first), inline-owned
+    /// so the view slice survives updates. Refreshed on boot + after each write.
+    chat_list: [chat.max_chats]chat.ChatEntry = undefined,
+    chat_count: usize = 0,
+    /// True once the chat-history list has been loaded on boot (load once).
+    chats_loaded: bool = false,
+    /// The active chat's human title, shown above the transcript. Set when a
+    /// past chat is opened or a new turn/summary starts; empty for a fresh chat.
+    chat_title_buf: [chat.chat_title_bytes]u8 = undefined,
+    chat_title_len: usize = 0,
     /// The next message `seq` for the active chat. We are the sole writer,
     /// so we track this in-model instead of re-querying MAX(seq) each turn.
     next_seq: i64 = 0,
@@ -696,9 +714,60 @@ pub const Model = struct {
         if (!self.llama_ready) return self.modelStatusText();
         return "Ask about your recent work, or tap a summary above.";
     }
+    /// Whether to surface the chat status line above the composer: only when
+    /// there's something worth saying (an error, a turn in flight, or the
+    /// runtime not yet ready) — never the idle hint, which would just be a
+    /// redundant echo of the placeholder.
+    pub fn showChatStatus(self: *const Model) bool {
+        return self.chat_error_len > 0 or self.sending or self.streaming or !self.llama_ready;
+    }
     /// True when there is nothing to show yet (empty-state hint).
     pub fn chatEmpty(self: *const Model) bool {
         return self.message_count == 0 and !self.streaming;
+    }
+    /// The chat-history sidebar list (newest-first) for the view's `<for each>`.
+    pub fn chatList(self: *const Model) []const chat.ChatEntry {
+        return self.chat_list[0..self.chat_count];
+    }
+    /// True when the user has at least one saved chat (drives the empty hint).
+    pub fn hasChats(self: *const Model) bool {
+        return self.chat_count > 0;
+    }
+    /// The active chat's title, shown above the transcript ("" when none, so
+    /// the header collapses on a brand-new chat).
+    pub fn chatTitleText(self: *const Model) []const u8 {
+        return self.chat_title_buf[0..self.chat_title_len];
+    }
+    /// True when a chat title should be shown above the transcript.
+    pub fn hasChatTitle(self: *const Model) bool {
+        return self.chat_title_len > 0;
+    }
+    fn setChatTitle(self: *Model, text: []const u8) void {
+        self.chat_title_len = @min(text.len, self.chat_title_buf.len);
+        @memcpy(self.chat_title_buf[0..self.chat_title_len], text[0..self.chat_title_len]);
+    }
+    /// Whether a given history row is the active (open) chat — drives the
+    /// sidebar highlight. Used by the per-row view function.
+    pub fn isActiveChat(self: *const Model, id: i64) bool {
+        return self.current_chat_id == id and id != 0;
+    }
+    /// The user's avatar initials (first letter of the detected username,
+    /// uppercased), for the sidebar avatar circle.
+    pub fn avatarInitials(self: *const Model) []const u8 {
+        return self.avatar_initials_buf[0..self.avatar_initials_len];
+    }
+    /// Derive the avatar initials from `username` (first alnum letter,
+    /// uppercased; falls back to "?"). Called once the username is known.
+    fn refreshAvatarInitials(self: *Model) void {
+        for (self.username) |c| {
+            if (std.ascii.isAlphanumeric(c)) {
+                self.avatar_initials_buf[0] = std.ascii.toUpper(c);
+                self.avatar_initials_len = 1;
+                return;
+            }
+        }
+        self.avatar_initials_buf[0] = '?';
+        self.avatar_initials_len = 1;
     }
     fn pendingUser(self: *const Model) []const u8 {
         return self.pending_user_buf[0..self.pending_user_len];
@@ -1009,6 +1078,7 @@ pub const Model = struct {
     // in markup — so they are intentionally exempt from the dead-state lint.
     pub const view_unbound = .{
         "onboarded",        "username",
+        "avatar_initials_buf", "avatar_initials_len",
         "data_dir",         "repo_list",        "repo_count",       "adding_repo",
         "repo_input",       "chat_input",
         "repo_error_buf",   "repo_error_len",   "pending_path_buf", "pending_path_len",
@@ -1036,6 +1106,8 @@ pub const Model = struct {
         // messagesSlice/streamingText/isStreaming/canSend/chatStatusText/
         // chatEmpty are bound in markup — the rest are update/effect state.
         "current_chat_id",    "next_seq",           "messages",       "message_count",
+        "chat_list",          "chat_count",         "chats_loaded",   "chat_title_buf",
+        "chat_title_len",
         "pending_user_buf",   "pending_user_len",   "streaming_buf",  "streaming_len",
         "context_buf",        "context_len",        "sending",        "streaming",
         "finalizing",         "chat_error_buf",     "chat_error_len", "pushMessage",
@@ -1142,6 +1214,9 @@ pub const Msg = union(enum) {
     chat_rowid_done: native_sdk.EffectDbResult, // last_insert_rowid() for the new chat
     chat_write_done: native_sdk.EffectDbResult, // the turn's messages persisted
     messages_listed: native_sdk.EffectDbResult, // a chat's messages reload
+    chats_listed: native_sdk.EffectDbResult, // the chat-history sidebar list reload
+    select_chat: i64, // open a saved chat from the history sidebar
+    new_chat, // "+ New chat" — reset to a fresh conversation
 
     // Single-click summaries (Task 11)
     start_summary: chat.SummaryKind, // a summary card was tapped
@@ -1222,7 +1297,7 @@ pub const Msg = union(enum) {
         // bound as markup handlers, so they are intentionally omitted).
         "mcp_search_done",     "chat_line",          "chat_done",
         "chat_inserted",       "chat_rowid_done",    "chat_write_done",
-        "messages_listed",
+        "messages_listed",     "chats_listed",
         // Task 11 effect-delivered arm (start_summary IS bound as a markup
         // handler, so it is intentionally omitted).
         "mcp_activity_done",
@@ -1286,6 +1361,7 @@ fn listRepos(fx: *Effects) void {
 
 pub fn initFx(model: *Model, fx: *Effects) void {
     model.username = boot_username;
+    model.refreshAvatarInitials();
 
     // Resolve the app-data directory (all data lives here) from the real
     // environment. The SDK runner has already created it and opened the
@@ -1458,8 +1534,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.context_len = 0;
             model.pending_summary_kind = null;
             if (model.current_chat_id != 0) loadMessages(model.current_chat_id, fx);
+            // Refresh the history sidebar so the new/updated chat rises to the
+            // top with its refreshed preview.
+            loadChats(fx);
         },
         .messages_listed => |res| messagesListed(model, res),
+        .chats_listed => |res| chatsListed(model, res, fx.wallMs()),
+        .select_chat => |id| selectChat(model, id, fx),
+        .new_chat => newChat(model),
 
         // ---- Single-click summaries (Task 11) ----
         .start_summary => |kind| startSummary(model, kind, fx),
@@ -1668,6 +1750,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.snippets_loaded = true;
                 loadSnippets(model, fx);
                 loadLanguages(model, fx);
+            }
+            // Load the chat-history sidebar list once the DB is ready.
+            if (res.kind == .done and !model.chats_loaded) {
+                model.chats_loaded = true;
+                loadChats(fx);
             }
         },
         .remove_repo => |id| {
@@ -2119,6 +2206,11 @@ fn sendChat(model: *Model, fx: *Effects) void {
 
     model.setPendingUser(raw);
     model.pushMessage(.user, raw); // optimistic display
+    // On a brand-new chat, adopt the first user message as the title (shown
+    // above the transcript and mirrored by the persisted `chats.title`).
+    if (model.current_chat_id == 0 and model.chat_title_len == 0) {
+        model.setChatTitle(chat.excerptTitle(raw));
+    }
     model.chat_input.clear();
     model.clearChatError();
     model.pending_summary_kind = null; // an ordinary chat turn (not a summary)
@@ -2202,6 +2294,7 @@ fn startSummary(model: *Model, kind: chat.SummaryKind, fx: *Effects) void {
     model.current_chat_id = 0;
     model.next_seq = 0;
     model.message_count = 0;
+    model.setChatTitle(kind.title());
     model.setPendingUser(prompt);
     model.pushMessage(.user, prompt); // optimistic display
     model.clearChatError();
@@ -2439,6 +2532,88 @@ fn persistTurn(model: *Model, fx: *Effects) void {
     });
     // `sending` stays SET until `chat_write_done` — the turn isn't done until
     // the write commits, which keeps a second turn from overlapping.
+}
+
+/// Load the chat-history sidebar list (newest-first). Fired on boot (once the
+/// DB is ready) and after every turn is persisted so a new/updated chat rises
+/// to the top with its refreshed preview.
+fn loadChats(fx: *Effects) void {
+    fx.dbQuery(.{
+        .key = key_chats_list,
+        .sql = chat.chats_list_sql,
+        .on_result = Effects.dbMsg(.chats_listed),
+    });
+}
+
+/// Copy a `chats_listed` page into the model's owned history list, computing
+/// each row's date bucket against "now" and marking the first row of each
+/// bucket so the sidebar can print a single group header per bucket.
+fn chatsListed(model: *Model, res: native_sdk.EffectDbResult, now_ms: i64) void {
+    switch (res.kind) {
+        .page => {
+            var reader = db.PageReader.init(res.bytes) catch return;
+            model.chat_count = 0;
+            var last_group: ?chat.DateGroup = null;
+            var row: [6]db.ColumnValue = undefined;
+            while (reader.next(&row) catch null) |cols| {
+                if (model.chat_count >= chat.max_chats) break;
+                const c = chat.Chat.fromRow(cols) orelse continue;
+                var entry = chat.ChatEntry.fromChat(c, now_ms);
+                // The list is ordered newest-first, so a bucket change marks
+                // the head row — the only row that prints the group header.
+                entry.group_head = (last_group == null or last_group.? != entry.group);
+                entry.active = (entry.id == model.current_chat_id and entry.id != 0);
+                last_group = entry.group;
+                model.chat_list[model.chat_count] = entry;
+                model.chat_count += 1;
+            }
+        },
+        .done, .exec => {},
+    }
+}
+
+/// Recompute each history row's `active` flag against `current_chat_id`, so
+/// the sidebar highlight tracks a selection change without a full DB reload.
+fn refreshActiveChat(model: *Model) void {
+    for (model.chat_list[0..model.chat_count]) |*e| {
+        e.active = (e.id == model.current_chat_id and e.id != 0);
+    }
+}
+
+/// Open a saved chat from the history sidebar: adopt its id + title and load
+/// its messages. A no-op mid-turn (don't swap the transcript out from under a
+/// streaming reply).
+fn selectChat(model: *Model, id: i64, fx: *Effects) void {
+    if (model.sending or id == 0) return;
+    model.current_chat_id = id;
+    model.clearChatError();
+    model.streaming = false;
+    model.streaming_len = 0;
+    // Adopt the title from the loaded list entry (if present).
+    for (model.chatList()) |e| {
+        if (e.id == id) {
+            model.setChatTitle(e.title());
+            break;
+        }
+    }
+    refreshActiveChat(model);
+    loadMessages(id, fx);
+}
+
+/// Start a brand-new chat (the "+ New chat" button): clear the active id,
+/// transcript, title, and composer so the summary cards + empty hint show.
+/// A no-op mid-turn.
+fn newChat(model: *Model) void {
+    if (model.sending) return;
+    model.current_chat_id = 0;
+    model.next_seq = 0;
+    model.message_count = 0;
+    model.streaming = false;
+    model.streaming_len = 0;
+    model.chat_title_len = 0;
+    model.chat_input.clear();
+    model.clearChatError();
+    refreshActiveChat(model);
 }
 
 /// Load a chat's messages into the model (oldest first). ?1 = chat id.
@@ -3478,6 +3653,7 @@ const BlocksApp = native_sdk.UiApp(Model, Msg);
 
 pub fn initialModel() Model {
     var m = Model{ .username = boot_username };
+    m.refreshAvatarInitials();
     m.refreshModelChoices();
     return m;
 }
