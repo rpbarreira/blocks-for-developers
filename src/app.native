@@ -191,7 +191,7 @@
                       <icon name="terminal" width="18" height="18" foreground="text_muted" />
                       <column gap="2" grow="1" cross="start">
                         <text wrap="true">{msg.content}</text>
-                        <button size="sm" variant="ghost" foreground="info" on-press="save_to_snippets:{msg.index}">Save to Snippets</button>
+                        <button size="sm" variant="secondary" on-press="save_to_snippets:{msg.index}">Save to Snippets</button>
                       </column>
                     </row>
                   </else>
