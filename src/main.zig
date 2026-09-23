@@ -2987,13 +2987,13 @@ fn blocksWindowView(ui: *BlocksApp.Ui, model: *const Model, window_label: []cons
 
     if (model.settingsMcp()) {
         panes[pn] = ui.column(.{ .gap = 6, .padding = 12 }, .{
-            ui.statusBar(.{}, "MODEL CONTEXT PROTOCOL (MCP)"),
+            ui.text(.{ .size = .heading }, "Model Context Protocol (MCP)"),
             ui.text(.{}, "Server URLs"),
             ui.row(.{ .cross = .center, .gap = 8 }, .{
                 ui.text(.{ .grow = 1 }, model.mcpUrlText()),
                 ui.button(.{ .variant = .ghost, .size = .sm, .on_press = .copy_mcp_url }, "Copy"),
             }),
-            ui.statusBar(.{}, "Local runtime (OpenAI-compatible):"),
+            ui.text(.{}, "Local runtime (OpenAI-compatible):"),
             ui.row(.{ .cross = .center, .gap = 8 }, .{
                 ui.text(.{ .grow = 1 }, model.llamaUrlText()),
                 ui.button(.{ .variant = .ghost, .size = .sm, .on_press = .copy_llama_url }, "Copy"),
