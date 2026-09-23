@@ -1029,34 +1029,20 @@ test "update: start_copilot_chat seeds and sends a chat when ready" {
     try std.testing.expect(std.mem.indexOf(u8, m.messagesSlice()[0].content(), "Deploy") != null);
 }
 
-test "update: snippet_clip_done reports a copy status" {
+test "update: snippet_clip_done shows no toast on success, an error on failure" {
     var m = main.initialModel();
     var fx = main.Effects.init(std.testing.allocator);
     defer fx.deinit();
     fx.executor = .fake;
 
+    // Success is silent — any prior status is cleared, none is set.
     main.update(&m, .{ .snippet_clip_done = .{ .key = 197, .op = .write, .outcome = .ok } }, &fx);
-    try std.testing.expectEqualStrings("Copied to clipboard.", m.snippetStatus());
+    try std.testing.expect(!m.hasSnippetStatus());
+
+    // A failed copy is still surfaced.
+    main.update(&m, .{ .snippet_clip_done = .{ .key = 197, .op = .write, .outcome = .failed } }, &fx);
+    try std.testing.expectEqualStrings("Couldn't copy to the clipboard.", m.snippetStatus());
 }
 
-test "update: lang modal opens from a loaded detail, typeahead pick fills it" {
-    var m = main.initialModel();
-    var fx = main.Effects.init(std.testing.allocator);
-    defer fx.deinit();
-    fx.executor = .fake;
-    // Seed a selected detail + a suggestion.
-    m.selected_snippet_id = 3;
-    m.selected_detail = snippets.SnippetDetail.fromSnippet(.{
-        .id = 3, .title = "T", .content = "c", .language = "", .annotation = "",
-        .text_expander = "", .origin_chat_id = 0, .origin_message_id = 0, .updated_at = 1,
-    });
-    m.languages[0] = snippets.LanguageEntry.set("rust");
-    m.language_count = 1;
-
-    main.update(&m, .open_lang_modal, &fx);
-    try std.testing.expect(m.langModalOpen());
-    main.update(&m, .{ .pick_lang_suggestion = 0 }, &fx);
-    try std.testing.expectEqualStrings("rust", m.lang_modal_input.text());
-    main.update(&m, .cancel_lang_modal, &fx);
-    try std.testing.expect(!m.langModalOpen());
-}
+// (The set-language modal was removed — language is edited in the material
+// editor window — so its update-arm test is gone with it.)

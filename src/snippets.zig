@@ -90,6 +90,10 @@ pub const SnippetEntry = struct {
     origin_chat_id: i64 = 0,
     origin_message_id: i64 = 0,
     updated_at: i64 = 0,
+    /// Whether this card is the currently-selected material (drives the
+    /// sidebar highlight). Computed at load time / on selection change,
+    /// mirroring `chat.ChatEntry.active`.
+    selected: bool = false,
     title_buf: [max_title_bytes]u8 = undefined,
     title_len: usize = 0,
     language_buf: [max_language_bytes]u8 = undefined,
@@ -379,6 +383,51 @@ pub fn defaultTitle(content: []const u8) []const u8 {
     return if (line.len > 0) line else "Untitled snippet";
 }
 
+/// The material header's "Saved …" subtitle (mockup: "Saved about an hour
+/// ago"). Formats `updated_ms` relative to `now_ms` into a coarse,
+/// human phrase written into `buf`; returns the slice. `updated_ms == 0`
+/// (no timestamp yet) yields "Saved just now". Buckets are deliberately
+/// coarse — the header wants a friendly gist, not a precise duration.
+pub fn formatSavedAgo(buf: []u8, updated_ms: i64, now_ms: i64) []const u8 {
+    const minute: i64 = 60 * 1000;
+    const hour: i64 = 60 * minute;
+    const day: i64 = 24 * hour;
+    const delta = if (updated_ms == 0) 0 else now_ms - updated_ms;
+
+    if (delta < 2 * minute) return copyStr(buf, "Saved just now");
+    if (delta < hour) {
+        const mins = @divFloor(delta, minute);
+        return printAgo(buf, "minute", mins);
+    }
+    if (delta < 2 * hour) return copyStr(buf, "Saved about an hour ago");
+    if (delta < day) {
+        const hours = @divFloor(delta, hour);
+        return printAgo(buf, "hour", hours);
+    }
+    if (delta < 2 * day) return copyStr(buf, "Saved yesterday");
+    const days = @divFloor(delta, day);
+    if (days < 7) return printAgo(buf, "day", days);
+    if (days < 14) return copyStr(buf, "Saved last week");
+    if (days < 30) return printAgo(buf, "week", @divFloor(days, 7));
+    if (days < 60) return copyStr(buf, "Saved last month");
+    if (days < 365) return printAgo(buf, "month", @divFloor(days, 30));
+    if (days < 730) return copyStr(buf, "Saved last year");
+    return printAgo(buf, "year", @divFloor(days, 365));
+}
+
+/// "Saved N <unit>[s] ago" into `buf` (pluralizes the unit).
+fn printAgo(buf: []u8, unit: []const u8, n: i64) []const u8 {
+    const plural: []const u8 = if (n == 1) "" else "s";
+    return std.fmt.bufPrint(buf, "Saved {d} {s}{s} ago", .{ n, unit, plural }) catch
+        copyStr(buf, "Saved a while ago");
+}
+
+fn copyStr(buf: []u8, s: []const u8) []const u8 {
+    const n = @min(s.len, buf.len);
+    @memcpy(buf[0..n], s[0..n]);
+    return buf[0..n];
+}
+
 // --------------------------------------------------------------- tests
 
 const testing = std.testing;
@@ -483,6 +532,34 @@ test "likePattern wraps the term in percent signs" {
     var buf: [64]u8 = undefined;
     try testing.expectEqualStrings("%docker%", likePattern(&buf, "docker"));
     try testing.expectEqualStrings("%%", likePattern(&buf, ""));
+}
+
+test "formatSavedAgo buckets a snippet's age into a friendly phrase" {
+    var buf: [64]u8 = undefined;
+    const minute: i64 = 60 * 1000;
+    const hour: i64 = 60 * minute;
+    const day: i64 = 24 * hour;
+    const now: i64 = 1000 * day;
+
+    // No timestamp / brand new -> "just now".
+    try testing.expectEqualStrings("Saved just now", formatSavedAgo(&buf, 0, now));
+    try testing.expectEqualStrings("Saved just now", formatSavedAgo(&buf, now - 30 * 1000, now));
+    // Minutes (pluralized).
+    try testing.expectEqualStrings("Saved 5 minutes ago", formatSavedAgo(&buf, now - 5 * minute, now));
+    // The mockup's phrase for the 1..2h window.
+    try testing.expectEqualStrings("Saved about an hour ago", formatSavedAgo(&buf, now - 90 * minute, now));
+    // Hours, days, week.
+    try testing.expectEqualStrings("Saved 5 hours ago", formatSavedAgo(&buf, now - 5 * hour, now));
+    try testing.expectEqualStrings("Saved yesterday", formatSavedAgo(&buf, now - 30 * hour, now));
+    try testing.expectEqualStrings("Saved 3 days ago", formatSavedAgo(&buf, now - 3 * day, now));
+    try testing.expectEqualStrings("Saved last week", formatSavedAgo(&buf, now - 9 * day, now));
+    // The 1..2h window is the friendly phrase, never "1 hour ago" — the hour
+    // COUNT bucket only starts at 2h (below that reads "about an hour ago").
+    try testing.expectEqualStrings("Saved about an hour ago", formatSavedAgo(&buf, now - 65 * minute, now));
+    try testing.expectEqualStrings("Saved 2 hours ago", formatSavedAgo(&buf, now - 2 * hour, now));
+    // Older buckets use the friendly "last week/month/year" phrasing.
+    try testing.expectEqualStrings("Saved 2 weeks ago", formatSavedAgo(&buf, now - 14 * day, now));
+    try testing.expectEqualStrings("Saved last month", formatSavedAgo(&buf, now - 40 * day, now));
 }
 
 // ---- Real in-memory DB integration test ----

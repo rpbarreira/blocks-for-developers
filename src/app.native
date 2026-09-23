@@ -228,137 +228,201 @@
       </if>
 
       <!-- ======================= MATERIALS SCREEN ======================= -->
+      <!-- High-fidelity redesign (materials mockup): an identity pill + a
+           large centered search pill in the header, a rounded-card sidebar
+           list with language glyphs, a big rounded material card (header +
+           Start Copilot Chat + code), an "All Context" pair of rounded
+           cards, a right-edge action rail, and a floating "+" FAB overlaid
+           on the sidebar (via a <stack>). Layered surfaces + lg radii give
+           the soft, grouped look; behavior/bindings are unchanged. -->
       <if test="{onMaterialsScreen}">
         <column gap="12" padding="16" grow="1">
-          <!-- Centered search. -->
-          <row gap="8" cross="center">
-            <text-field
-              placeholder="Find materials…"
-              on-input="snippet_search_edit"
-              grow="1" />
+
+          <!-- Materials header: identity pill on the left, a large centered
+               search pill in the middle. (The Chat/Materials/Settings nav
+               lives in the shared top bar above.) -->
+          <row cross="center" gap="12">
+            <row cross="center" gap="8" background="surface_subtle" radius="lg" padding="6">
+              <avatar>{avatarInitials}</avatar>
+              <text>{usernameText}</text>
+            </row>
+            <column grow="1" cross="center">
+              <row cross="center" gap="8" background="surface_subtle" radius="xl" padding="10" width="480">
+                <search-field
+                  placeholder="Find materials…"
+                  on-input="snippet_search_edit"
+                  grow="1" />
+              </row>
+            </column>
+            <!-- A spacer matching the identity pill keeps the search pill
+                 visually centered in the row. -->
+            <column width="140" />
           </row>
 
           <row gap="16" grow="1">
-            <!-- Sidebar: Saved Materials list with sort + language filter. -->
-            <column gap="8" grow="1">
-              <row cross="center" gap="8">
-                <text size="heading" grow="1">Saved Materials</text>
-                <badge>{snippetCount}</badge>
-                <button size="sm" variant="ghost" on-press="toggle_lang_menu">{langFilterLabel}</button>
-                <button size="sm" variant="ghost" on-press="toggle_sort_menu">{sortLabel}</button>
-              </row>
 
-              <!-- SORT BY menu. -->
-              <if test="{sortMenuOpen}">
-                <column gap="2" padding="6">
-                  <status-bar>SORT BY</status-bar>
-                  <button size="sm" variant="ghost" on-press="sort_recent">Recent</button>
-                  <button size="sm" variant="ghost" on-press="sort_alphabetical">Alphabetical</button>
-                </column>
-              </if>
+            <!-- ===================== SIDEBAR ===================== -->
+            <!-- Wrapped in a <stack> so the "+" FAB floats over the list's
+                 bottom-left corner (mockup) instead of sitting inline. -->
+            <stack width="320">
+              <column gap="10" grow="1">
 
-              <!-- Language filter menu: "All" first, then the languages in use. -->
-              <if test="{langMenuOpen}">
-                <column gap="2" padding="6">
-                  <status-bar>Language</status-bar>
-                  <button size="sm" variant="ghost" on-press="clear_lang_filter">All</button>
-                  <for each="languageList" key="name" as="l">
-                    <button size="sm" variant="ghost" on-press="set_lang_filter:{l.filterIndex}">{l.name}</button>
-                  </for>
-                </column>
-              </if>
+                <!-- Sidebar header: title + count pill + language ({}) and
+                     sort (clock) icon buttons. -->
+                <row cross="center" gap="6">
+                  <text grow="1">Saved Materials</text>
+                  <badge>{snippetCount}</badge>
+                  <button size="icon" variant="ghost" icon="app:braces" label="Filter by language" on-press="toggle_lang_menu" />
+                  <button size="icon" variant="ghost" icon="clock" label="Sort" on-press="toggle_sort_menu" />
+                </row>
 
-              <if test="{hasSnippets}">
-                <column gap="4">
-                  <for each="snippetList" key="id" as="s">
-                    <column gap="2" padding="8" on-press="select_snippet:{s.id}">
-                      <text>{s.title}</text>
-                      <status-bar>{s.cardBlurb}</status-bar>
+                <!-- SORT BY menu (rounded floating card, mockup). The header
+                     shows the active sort so the icon-only trigger stays
+                     legible. -->
+                <if test="{sortMenuOpen}">
+                  <card radius="lg" background="surface" padding="6">
+                    <column gap="2">
+                      <status-bar>SORT BY · {sortLabel}</status-bar>
+                      <button size="sm" variant="ghost" icon="clock" on-press="sort_recent">Recent</button>
+                      <button size="sm" variant="ghost" on-press="sort_alphabetical">Alphabetical</button>
                     </column>
-                  </for>
-                </column>
-              </if>
-              <if test="{noSnippets}">
-                <status-bar>No materials yet. Save a snippet from a chat, or add one with + New.</status-bar>
-              </if>
+                  </card>
+                </if>
 
-              <button variant="primary" size="sm" on-press="open_new_snippet">+ New</button>
-            </column>
+                <!-- Language filter menu: "All" first, then languages in use.
+                     The header shows the active filter. -->
+                <if test="{langMenuOpen}">
+                  <card radius="lg" background="surface" padding="6">
+                    <column gap="2">
+                      <status-bar>LANGUAGE · {langFilterLabel}</status-bar>
+                      <button size="sm" variant="ghost" on-press="clear_lang_filter">All</button>
+                      <for each="languageList" key="name" as="l">
+                        <button size="sm" variant="ghost" on-press="set_lang_filter:{l.filterIndex}">{l.name}</button>
+                      </for>
+                    </column>
+                  </card>
+                </if>
 
-            <!-- Main panel: the selected material. -->
-            <column gap="8" grow="1">
+                <!-- The list of saved materials, as rounded cards. -->
+                <scroll grow="1">
+                  <column gap="6">
+                    <if test="{hasSnippets}">
+                      <for each="snippetList" key="id" as="s">
+                        <card selected="{s.selected}" radius="lg" on-press="select_snippet:{s.id}">
+                          <row cross="start" gap="8" padding="10">
+                            <!-- Generic accent-tinted glyph per card. -->
+                            <icon name="file-text" width="18" height="18" foreground="accent" />
+                            <column gap="3" grow="1">
+                              <text wrap="true">{s.title}</text>
+                              <text size="sm" foreground="text_muted" wrap="true">{s.cardBlurb}</text>
+                            </column>
+                          </row>
+                        </card>
+                      </for>
+                    </if>
+                    <if test="{noSnippets}">
+                      <card radius="lg" background="surface_subtle" padding="12">
+                        <text size="sm" foreground="text_muted" wrap="true">No materials yet. Save a snippet from a chat, or add one with the + button.</text>
+                      </card>
+                    </if>
+                  </column>
+                </scroll>
+              </column>
+
+              <!-- Floating "+" FAB, docked bottom-left over the sidebar. -->
+              <column grow="1" main="end">
+                <row main="start">
+                  <button size="icon" variant="primary" icon="plus" label="New material" on-press="open_new_snippet" />
+                </row>
+              </column>
+            </stack>
+
+            <!-- ===================== MAIN PANEL ===================== -->
+            <row gap="10" grow="1">
+              <column gap="12" grow="1">
+                <if test="{snippetSelected}">
+
+                  <!-- The material card: header (glyph + title + saved-ago +
+                       {} button) + Start Copilot Chat + code with numbers. -->
+                  <card radius="lg" background="surface_subtle" grow="1">
+                    <column gap="12" padding="16" grow="1">
+                      <row cross="start" gap="10">
+                        <column gap="2" grow="1">
+                          <text size="heading">{selectedTitle}</text>
+                          <text size="sm" foreground="text_muted">{selectedSavedAgo}</text>
+                        </column>
+                      </row>
+
+                      <row cross="center" gap="8">
+                        <button size="sm" variant="secondary" icon="terminal" on-press="start_copilot_chat">Start Copilot Chat</button>
+                      </row>
+
+                      <scroll grow="1">
+                        <code source="{selectedContent}" line-numbers="true" />
+                      </scroll>
+                    </column>
+                  </card>
+
+                  <!-- All Context: Annotations + Text Expander, rounded cards.
+                       A subsection label sized BETWEEN the small status-bar
+                       labels (ANNOTATIONS / TEXT EXPANDER) and the heading-
+                       sized material title: default body text scaled up ~1.3x
+                       via a <span> (the text `size` scale has no rung between
+                       default and `heading`). -->
+                  <text><span scale="1.3">All Context</span></text>
+                  <card radius="lg" background="surface_subtle">
+                    <column gap="6" padding="12">
+                      <status-bar>ANNOTATIONS</status-bar>
+                      <text wrap="true">{selectedAnnotation}</text>
+                    </column>
+                  </card>
+                  <card radius="lg" background="surface_subtle">
+                    <column gap="6" padding="12">
+                      <status-bar>TEXT EXPANDER</status-bar>
+                      <text wrap="true">{selectedTextExpander}</text>
+                    </column>
+                  </card>
+                </if>
+                <if test="{noSnippetSelected}">
+                  <card radius="lg" background="surface_subtle" grow="1">
+                    <column gap="8" padding="16" grow="1" main="center" cross="center">
+                      <icon name="app:braces" width="40" height="40" foreground="text_muted" />
+                      <text foreground="text_muted" text-alignment="center" wrap="true">Select a material to view it, or create one with the + button.</text>
+                    </column>
+                  </card>
+                </if>
+              </column>
+
+              <!-- Right action rail: edit / copy / delete (mockup). Shown
+                   only when a material is selected. -->
               <if test="{snippetSelected}">
-                <column gap="8" grow="1">
-                  <row cross="center" gap="8">
-                    <text size="heading" grow="1">{selectedTitle}</text>
-                    <button size="sm" variant="ghost" on-press="open_lang_modal">{selectedLanguageLabel}</button>
-                    <button size="sm" variant="ghost" on-press="open_edit_snippet">Edit</button>
-                    <button size="sm" variant="ghost" on-press="copy_snippet">Copy</button>
-                    <button size="sm" variant="ghost" on-press="delete_snippet">Delete</button>
-                  </row>
-                  <row gap="8" cross="center">
-                    <button size="sm" variant="secondary" on-press="start_copilot_chat">Start Copilot Chat</button>
-                  </row>
-
-                  <code source="{selectedContent}" line-numbers="true" />
-
-                  <!-- All Context: Annotations + Text Expander. -->
-                  <text size="heading">All Context</text>
-                  <column gap="2" padding="8">
-                    <status-bar>ANNOTATIONS</status-bar>
-                    <text>{selectedAnnotation}</text>
-                  </column>
-                  <column gap="2" padding="8">
-                    <status-bar>TEXT EXPANDER</status-bar>
-                    <text>{selectedTextExpander}</text>
-                  </column>
+                <column gap="8">
+                  <button size="icon" variant="ghost" icon="edit" label="Edit" on-press="open_edit_snippet" />
+                  <button size="icon" variant="ghost" icon="copy" label="Copy" on-press="copy_snippet" />
+                  <button size="icon" variant="ghost" icon="trash" label="Delete" on-press="request_delete_snippet" />
                 </column>
               </if>
-              <if test="{noSnippetSelected}">
-                <status-bar>Select a material to view it, or create one with + New.</status-bar>
-              </if>
-            </column>
+            </row>
           </row>
 
-          <status-bar>{snippetStatus}</status-bar>
+          <!-- A muted status line (toast) when there's something to say. -->
+          <if test="{hasSnippetStatus}">
+            <text size="sm" foreground="text_muted">{snippetStatus}</text>
+          </if>
         </column>
       </if>
     </column>
   </if>
 
-  <!-- ===================== EDITOR SHEET (add/edit) ====================== -->
-  <if test="{editorOpen}">
-    <column gap="8" padding="12">
-      <text size="heading">{editorTitleLabel}</text>
-      <text-field placeholder="Title" on-input="edit_title_edit" />
-      <text-field placeholder="Language (e.g. python, zig)" on-input="edit_language_edit" />
-      <code source="{editContent}" editable="true" on-input="edit_content_edit" />
-      <text-field placeholder="Annotation" on-input="edit_annotation_edit" />
-      <text-field placeholder="Text expander" on-input="edit_text_expander_edit" />
-      <row gap="8" cross="center">
-        <button variant="primary" size="sm" on-press="save_snippet">Save</button>
-        <button variant="ghost" size="sm" on-press="cancel_editor">Cancel</button>
-      </row>
-    </column>
-  </if>
+  <!-- The material ADD/EDIT editor is now a SEPARATE OS window (like
+       Settings), built in Zig by `editorWindowView` in main.zig — the "+"
+       FAB (open_new_snippet) and the pencil (open_edit_snippet) declare it.
+       Markup binds only the main canvas, so it cannot live here. -->
 
-  <!-- ================= SET-LANGUAGE MODAL (typeahead) =================== -->
-  <if test="{langModalOpen}">
-    <column gap="8" padding="12">
-      <text size="heading">Set language</text>
-      <text-field placeholder="Type a language…" on-input="lang_modal_edit" on-submit="save_lang_modal" />
-      <status-bar>Used before</status-bar>
-      <row gap="6" cross="center">
-        <for each="languageList" key="name" as="l">
-          <button size="sm" variant="ghost" on-press="pick_lang_suggestion:{l.index}">{l.name}</button>
-        </for>
-      </row>
-      <row gap="8" cross="center">
-        <button variant="primary" size="sm" on-press="save_lang_modal">Save</button>
-        <button variant="ghost" size="sm" on-press="cancel_lang_modal">Cancel</button>
-      </row>
-    </column>
-  </if>
+  <!-- The set-language modal was removed: the material editor window is the
+       single place to set a snippet's language (the `{}` button + this modal
+       were duplicate functionality). The sidebar language FILTER still uses
+       the language list; snippet language is edited in the editor. -->
 
   <!-- The Settings UI is a SEPARATE OS window (Task 13), built in Zig by
        `window_view`/`windows_fn` in main.zig — the header "Settings" button

@@ -212,6 +212,17 @@ const main_window_label = "main";
 /// Its canvas label MUST be distinct from the main canvas.
 const settings_window_label = "settings";
 const settings_canvas_label = "settings-canvas";
+/// The material add/edit editor (formerly an inline `<if editorOpen>` sheet on
+/// the main canvas) is ALSO a model-declared SECONDARY OS window, mirroring
+/// Settings: opened via `windows_fn` when `editor_open`, built by `window_view`
+/// (a UiApp binds markup to only ONE canvas, so a second window is Zig-built).
+const editor_window_label = "material-editor";
+const editor_canvas_label = "material-canvas";
+/// The delete-confirmation dialog is ALSO a secondary OS window (per the
+/// user's request — not an inline overlay): opened via `windows_fn` when
+/// `confirm_delete_open`, built by `window_view`.
+const confirm_delete_window_label = "confirm-delete";
+const confirm_delete_canvas_label = "confirm-delete-canvas";
 // Timer keys live in their OWN namespace (never collide with the above).
 const key_snap_timer: u64 = 1; // the repeating scan/debounce tick
 const key_mcp_health_timer: u64 = 2; // one-shot delay before the MCP health check
@@ -581,20 +592,33 @@ pub const Model = struct {
     /// Which transient sidebar menu is open (only one at a time).
     sort_menu_open: bool = false,
     lang_menu_open: bool = false,
-    /// The editor sheet: open when adding or editing a snippet. `editing_id`
-    /// is 0 for a new snippet, else the id being edited.
+    /// The material editor: a SECONDARY OS window (like Settings), open when
+    /// adding or editing a snippet. `editing_id` is 0 for a new snippet, else
+    /// the id being edited.
     editor_open: bool = false,
     editing_id: i64 = 0,
+    /// Bumped on each editor OPEN so the window gets a fresh canvas label
+    /// (`material-canvas-<n>`) — a re-declare under the same label doesn't
+    /// re-install the canvas in a live session (the Settings reopen-blank
+    /// gotcha), so each open is a clean install.
+    editor_open_count: u32 = 0,
+    editor_canvas_buf: [40]u8 = undefined,
+    editor_canvas_len: usize = 0,
     edit_title: canvas.TextBuffer(snip_title_capacity) = .{},
     edit_content: canvas.TextBuffer(snip_content_capacity) = .{},
     edit_language: canvas.TextBuffer(snip_language_capacity) = .{},
     edit_annotation: canvas.TextBuffer(snip_annotation_capacity) = .{},
     edit_text_expander: canvas.TextBuffer(snip_text_expander_capacity) = .{},
-    /// The set-language modal (main-panel `{}` icon): a free-text field with
-    /// typeahead from `languages`. `lang_modal_id` is the snippet being tagged.
-    lang_modal_open: bool = false,
-    lang_modal_id: i64 = 0,
-    lang_modal_input: canvas.TextBuffer(snip_language_capacity) = .{},
+    /// The delete-confirmation dialog: a SECONDARY OS window (like the editor
+    /// + Settings), open when awaiting the user's confirmation. Same fresh-
+    /// canvas-label-per-open pattern (the reopen-blank fix). The prompt
+    /// sentence is built when the window opens (accessors don't allocate).
+    confirm_delete_open: bool = false,
+    confirm_delete_open_count: u32 = 0,
+    confirm_delete_canvas_buf: [40]u8 = undefined,
+    confirm_delete_canvas_len: usize = 0,
+    confirm_delete_prompt_buf: [snippets.max_title_bytes + 64]u8 = undefined,
+    confirm_delete_prompt_len: usize = 0,
     /// True once the snippets list has been loaded on boot (load exactly once).
     snippets_loaded: bool = false,
     /// True while a snippet write (insert/update/delete/setlang) is in flight,
@@ -603,6 +627,10 @@ pub const Model = struct {
     /// Transient status/toast for materials actions (e.g. "Copied to clipboard").
     snippet_status_buf: [128]u8 = undefined,
     snippet_status_len: usize = 0,
+    /// The selected material's "Saved …" subtitle (mockup), computed against
+    /// "now" when the detail loads (accessors have no clock, so we precompute).
+    saved_ago_buf: [64]u8 = undefined,
+    saved_ago_len: usize = 0,
 
     pub fn selectedModel(self: *const Model) []const u8 {
         if (self.selected_model_len == 0) return models.default_model_id;
@@ -860,6 +888,32 @@ pub const Model = struct {
         const s = std.fmt.bufPrint(&self.settings_canvas_buf, "{s}-{d}", .{ settings_canvas_label, self.settings_open_count }) catch settings_canvas_label;
         self.settings_canvas_len = s.len;
     }
+    /// The current material-editor canvas label (`material-canvas-<n>`), read
+    /// by `windows_fn`. Falls back to the base label before the first open.
+    pub fn editorCanvasLabel(self: *const Model) []const u8 {
+        if (self.editor_canvas_len == 0) return editor_canvas_label;
+        return self.editor_canvas_buf[0..self.editor_canvas_len];
+    }
+    /// Rewrite `editor_canvas_buf` to `material-canvas-<open_count>`; called
+    /// from `openEditor` (a fresh label each open, like Settings).
+    fn refreshEditorCanvasLabel(self: *Model) void {
+        const s = std.fmt.bufPrint(&self.editor_canvas_buf, "{s}-{d}", .{ editor_canvas_label, self.editor_open_count }) catch editor_canvas_label;
+        self.editor_canvas_len = s.len;
+    }
+    /// The current delete-confirmation canvas label (`confirm-delete-canvas-<n>`),
+    /// read by `windows_fn`. Falls back to the base label before the first open.
+    pub fn confirmDeleteCanvasLabel(self: *const Model) []const u8 {
+        if (self.confirm_delete_canvas_len == 0) return confirm_delete_canvas_label;
+        return self.confirm_delete_canvas_buf[0..self.confirm_delete_canvas_len];
+    }
+    fn refreshConfirmDeleteCanvasLabel(self: *Model) void {
+        const s = std.fmt.bufPrint(&self.confirm_delete_canvas_buf, "{s}-{d}", .{ confirm_delete_canvas_label, self.confirm_delete_open_count }) catch confirm_delete_canvas_label;
+        self.confirm_delete_canvas_len = s.len;
+    }
+    /// The confirmation prompt sentence shown in the dialog window.
+    pub fn confirmDeletePrompt(self: *const Model) []const u8 {
+        return self.confirm_delete_prompt_buf[0..self.confirm_delete_prompt_len];
+    }
     pub fn settingsAbout(self: *const Model) bool {
         return self.settings_section == .about or self.settings_section == .all;
     }
@@ -925,11 +979,7 @@ pub const Model = struct {
     pub fn noSnippetSelected(self: *const Model) bool {
         return !self.snippetSelected();
     }
-    /// The main-panel language button label: the language, or a hint to set one.
-    pub fn selectedLanguageLabel(self: *const Model) []const u8 {
-        const lang = self.selectedLanguage();
-        return if (lang.len > 0) lang else "Set language";
-    }
+
     /// The editor's current content text (bound by the editable `<code>`).
     pub fn editContent(self: *const Model) []const u8 {
         return self.edit_content.text();
@@ -962,6 +1012,10 @@ pub const Model = struct {
     pub fn selectedTextExpander(self: *const Model) []const u8 {
         return if (self.detail()) |d| d.textExpander() else "";
     }
+    /// The selected material's "Saved …" subtitle (precomputed on load).
+    pub fn selectedSavedAgo(self: *const Model) []const u8 {
+        return self.saved_ago_buf[0..self.saved_ago_len];
+    }
     pub fn langFilter(self: *const Model) []const u8 {
         return self.lang_filter_buf[0..self.lang_filter_len];
     }
@@ -987,11 +1041,13 @@ pub const Model = struct {
     pub fn editorTitleLabel(self: *const Model) []const u8 {
         return if (self.editing_id == 0) "New material" else "Edit material";
     }
-    pub fn langModalOpen(self: *const Model) bool {
-        return self.lang_modal_open;
-    }
     pub fn snippetStatus(self: *const Model) []const u8 {
         return self.snippet_status_buf[0..self.snippet_status_len];
+    }
+    /// Whether a materials toast/status line is currently set (so the view
+    /// only shows the status text when there's something to say — no box).
+    pub fn hasSnippetStatus(self: *const Model) bool {
+        return self.snippet_status_len > 0;
     }
     fn setSnippetStatus(self: *Model, msg: []const u8) void {
         self.snippet_status_len = @min(msg.len, self.snippet_status_buf.len);
@@ -1129,6 +1185,18 @@ pub const Model = struct {
         "dataDirText",          "repoError",           "isAddingRepo",
         "reposSlice",           "canDownload",         "settingsCanvasLabel",
         "refreshSettingsCanvasLabel",
+        // The material EDITOR window (Task 12 editor, now a Zig-built
+        // secondary window like Settings): these accessors are read by
+        // `editorWindowView`/`blocksWindows`/tests, not markup.
+        "editorCanvasLabel",    "refreshEditorCanvasLabel",
+        "editorOpen",           "editorTitleLabel",    "editContent",
+        // The delete-confirmation dialog window (also Zig-built): fields +
+        // accessors read by `confirmDeleteWindowView`/`blocksWindows`, not markup.
+        "confirm_delete_open",  "confirm_delete_open_count",
+        "confirm_delete_canvas_buf", "confirm_delete_canvas_len",
+        "confirm_delete_prompt_buf", "confirm_delete_prompt_len",
+        "confirmDeleteCanvasLabel", "refreshConfirmDeleteCanvasLabel",
+        "confirmDeletePrompt",
         // Navigation + Materials / snippets (Task 12). The list/menu/editor
         // accessors are bound in markup; these are the update/effect-only
         // fields + the text-field buffers (driven via on-input, not bound).
@@ -1138,12 +1206,14 @@ pub const Model = struct {
         "lang_filter_len",
         "snippet_search",       "sort_menu_open",      "lang_menu_open",     "editor_open",
         "editing_id",           "edit_title",          "edit_content",       "edit_language",
-        "edit_annotation",      "edit_text_expander",  "lang_modal_open",    "lang_modal_id",
-        "lang_modal_input",     "snippet_writing",     "snippet_status_buf", "snippet_status_len",
+        "edit_annotation",      "edit_text_expander",
+        "snippet_writing",      "snippet_status_buf",  "snippet_status_len",
+        "saved_ago_buf",        "saved_ago_len",
+        "editor_open_count",    "editor_canvas_buf",   "editor_canvas_len",
         "snippets_loaded",
         // Accessors read only from update/other-accessor logic (not bound in
         // markup): the search text drives a reload; selectedLanguage feeds
-        // selectedLanguageLabel; langFilter feeds the reload query.
+        // the editor prefill; langFilter feeds the reload query.
         "snippetSearchText",    "selectedLanguage",    "langFilter",
     };
 };
@@ -1261,15 +1331,13 @@ pub const Msg = union(enum) {
     edit_annotation_edit: canvas.TextInputEvent,
     edit_text_expander_edit: canvas.TextInputEvent,
     save_snippet, // commit the editor (insert or update)
-    cancel_editor, // discard the editor
-    delete_snippet, // trash — delete the selected snippet
+    cancel_editor, // discard the editor (Cancel button in the editor window)
+    close_editor, // the editor window's native red-button close
+    request_delete_snippet, // trash — open the delete-confirmation dialog window
+    confirm_delete, // dialog "Yes, delete it!" — actually delete
+    cancel_delete, // dialog Cancel (or native close) — dismiss without deleting
     copy_snippet, // copy icon — copy the selected snippet to the clipboard
     snippet_clip_done: native_sdk.EffectClipboardResult, // clipboard write result
-    open_lang_modal, // main-panel `{}` — open the set-language modal
-    lang_modal_edit: canvas.TextInputEvent, // typing the language in the modal
-    pick_lang_suggestion: usize, // tap a typeahead suggestion (index into languages)
-    save_lang_modal, // commit the set-language modal
-    cancel_lang_modal, // discard the set-language modal
     start_copilot_chat, // "Start Copilot Chat" — seed a new chat from the snippet
     snippet_inserted: native_sdk.EffectDbResult, // new snippet insert result
     snippet_rowid_done: native_sdk.EffectDbResult, // MAX(id) recovery for a new snippet
@@ -1301,12 +1369,24 @@ pub const Msg = union(enum) {
         // Task 11 effect-delivered arm (start_summary IS bound as a markup
         // handler, so it is intentionally omitted).
         "mcp_activity_done",
-        // Task 12 effect-delivered arms (the select/toggle/open/save/cancel/
-        // delete/copy + *_edit on-input arms ARE bound as markup handlers, so
-        // they are intentionally omitted).
+        // Task 12 effect-delivered arms (the select/toggle/open-editor/
+        // delete/copy + the set-language-modal + start_copilot_chat arms ARE
+        // bound as markup handlers, so they are intentionally omitted).
         "snippets_listed",  "languages_listed",  "snippet_clip_done",
         "snippet_inserted", "snippet_rowid_done", "snippet_write_done",
         "snippet_detail_loaded",
+        // The material EDITOR is now a SEPARATE OS window (like Settings),
+        // built in Zig by `window_view` — so its Save/Cancel/close + the five
+        // edit_*_edit on-input arms are dispatched from that window, NOT
+        // markup, and belong here. (open_new_snippet/open_edit_snippet stay
+        // markup-bound: the FAB + pencil live on the main canvas.)
+        "save_snippet",     "cancel_editor",     "close_editor",
+        "edit_title_edit",  "edit_content_edit", "edit_language_edit",
+        "edit_annotation_edit", "edit_text_expander_edit",
+        // The delete-confirmation dialog window's buttons (confirm/cancel) are
+        // dispatched from its Zig `window_view`, not markup. (The trash button
+        // `request_delete_snippet` stays markup-bound on the main canvas.)
+        "confirm_delete",   "cancel_delete",
         // Task 13. onboard_next/onboard_finish/open_settings are bound in
         // the main markup; the SETTINGS-window controls (close_settings,
         // settings_all/about/mcp/local_model, copy_*_url, download_model,
@@ -1608,6 +1688,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .select_snippet => |id| {
             model.selected_snippet_id = id;
             model.snippet_status_len = 0;
+            refreshSelectedSnippet(model);
             loadSnippetDetail(model, id, fx);
         },
         .snippet_search_edit => |event| {
@@ -1656,34 +1737,26 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .edit_annotation_edit => |e| model.edit_annotation.apply(e),
         .edit_text_expander_edit => |e| model.edit_text_expander.apply(e),
         .save_snippet => saveSnippet(model, fx),
-        .cancel_editor => {
+        .cancel_editor, .close_editor => {
             model.editor_open = false;
             model.editing_id = 0;
         },
-        .delete_snippet => deleteSnippet(model, fx),
+        .request_delete_snippet => openDeleteConfirm(model),
+        .confirm_delete => {
+            model.confirm_delete_open = false;
+            deleteSnippet(model, fx);
+        },
+        .cancel_delete => model.confirm_delete_open = false,
         .copy_snippet => copySnippet(model, fx),
         .snippet_clip_done => |res| {
+            // No success toast (the user asked for the copy confirmation to be
+            // removed); clear any prior status so nothing lingers. A FAILED
+            // copy is still surfaced.
             if (res.outcome == .ok) {
-                model.setSnippetStatus("Copied to clipboard.");
+                model.snippet_status_len = 0;
             } else {
                 model.setSnippetStatus("Couldn't copy to the clipboard.");
             }
-        },
-        .open_lang_modal => {
-            if (model.detail()) |s| {
-                model.lang_modal_open = true;
-                model.lang_modal_id = s.id;
-                model.lang_modal_input.set(s.language());
-            }
-        },
-        .lang_modal_edit => |e| model.lang_modal_input.apply(e),
-        .pick_lang_suggestion => |idx| {
-            if (idx < model.language_count) model.lang_modal_input.set(model.languages[idx].name());
-        },
-        .save_lang_modal => saveLangModal(model, fx),
-        .cancel_lang_modal => {
-            model.lang_modal_open = false;
-            model.lang_modal_id = 0;
         },
         .start_copilot_chat => startCopilotChat(model, fx),
         .snippet_inserted => |res| {
@@ -1705,7 +1778,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             loadLanguages(model, fx);
             if (model.selected_snippet_id != 0) loadSnippetDetail(model, model.selected_snippet_id, fx);
         },
-        .snippet_detail_loaded => |res| snippetDetailLoaded(model, res),
+        .snippet_detail_loaded => |res| snippetDetailLoaded(model, res, fx.wallMs()),
         .save_to_snippets => |seq_idx| saveToSnippets(model, seq_idx, fx),
 
         .wrote_keep => {
@@ -2730,8 +2803,18 @@ fn snippetsListed(model: *Model, res: native_sdk.EffectDbResult) void {
             if (model.selectedCard() == null) {
                 model.selected_snippet_id = if (model.snippet_count > 0) model.snippet_list[0].id else 0;
             }
+            refreshSelectedSnippet(model);
         },
         .exec => {},
+    }
+}
+
+/// Recompute each sidebar card's `selected` flag against `selected_snippet_id`
+/// so the highlight tracks the selection without a full DB reload (mirrors
+/// `refreshActiveChat` for the chat sidebar).
+fn refreshSelectedSnippet(model: *Model) void {
+    for (model.snippet_list[0..model.snippet_count]) |*e| {
+        e.selected = (e.id == model.selected_snippet_id and e.id != 0);
     }
 }
 
@@ -2751,7 +2834,7 @@ fn loadSnippetDetail(model: *Model, id: i64, fx: *Effects) void {
 }
 
 /// Copy the selected snippet's full row into `selected_detail`.
-fn snippetDetailLoaded(model: *Model, res: native_sdk.EffectDbResult) void {
+fn snippetDetailLoaded(model: *Model, res: native_sdk.EffectDbResult, now_ms: i64) void {
     switch (res.kind) {
         .page => {
             var reader = db.PageReader.init(res.bytes) catch return;
@@ -2759,6 +2842,10 @@ fn snippetDetailLoaded(model: *Model, res: native_sdk.EffectDbResult) void {
             if ((reader.next(&row) catch null)) |cols| {
                 if (snippets.Snippet.fromRow(cols)) |s| {
                     model.selected_detail = snippets.SnippetDetail.fromSnippet(s);
+                    // Precompute the "Saved …" subtitle now (render-time
+                    // accessors have no clock of their own).
+                    const ago = snippets.formatSavedAgo(&model.saved_ago_buf, s.updated_at, now_ms);
+                    model.saved_ago_len = ago.len;
                 }
             }
         },
@@ -2790,6 +2877,12 @@ fn languagesListed(model: *Model, res: native_sdk.EffectDbResult) void {
 /// Open the editor sheet, blank for a new snippet (`id == 0`) or pre-filled
 /// from the snippet being edited.
 fn openEditor(model: *Model, id: i64) void {
+    // Fresh canvas label per open (the Settings reopen-blank fix), so the
+    // secondary editor window renders on every reopen.
+    if (!model.editor_open) {
+        model.editor_open_count +%= 1;
+        model.refreshEditorCanvasLabel();
+    }
     model.editor_open = true;
     model.editing_id = id;
     model.snippet_status_len = 0;
@@ -2883,6 +2976,25 @@ fn snippetRowidDone(model: *Model, res: native_sdk.EffectDbResult, fx: *Effects)
     }
 }
 
+/// Open the delete-confirmation dialog window for the selected material,
+/// building its prompt sentence (with the material's title). No-op when
+/// nothing is selected. A fresh canvas label per open (the reopen-blank fix).
+fn openDeleteConfirm(model: *Model) void {
+    if (model.selected_snippet_id == 0) return;
+    const title = model.selectedTitle();
+    const prompt = std.fmt.bufPrint(
+        &model.confirm_delete_prompt_buf,
+        "Are you sure you want to delete the material '{s}'?",
+        .{title},
+    ) catch "Are you sure you want to delete this material?";
+    model.confirm_delete_prompt_len = prompt.len;
+    if (!model.confirm_delete_open) {
+        model.confirm_delete_open_count +%= 1;
+        model.refreshConfirmDeleteCanvasLabel();
+    }
+    model.confirm_delete_open = true;
+}
+
 /// Delete the selected snippet, then reload.
 fn deleteSnippet(model: *Model, fx: *Effects) void {
     if (model.snippet_writing) return;
@@ -2907,26 +3019,6 @@ fn copySnippet(model: *Model, fx: *Effects) void {
         .text = s.content(),
         .on_result = Effects.clipboardMsg(.snippet_clip_done),
     });
-}
-
-/// Commit the set-language modal: UPDATE just the snippet's language.
-fn saveLangModal(model: *Model, fx: *Effects) void {
-    if (model.lang_modal_id == 0) {
-        model.lang_modal_open = false;
-        return;
-    }
-    if (model.snippet_writing) return;
-    const language = std.mem.trim(u8, model.lang_modal_input.text(), " \t\r\n");
-    model.snippet_writing = true;
-    model.lang_modal_open = false;
-    model.selected_snippet_id = model.lang_modal_id;
-    var params: [3]db.Value = undefined;
-    fx.dbExec(.{
-        .key = key_snip_setlang,
-        .statements = &.{snippets.setLanguageStatement(&params, model.lang_modal_id, language, fx.wallMs())},
-        .on_result = Effects.dbMsg(.snippet_write_done),
-    });
-    model.lang_modal_id = 0;
 }
 
 /// "Save to Snippets" from a chat message: create a snippet from a message's
@@ -3059,6 +3151,41 @@ fn blocksWindows(model: *const Model, scratch: *BlocksApp.WindowsScratch) []cons
         };
         count += 1;
     }
+    // The material add/edit editor: a second secondary window, same pattern.
+    // A fresh `material-canvas-<n>` per open (the reopen-blank fix); the
+    // native red-button close dispatches `close_editor`.
+    if (model.editor_open) {
+        scratch.windows[count] = .{
+            .label = editor_window_label,
+            .canvas_label = model.editorCanvasLabel(),
+            .title = if (model.editing_id == 0) "New material" else "Edit material",
+            .width = 720,
+            .height = 640,
+            .min_width = 520,
+            .min_height = 420,
+            .titlebar = .hidden_inset,
+            .close_policy = .quit,
+            .on_close = .close_editor,
+        };
+        count += 1;
+    }
+    // The delete-confirmation dialog: a small third window. The native
+    // red-button close cancels (same as the Cancel button).
+    if (model.confirm_delete_open) {
+        scratch.windows[count] = .{
+            .label = confirm_delete_window_label,
+            .canvas_label = model.confirmDeleteCanvasLabel(),
+            .title = "Delete material",
+            .width = 460,
+            .height = 200,
+            .min_width = 360,
+            .min_height = 160,
+            .titlebar = .hidden_inset,
+            .close_policy = .quit,
+            .on_close = .cancel_delete,
+        };
+        count += 1;
+    }
     return scratch.windows[0..count];
 }
 
@@ -3108,11 +3235,76 @@ fn settingsModelCard(ui: *BlocksApp.Ui, choice: *const ModelChoice) BlocksApp.Ui
     });
 }
 
+/// Build the material add/edit editor window's canvas tree. Formerly the
+/// inline `<if editorOpen>` markup sheet; now a Zig-built SECONDARY window
+/// (like Settings), driven by the SAME Model/Msg/update loop. Each field
+/// seeds its current buffer text (`.text = ...`) so an EDIT shows the loaded
+/// snippet's values; edits flow back through `edit_*_edit` (via
+/// `Ui.inputMsg`) into the same `edit_*` TextBuffers the old markup used.
+fn editorWindowView(ui: *BlocksApp.Ui, model: *const Model) BlocksApp.Ui.Node {
+    const heading = if (model.editing_id == 0) "New material" else "Edit material";
+    return ui.column(.{ .gap = 10, .padding = 20, .grow = 1 }, .{
+        ui.text(.{ .size = .heading }, heading),
+        ui.textField(.{
+            .placeholder = "Title",
+            .text = model.edit_title.text(),
+            .on_input = BlocksApp.Ui.inputMsg(.edit_title_edit),
+            .autofocus = true,
+        }),
+        ui.textField(.{
+            .placeholder = "Language (e.g. python, zig)",
+            .text = model.edit_language.text(),
+            .on_input = BlocksApp.Ui.inputMsg(.edit_language_edit),
+        }),
+        // The code body: an editable, highlighted code surface (same widget
+        // the read-only detail panel uses), growing to fill the window.
+        ui.code(.{
+            .editable = true,
+            .on_input = BlocksApp.Ui.inputMsg(.edit_content_edit),
+            .line_numbers = true,
+            .grow = 1,
+        }, model.edit_content.text()),
+        ui.textField(.{
+            .placeholder = "Annotation",
+            .text = model.edit_annotation.text(),
+            .on_input = BlocksApp.Ui.inputMsg(.edit_annotation_edit),
+        }),
+        ui.textField(.{
+            .placeholder = "Text expander",
+            .text = model.edit_text_expander.text(),
+            .on_input = BlocksApp.Ui.inputMsg(.edit_text_expander_edit),
+        }),
+        ui.row(.{ .gap = 8, .cross = .center }, .{
+            ui.button(.{ .variant = .primary, .size = .sm, .on_press = .save_snippet }, "Save"),
+            ui.button(.{ .variant = .ghost, .size = .sm, .on_press = .cancel_editor }, "Cancel"),
+        }),
+    });
+}
+
+/// Build the delete-confirmation dialog window's tree: the prompt sentence
+/// (with the material's title) + a red "Yes, delete it!" (confirm) and a
+/// Cancel button. Confirm deletes; Cancel (and the native close) dismiss.
+fn confirmDeleteWindowView(ui: *BlocksApp.Ui, model: *const Model) BlocksApp.Ui.Node {
+    return ui.column(.{ .gap = 16, .padding = 20, .grow = 1 }, .{
+        ui.text(.{ .size = .heading }, "Delete material"),
+        ui.text(.{ .wrap = true, .grow = 1 }, model.confirmDeletePrompt()),
+        ui.row(.{ .gap = 8, .cross = .center }, .{
+            ui.button(.{ .variant = .destructive, .on_press = .confirm_delete }, "Yes, delete it!"),
+            ui.button(.{ .variant = .ghost, .on_press = .cancel_delete }, "Cancel"),
+        }),
+    });
+}
+
 /// Build the Settings window's canvas tree (Task 13). A left nav (All /
 /// About / MCP / Local Model, the active row highlighted) + a right scroll
 /// pane; "All" shows every section, a specific choice narrows to one. Driven
 /// by the SAME Model/Msg/update loop as the main window.
 fn blocksWindowView(ui: *BlocksApp.Ui, model: *const Model, window_label: []const u8) BlocksApp.Ui.Node {
+    // Three secondary windows share this builder; dispatch on the WINDOW label.
+    if (std.mem.eql(u8, window_label, editor_window_label))
+        return editorWindowView(ui, model);
+    if (std.mem.eql(u8, window_label, confirm_delete_window_label))
+        return confirmDeleteWindowView(ui, model);
     std.debug.assert(std.mem.eql(u8, window_label, settings_window_label));
 
     // --- Left nav ---
@@ -3642,11 +3834,15 @@ pub const app_markup = @embedFile("app.native");
 /// (in the framework's stroke/fill icon dialect) and expose it to markup as
 /// `app:sparkle`. Parsed at comptime — a malformed SVG is a compile error.
 const sparkle_icon = canvas.svg_icon.parseComptime(@embedFile("assets/icons/sparkle.svg"));
+/// The Materials screen's `{}` glyph (the built-in icon set has no braces
+/// icon). Same custom-SVG path as `app:sparkle`; drawn via `app:braces`.
+const braces_icon = canvas.svg_icon.parseComptime(@embedFile("assets/icons/braces.svg"));
 /// Reflected by the model contract (`native check`) to validate `app:`
 /// icon references in markup, and handed to `registerAppIcons` in `main`.
 /// MUST be `pub const app_icons` on the app root for the contract to see it.
 pub const app_icons = [_]canvas.icons.Entry{
     .{ .name = "sparkle", .icon = &sparkle_icon },
+    .{ .name = "braces", .icon = &braces_icon },
 };
 
 const BlocksApp = native_sdk.UiApp(Model, Msg);
