@@ -1,16 +1,25 @@
 # Blocks for Developers — Progress & Resumption Notes
 
+> **THIS FILE IS THE MAIN SOURCE OF TRUTH FOR THE PROJECT. KEEP IT ACCURATE.**
+> Going forward, EVERY change to the codebase must be reflected here in the SAME
+> change — update the relevant Task section (or add a "Post-v1 changes" entry) so a
+> future reader can trust this file over their memory. If a later change supersedes
+> something an earlier section described, edit that section (or add an inline
+> `> SUPERSEDED:` note) rather than leaving it wrong. A stale resumption log is worse
+> than none, because it is read first and trusted.
+
 Last updated: end of Task 13 (Welcome/onboarding flow + Settings modal + UI
-polish), VERIFIED END-TO-END live via automation. Schema is still user_version 2
-(migration 0002 added `snippets.text_expander`). This was the FINAL v1 task — all
-14 tasks (0-13) are now implemented. To continue (polish / packaging), open the IDE
-on this repo folder and read this file first.
+polish), VERIFIED END-TO-END live via automation, PLUS packaging + a set of post-v1
+UI refactors (see "Post-v1 changes" below). Schema is still user_version 2
+(migration 0002 added `snippets.text_expander`). All 14 v1 tasks (0-13) are
+implemented, committed, and the app is packaged (see the "Packaging" section). Read
+this file first when resuming.
 Committed so far: Tasks 4-9 (`01969e5`/`56ae2a2`/`c2afa1b`/`e27eb0a`/`887480e`/
 `7a6961d`+`2ec4210`), Task 10 (`db4ce24`), Task 11 (`0fd1db3`), Task 12 (`9ff424a`),
 Task 13 (`b824dd2`+`2b4c904`+`c0f3d95`+`78fceb3`+`fb48067`+`6663f46`+`323d86f`+
 `38fcec6`+`7fa5827`+`8c49c81`). All 14 v1 tasks (0-13) are implemented AND committed.
-Remaining v1 work is packaging (see the "Packaging" section below). Read this first
-when resuming.
+Packaging is DONE (`94cb022`; see the "Packaging" section). Post-v1 UI refactors are
+logged under "Post-v1 changes". Read this file first when resuming.
 
 **Runtime note for live runs:** the llama.cpp runtime is `llama-server`
 (installed via `brew install llama.cpp`, at `/opt/homebrew/bin/llama-server`).
@@ -152,9 +161,11 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
   statement builders + LIKE search). Materials screen wired into `main.zig`
   (keys 190-198, a `Screen` nav) + `app.native` (sidebar list with sort +
   language-filter menus, search, selected-snippet panel with code + All Context
-  = Annotations + Text Expander, editor sheet, set-language typeahead modal),
+  = Annotations + Text Expander, an editor for add/edit, a set-language typeahead),
   plus Save-to-Snippets from chat + Start-Copilot-Chat + copy-to-clipboard. 184
   tests; `native check` clean; VERIFIED END-TO-END live. See the Task 12 section.
+  (SUPERSEDED post-v1: the editor is now a separate OS window and the set-language
+  modal was removed — language is edited in the editor. See "Post-v1 changes".)
 - [x] **Task 13 — Welcome flow + settings modal completion + polish.** DONE.
   Full-screen onboarding (welcome splash -> pick-a-local-model) gated on the
   persisted `onboarded` flag, a Settings modal (About / Model Context Protocol /
@@ -358,8 +369,10 @@ The GPU view label is `main-canvas`. This is how Task 3 was verified end-to-end.
 - **app.native** — the MAIN-window shell (Task 13): a `<if needsOnboarding>` onboarding
   overlay (welcome splash + pick-a-local-model), the main app (`<if onboarded>`) with a
   header (Chat/Materials nav + a Settings button), a Chat screen (sidebar + single-click
-  summary cards + transcript + composer), and a Materials screen. Editor sheet +
-  set-language modal are still `<if>`-gated panels. The SETTINGS UI is NOT here — it's a
+  summary cards + transcript + composer), and a Materials screen. (At Task 13 the editor
+  sheet + set-language modal were still `<if>`-gated panels; SUPERSEDED post-v1 — the
+  editor became a separate OS window and the set-language modal was removed. See "Post-v1
+  changes".) The SETTINGS UI is NOT here — it's a
   SEPARATE OS window built in Zig (`window_view`/`windows_fn` in main.zig), because a
   UiApp binds markup to exactly ONE canvas (the main window). The header "Settings"
   button just dispatches `open_settings`.
@@ -1243,6 +1256,12 @@ After both fixes a clean run passed all four criteria above; 161 tests green;
 
 ## Task 12 — Materials (snippets) screen + chat cross-linking (DONE — what was built)
 
+> SUPERSEDED (UI only): this section describes the editor as an inline `<if>`-gated
+> "editor sheet" and a separate "set-language modal" — accurate at Task 12 time. Post-v1
+> the editor became a SEPARATE OS window (`editorWindowView`) and the set-language modal
+> was REMOVED (language is edited in the editor). The data layer / SQL / cross-linking
+> below is unchanged. See "Post-v1 changes" at the end of this file.
+
 The "Materials" screen from the mockup is live: the user keeps saved code snippets
 ("materials"), each with a language tag, a free-form annotation, and a "text
 expander" note, and can search/sort/filter them, copy them to the clipboard, save
@@ -1486,10 +1505,13 @@ refreshed model contract).
   aligns it. A text leaf grows to its CONTAINER width, so to get a narrow centered
   paragraph, constrain the parent (`max-width`) — otherwise it wraps at the window edge
   with each line left-hugging.
-- **Modals stay `<if test>`-gated panels** (no dedicated dialog element used): the
-  onboarding overlay, editor sheet, and set-language modal are all plain conditional
-  subtrees, so their open state is testable Model state. (The Settings UI is the
-  exception — it's a separate OS window, see below.)
+- **Small overlays stay `<if test>`-gated panels** (no dedicated dialog element used):
+  the onboarding overlay and the Materials sort / language-FILTER dropdown menus are
+  plain conditional subtrees, so their open state is testable Model state. Larger
+  modal/dialog SURFACES are separate OS windows instead (the Settings window at Task 13,
+  and — post-v1 — the material editor + a delete-confirmation dialog); see "Post-v1
+  changes". (At Task 13 the editor + set-language modal were still `<if>` panels; that
+  changed post-v1.)
 
 ### The Settings window — a model-declared SECONDARY OS window (Task 13)
 The Settings UI opens in its OWN native window (per the mockup / the user's request),
@@ -1663,3 +1685,36 @@ Gatekeeper/notarized distribution needs a Developer ID identity
   (0.4.1 here). Pin/verify a known-good build when locking a release.
 - **Login item (SMAppService)** still can't be exercised until run as an installed `.app`
   (the Task 6 note) — verify Start-at-Login registers from the packaged bundle.
+
+## Post-v1 changes (log every change here or in the relevant Task section)
+
+Changes made after the v1 tasks (0-13). Keep this current — see the source-of-truth
+note at the top of this file.
+
+### Packaging — distributable macOS `.app`
+Added `packaging/` (`package-macos.sh`, `vendor-llama.sh`, `README.md`) + a
+`BLOCKS_MCP_SERVER` env override (`resolveMcpBinary` in `main.zig`). Full detail is in
+the "Packaging (DONE — distributable macOS `.app`)" section above.
+
+### Materials editor + set-language + delete-confirmation → separate OS windows
+The Task 12/13 sections describe the material add/edit editor as an inline `<if>`-gated
+"editor sheet" and a separate "set-language modal". That is NO LONGER how it works:
+- **Material add/edit editor is now a SEPARATE OS window** (`editor_window_label` /
+  `editor_canvas_label`), built in Zig by `editorWindowView` in `main.zig`, opened via
+  `windows_fn` when `editor_open`. The "+" FAB (`open_new_snippet`) and the pencil
+  (`open_edit_snippet`) declare it. Its Save/Cancel/close + the five `edit_*_edit`
+  `on-input` arms are dispatched from that window (not markup) — hence listed under the
+  Model's update-only decls.
+- **The set-language modal was REMOVED.** A snippet's language is now edited INSIDE the
+  editor window (the old `{}`-button modal was duplicate functionality). The sidebar
+  language FILTER menu still exists and is unchanged.
+- **A delete-confirmation dialog is ALSO a separate OS window** (`confirm_delete_*`),
+  built by `confirmDeleteWindowView`; the trash button dispatches `request_delete_snippet`
+  on the main canvas, and confirm/cancel come from the dialog window.
+
+All three secondary windows (Settings, material editor, delete-confirmation) are declared
+by `blocksWindows` (`windows_fn`) and routed by window label inside `blocksWindowView`
+(`window_view`); each open hands the window a FRESH `<base>-canvas-<n>` label to dodge the
+reopen-blank-canvas reconcile bug (the same fix Settings uses — see the Task 13 Settings
+window section). `app.native` now only `<if>`-gates the onboarding overlay + the Materials
+sort/language-filter dropdown menus.
