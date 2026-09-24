@@ -194,7 +194,7 @@ test "update: 'All' shows every settings section; a section narrows to one" {
     try std.testing.expect(m.settingsLocalModel());
 }
 
-test "update: copying an MCP URL reports success via the clipboard result" {
+test "update: copying an MCP URL is silent on success (no lingering toast)" {
     var m = main.Model{};
     var fx = main.Effects.init(std.testing.allocator);
     defer fx.deinit();
@@ -202,7 +202,8 @@ test "update: copying an MCP URL reports success via the clipboard result" {
 
     main.update(&m, .copy_mcp_url, &fx);
     main.update(&m, .{ .url_clip_done = .{ .key = 197, .op = .write, .outcome = .ok } }, &fx);
-    try std.testing.expect(std.mem.indexOf(u8, m.snippetStatus(), "Copied") != null);
+    // A successful URL copy shows no confirmation text.
+    try std.testing.expect(!m.hasSnippetStatus());
 }
 
 test "the onboarding + settings views build against the model" {

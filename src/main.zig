@@ -1673,7 +1673,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             .on_result = Effects.clipboardMsg(.url_clip_done),
         }),
         .url_clip_done => |res| {
-            if (res.outcome == .ok) model.setSnippetStatus("Copied URL to clipboard.");
+            // No success toast (the copy confirmation was removed, like the
+            // material-copy one); clear any prior status so nothing lingers
+            // behind the settings window.
+            if (res.outcome == .ok) model.snippet_status_len = 0;
         },
         .config_persisted => |res| {
             // A model-change / onboarding config rewrite completed. Nothing
