@@ -6,8 +6,11 @@ polish), VERIFIED END-TO-END live via automation. Schema is still user_version 2
 14 tasks (0-13) are now implemented. To continue (polish / packaging), open the IDE
 on this repo folder and read this file first.
 Committed so far: Tasks 4-9 (`01969e5`/`56ae2a2`/`c2afa1b`/`e27eb0a`/`887480e`/
-`7a6961d`+`2ec4210`), Task 10 (`db4ce24`), Task 11 (`0fd1db3`). Task 12 + Task 13
-implemented (see their sections) — commit pending. Read this first when resuming.
+`7a6961d`+`2ec4210`), Task 10 (`db4ce24`), Task 11 (`0fd1db3`), Task 12 (`9ff424a`),
+Task 13 (`b824dd2`+`2b4c904`+`c0f3d95`+`78fceb3`+`fb48067`+`6663f46`+`323d86f`+
+`38fcec6`+`7fa5827`+`8c49c81`). All 14 v1 tasks (0-13) are implemented AND committed.
+Remaining v1 work is packaging (see the "Packaging" section below). Read this first
+when resuming.
 
 **Runtime note for live runs:** the llama.cpp runtime is `llama-server`
 (installed via `brew install llama.cpp`, at `/opt/homebrew/bin/llama-server`).
@@ -1555,11 +1558,13 @@ welcome flow then showed correctly. 198 tests green; `native check` clean.
   the real per-day chat list from the `chats` table (mockup 1 groups by date). Wire a
   chats-list query + a `select_chat` nav + date grouping. `+ New chat` currently just
   routes to the chat screen (a fresh chat is still created on first send).
-- **Packaging (the big remaining v1 item).** `native package` must: build + vendor the
-  MCP child (`mcp/zig-out/bin/blocks-mcp`) and a Metal-enabled `llama-server` (+
-  `.metallib`) into the `.app`, and resolve their paths from the bundle exe-dir (the
-  SDK effects channel still has no self-path helper — see the Task 8/9 deferrals). The
-  packaged-build login item (SMAppService) also can't be exercised under `native dev`.
+- **Packaging — DONE (see the "Packaging" section below).** The `.app` is now built by
+  `packaging/package-macos.sh`: it vendors the MCP child + a relocatable `llama-server`
+  into the bundle and a launcher script wires their absolute paths via env
+  (`BLOCKS_MCP_SERVER`/`BLOCKS_LLAMA_SERVER`), sidestepping the missing self-path effect.
+  STILL open: the packaged-build login item (SMAppService) can't be exercised under
+  `native dev`, and the bundle is ad-hoc signed (Developer-ID signing + notarization for
+  Gatekeeper-clean distribution is a follow-up — see the Packaging section).
 - **Onboarding <-> download UX.** `onboard_finish` starts the download and enters the
   app immediately; there's no in-onboarding progress bar/percent (the chat status shows
   "Downloading…"). A progress meter on the pick-model step + a cancel would be nicer.
@@ -1568,3 +1573,93 @@ welcome flow then showed correctly. 198 tests green; `native check` clean.
 - **Settings polish.** No model-delete/disk-usage UI; the login toggle is a text button
   (`On`/`Off`), not a native switch; MCP URLs are static strings (not read from the live
   `mcp-endpoint.json` port, which can differ on an `AddressInUse` scan).
+
+## Packaging (DONE — distributable macOS `.app`)
+
+The app is packaged into a self-contained `Blocks for Developers.app` that runs on
+another Apple-Silicon Mac with NO Homebrew / PATH / dev-env dependency. One command:
+
+```sh
+packaging/package-macos.sh            # full bundle (app + MCP + llama-server)
+packaging/package-macos.sh --skip-llama   # smaller bundle; relies on $BLOCKS_LLAMA_SERVER/PATH
+```
+
+Outputs `dist/Blocks for Developers.app` (~44 MB) and `dist/Blocks for Developers.zip`
+(~16 MB, the distributable). `dist/` and `vendor/` are gitignored (regenerated artifacts).
+
+**The core problem it solves.** The app spawns two child processes at runtime — the MCP
+memory server (`blocks-mcp`) and the llama.cpp chat runtime (`llama-server`) — but under
+`native dev` it locates them by REPO-RELATIVE paths that only resolve because the dev
+cwd is the repo root. Inside a `.app` the cwd is arbitrary, and the SDK effects channel
+still exposes NO self-exe-path / bundle-dir helper (the long-standing Task 8/9 deferral).
+
+**The fix — a launcher that injects absolute sidecar paths via env.** `native package`
+sets `CFBundleExecutable = blocks`, so macOS launches `Contents/MacOS/blocks`. The
+packaging script renames the real Zig binary to `blocks-bin` and drops a zsh launcher in
+its place that computes its own bundle dir (`${0:A:h}`), exports `BLOCKS_MCP_SERVER` +
+`BLOCKS_LLAMA_SERVER` pointing at the vendored binaries under `Contents/Resources/vendor/`,
+then `exec`s `blocks-bin` (same PID, so tray/login still work). Children inherit the env
+(SDK spawn passes the host environment). This required ONE code change:
+`main.zig` `resolveMcpBinary()` now prefers `$BLOCKS_MCP_SERVER` (mirror of the existing
+`models.resolveServerBinary` / `$BLOCKS_LLAMA_SERVER`) before the repo-relative default.
+A dev-set `BLOCKS_LLAMA_SERVER` still wins (the launcher only sets it if unset).
+
+**Bundle layout:**
+```
+Blocks for Developers.app/Contents/
+  MacOS/blocks            # zsh launcher (CFBundleExecutable)
+  MacOS/blocks-bin        # the real ReleaseFast Zig app binary
+  Resources/vendor/mcp/bin/blocks-mcp      # MCP sidecar (links only system libsqlite3)
+  Resources/vendor/llama/bin/llama-server  # llama.cpp runtime
+  Resources/vendor/llama/lib/*.dylib       # its relocated dylib closure (13 dylibs)
+  Resources/icon.png, AppIcon.icns, *manifest.zon
+  Info.plist, PkgInfo, _CodeSignature/
+```
+
+**Vendoring `llama-server` (`packaging/vendor-llama.sh`).** `llama-server` (Homebrew,
+`brew install llama.cpp`) pulls a web of `@rpath` dylibs (libllama*, libmtmd, libggml*,
+libomp) + openssl@3 (libssl/libcrypto) from `/opt/homebrew`. The script copies the binary
++ its full non-system dylib closure into `vendor/llama/{bin,lib}`, rewrites every
+non-system install-name to `@rpath/<leaf>`, sets each dylib id to `@rpath/<leaf>`, adds an
+`LC_RPATH` of `@loader_path` (dylibs) / `@loader_path/../lib` (the binary), strips the old
+Homebrew rpaths, and ad-hoc re-signs each Mach-O (rewriting invalidates the signature).
+Metal is compiled INTO `libggml.0.dylib` in this build (no separate `libggml-metal` /
+`.metallib` to ship). System libs (`/usr/lib`, `/System/...`) are left as-is. Verified
+relocatable: the vendored tree runs `llama-server --version` from a temp dir under
+`env -i` (clean environment, no `/opt/homebrew` on the path).
+
+**Signing.** `native package --signing adhoc` signs the initial bundle; after the script
+mutates it (launcher + vendored sidecars) it re-signs the whole `.app` ad-hoc with
+`codesign --force --deep --sign -`. `codesign --verify --deep --strict` passes and the
+bundle "satisfies its Designated Requirement". Ad-hoc is enough to RUN locally and for a
+user who removes the quarantine attr (`xattr -dr com.apple.quarantine <app>`); a clean
+Gatekeeper/notarized distribution needs a Developer ID identity
+(`native package --signing identity --identity "Developer ID Application: …"
+--notarize --notary-profile <profile>`) — a follow-up (requires an Apple Developer acct).
+
+### VERIFIED
+- `native test --yes` → 200/200 pass; `native check` clean, after the `resolveMcpBinary`
+  change.
+- `mcp/zig-out/bin/blocks-mcp` links only `/usr/lib/libsqlite3.dylib` + libSystem (on
+  every macOS) — fully portable; the ReleaseFast app binary links only system frameworks.
+- Bundled `llama-server --version` runs from inside the `.app` under `env -i` (clean env).
+- Bundled `blocks-mcp` launched from inside the `.app` under `env -i` against a temp
+  `app.db`: wrote its endpoint file, and `curl POST tools/list` returned the 3 tool
+  descriptors; `get_activity` answered (empty on the empty test DB).
+- The `.app` copied to a fresh location (`/tmp`) still runs its vendored `llama-server`
+  under a clean env AND still passes `codesign --verify --deep --strict` — genuinely
+  relocatable (proves the drag-to-/Applications-on-another-Mac path).
+
+### Deferred / follow-ups
+- **Developer-ID signing + notarization** for a Gatekeeper-clean download (needs an Apple
+  Developer account + `--notarize --notary-profile`). Ad-hoc bundles need the quarantine
+  attribute cleared on the target Mac.
+- **A `.dmg`** (drag-to-Applications installer) instead of / alongside the zip — a
+  `create-dmg` / `hdiutil` step on top of the built `.app`.
+- **Universal binary (x86_64 + arm64).** Current bundle is arm64-only (the Homebrew
+  `llama-server` + the Zig build target). An Intel build would need a second vendored
+  `llama-server` + a `lipo`'d app binary, or a per-arch bundle.
+- **llama-server version pinning.** The vendor script grabs whatever `brew` has installed
+  (0.4.1 here). Pin/verify a known-good build when locking a release.
+- **Login item (SMAppService)** still can't be exercised until run as an installed `.app`
+  (the Task 6 note) — verify Start-at-Login registers from the packaged bundle.

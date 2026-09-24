@@ -112,11 +112,24 @@ const key_config_persist: u64 = 200; // rewrite config.json (model change / onbo
 /// The loopback port the MCP child binds (passed explicitly so the app
 /// knows where to reach it without first reading the endpoint file).
 const mcp_port: u16 = 39_017;
-/// argv[0] for the MCP child. Under `native dev` the app's cwd is the repo
-/// root, so this repo-relative path resolves. A packaged build ships the
-/// binary beside the app; locating it there needs the bundle path (no
-/// self-path effect exists yet) and is a documented Task 8 follow-up.
-const mcp_binary_path = "mcp/zig-out/bin/blocks-mcp";
+/// Default argv[0] for the MCP child. Under `native dev` the app's cwd is the
+/// repo root, so this repo-relative path resolves. A packaged `.app` cannot
+/// see the repo, and the SDK exposes no self-exe-path effect, so the bundle's
+/// launcher script exports `BLOCKS_MCP_SERVER` with the absolute path to the
+/// vendored `blocks-mcp` beside the app — `resolveMcpBinary` prefers it.
+const mcp_binary_default = "mcp/zig-out/bin/blocks-mcp";
+/// Env var the packaged launcher sets to point the app at the vendored MCP
+/// child (mirror of `BLOCKS_LLAMA_SERVER` for the llama runtime).
+const mcp_binary_env = "BLOCKS_MCP_SERVER";
+
+/// The MCP child binary path: `$BLOCKS_MCP_SERVER` when set (packaged build),
+/// else the repo-relative default (`native dev`).
+fn resolveMcpBinary() []const u8 {
+    if (env.lookup(mcp_binary_env)) |v| {
+        if (v.len > 0) return v;
+    }
+    return mcp_binary_default;
+}
 /// The MCP tools/list request body used as a health check once the child
 /// has had a moment to bind its port.
 const mcp_health_body =
@@ -2062,7 +2075,7 @@ fn startMcpServer(model: *Model, fx: *Effects) void {
     // its own stderr, surfaced in the exit Msg's stderr_tail if it dies.
     fx.spawn(.{
         .key = key_mcp_spawn,
-        .argv = &.{ mcp_binary_path, "--db", paths.db, "--port", port_str },
+        .argv = &.{ resolveMcpBinary(), "--db", paths.db, "--port", port_str },
         .output = .collect,
         .on_exit = Effects.exitMsg(.mcp_exit),
     });
