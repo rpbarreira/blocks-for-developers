@@ -463,6 +463,15 @@ pub const Model = struct {
     /// false the tray toggle is shown disabled. Assume supported until the
     /// host says otherwise (a `.set`/`.status` "unsupported" result).
     login_supported: bool = true,
+    /// True while a launch-at-login `.set` request is in flight (so the
+    /// Settings button can show it's busy and reject a double-click).
+    login_pending: bool = false,
+    /// A short human-readable result of the last login action, shown under
+    /// the Settings toggle so the click always produces visible feedback
+    /// (the host `.set` can fail — e.g. an unsigned/quarantined bundle — and
+    /// silence looked like a dead button).
+    login_status_buf: [96]u8 = undefined,
+    login_status_len: usize = 0,
 
     // ---- Embedding generation (Task 7) ----
     /// True while an embedding pass is running (coalesces triggers).
@@ -955,9 +964,27 @@ pub const Model = struct {
         _ = self;
         return llama_url;
     }
-    /// The launch-at-login toggle label for the Settings row.
+    /// The launch-at-login toggle label for the Settings row. While a change
+    /// is in flight it reads "…" so the click has an immediate response.
     pub fn loginToggleLabel(self: *const Model) []const u8 {
+        if (self.login_pending) return "…";
         return if (self.login_enabled) "On" else "Off";
+    }
+    /// Whether the login toggle should be disabled (unsupported on this Mac,
+    /// or a change is already in flight).
+    pub fn loginToggleDisabled(self: *const Model) bool {
+        return !self.login_supported or self.login_pending;
+    }
+    /// The status/result line under the login toggle (empty = nothing to say).
+    pub fn loginStatusText(self: *const Model) []const u8 {
+        return self.login_status_buf[0..self.login_status_len];
+    }
+    pub fn hasLoginStatus(self: *const Model) bool {
+        return self.login_status_len > 0;
+    }
+    fn setLoginStatus(self: *Model, msg: []const u8) void {
+        self.login_status_len = @min(msg.len, self.login_status_buf.len);
+        @memcpy(self.login_status_buf[0..self.login_status_len], msg[0..self.login_status_len]);
     }
 
     // ---- Materials / snippets accessors (Task 12) ----
@@ -1160,7 +1187,8 @@ pub const Model = struct {
         "scan_file_idx",      "scan_content_buf",   "scan_content_len", "scan_hash_buf",
         "scan_last_hash_buf", "scan_last_hash_len", "scanRepoPath",
         // Tray + launch-at-login (Task 6).
-        "login_enabled",      "login_supported",
+        "login_enabled",      "login_supported",  "login_pending",
+        "login_status_buf",   "login_status_len",
         // Embedding generation (Task 7).
         "embedding",          "embed_phase",       "embed_last_rows",
         // MCP server child process (Task 8).
@@ -1195,6 +1223,7 @@ pub const Model = struct {
         "settingsOpen",         "settingsAbout",       "settingsMcp",
         "settingsLocalModel",   "settingsRepos",       "appVersionText",
         "mcpUrlText",           "llamaUrlText",        "loginToggleLabel",
+        "loginToggleDisabled",  "loginStatusText",     "hasLoginStatus",
         "dataDirText",          "repoError",           "isAddingRepo",
         "reposSlice",           "canDownload",         "settingsCanvasLabel",
         "refreshSettingsCanvasLabel",
@@ -1891,9 +1920,19 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .open_window => fx.showWindow(main_window_label),
         .quit_app => fx.quitApp(),
         .toggle_login => {
-            if (!model.login_supported) return;
-            // Optimistically flip; the host result confirms/corrects it.
+            // Ignore while a change is already in flight (avoids racing two
+            // register/unregister calls).
+            if (model.login_pending) return;
+            if (!model.login_supported) {
+                model.setLoginStatus("Start at login isn't available on this Mac.");
+                return;
+            }
+            // Optimistically flip so the label switches immediately (instant
+            // feedback); the host result confirms or corrects it below.
             const enable = !model.login_enabled;
+            model.login_enabled = enable;
+            model.login_pending = true;
+            model.setLoginStatus(if (enable) "Enabling start at login…" else "Disabling start at login…");
             const payload = [_]u8{@intFromBool(enable)};
             fx.hostRequest(.{
                 .key = key_login_set,
@@ -1902,8 +1941,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 .on_result = Effects.hostMsg(.login_set_done),
             });
         },
-        .login_status_done => |res| applyLoginResult(model, res),
-        .login_set_done => |res| applyLoginResult(model, res),
+        .login_status_done => |res| applyLoginResult(model, res, false),
+        .login_set_done => |res| applyLoginResult(model, res, true),
 
         // ---- Embedding generation (Task 7) ----
         .embed_events_page => |res| embedEventsPage(model, res, fx),
@@ -3098,25 +3137,45 @@ fn startCopilotChat(model: *Model, fx: *Effects) void {
     sendChat(model, fx);
 }
 
-/// Interpret a launch-at-login host result (from either the status query or
-/// a set request) and update the model's login flags. The result bytes are
-/// the status name on success, or an error tag on failure.
-fn applyLoginResult(model: *Model, res: native_sdk.EffectHostResult) void {
+/// Interpret a launch-at-login host result and update the model's login
+/// flags. The result bytes are the status name on success, or an error tag
+/// on failure. `from_set` is true for the result of a user toggle (a `.set`
+/// request) — that path shows a status message and clears `login_pending`;
+/// the boot status query (`from_set = false`) updates state silently.
+fn applyLoginResult(model: *Model, res: native_sdk.EffectHostResult, from_set: bool) void {
+    if (from_set) model.login_pending = false;
+
     if (!res.ok) {
-        // "unsupported" means the platform/build has no launch-at-login;
-        // disable the toggle. "failed"/"rejected" leave state unchanged.
-        if (std.mem.eql(u8, res.bytes, "unsupported")) model.login_supported = false;
+        if (std.mem.eql(u8, res.bytes, "unsupported")) {
+            // The platform/build has no launch-at-login — disable the toggle.
+            model.login_supported = false;
+            if (from_set) {
+                model.login_enabled = false; // undo the optimistic flip
+                model.setLoginStatus("Start at login isn't available on this Mac.");
+            }
+        } else if (from_set) {
+            // A supported service refused (e.g. an unsigned/quarantined bundle,
+            // or macOS denied the registration). Undo the optimistic flip and
+            // tell the user, instead of leaving a dead-looking button.
+            model.login_enabled = !model.login_enabled; // revert the optimistic guess
+            model.setLoginStatus("Couldn't change the login setting. Move Blocks to /Applications and try again.");
+        }
         return;
     }
+
     model.login_supported = true;
     if (std.mem.eql(u8, res.bytes, "enabled")) {
         model.login_enabled = true;
+        if (from_set) model.setLoginStatus("Blocks will start at login.");
     } else if (std.mem.eql(u8, res.bytes, "disabled") or std.mem.eql(u8, res.bytes, "not_found")) {
         model.login_enabled = false;
+        if (from_set) model.setLoginStatus("Blocks won't start at login.");
     } else if (std.mem.eql(u8, res.bytes, "requires_approval")) {
         // macOS SMAppService: registered but pending the user's approval in
-        // System Settings. Treat as "on" for the toggle — the item exists.
+        // System Settings > General > Login Items. Treat as "on" — the item
+        // exists — but tell the user it needs their approval.
         model.login_enabled = true;
+        if (from_set) model.setLoginStatus("Approve Blocks in System Settings > Login Items.");
     }
 }
 
@@ -3354,8 +3413,16 @@ fn blocksWindowView(ui: *BlocksApp.Ui, model: *const Model, window_label: []cons
             ui.spacer(12),
             ui.row(.{ .cross = .center, .gap = 8 }, .{
                 ui.text(.{ .grow = 1 }, "Start Blocks at login"),
-                ui.button(.{ .variant = .ghost, .on_press = .toggle_login }, model.loginToggleLabel()),
+                ui.button(.{
+                    .variant = .ghost,
+                    .on_press = .toggle_login,
+                    .disabled = model.loginToggleDisabled(),
+                }, model.loginToggleLabel()),
             }),
+            if (model.hasLoginStatus())
+                ui.statusBar(.{}, model.loginStatusText())
+            else
+                ui.spacer(0),
         });
         pn += 1;
     }

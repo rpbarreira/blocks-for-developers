@@ -1741,3 +1741,41 @@ Changes, all in `src/chat.zig` (PURE) except the load loop:
 - The `app.native` binding is unchanged (`<status-bar>{c.groupLabel}</status-bar>` under
   `<if test="{c.groupHead}">`). 202 tests (was 200): added `formatDmy` +
   earlier-bucket `groupLabel` tests. `native check` clean.
+
+### "Start Blocks at login" toggle — feedback + optimistic flip (bug fix)
+Reported live on the INSTALLED app: clicking the Settings › About "Start Blocks at
+login" button did nothing — no On/Off switch, no feedback. Root cause was in the app's
+own state handling (`src/main.zig`), not the button wiring (it dispatches `.toggle_login`
+through the same proven `window_view` `on_press` path as the working Copy/nav buttons):
+- The `.toggle_login` arm fired the `native-sdk.launch-at-login.set` host request but did
+  NOT flip `login_enabled` itself — the label only moved when `applyLoginResult` set it
+  from the async result. And `applyLoginResult`'s `!ok` branch SILENTLY returned for any
+  non-`"unsupported"` failure (e.g. SMAppService `register` returning `"failed"` for an
+  ad-hoc/quarantined bundle or a denied registration). Net effect: click → nothing.
+
+Fix (all in `main.zig`; `app.native` untouched — Settings is a Zig-built window):
+- `.toggle_login` now flips `login_enabled` OPTIMISTICALLY, sets a new `login_pending`
+  flag, and sets a `login_status` message ("Enabling…/Disabling…") — instant feedback.
+  It early-returns with an explanatory status when `!login_supported` (was a silent
+  no-op).
+- `applyLoginResult(model, res, from_set)` gained the `from_set` flag: the boot status
+  query (`from_set=false`) updates state silently; a user toggle (`from_set=true`) clears
+  `login_pending`, and ALWAYS sets a human-readable `login_status` — success
+  ("Blocks will start at login." / "…won't…" / "Approve Blocks in System Settings >
+  Login Items." for `requires_approval`) OR failure, reverting the optimistic flip on a
+  refused/`failed` set ("Couldn't change the login setting. Move Blocks to /Applications
+  and try again.") and on `unsupported`.
+- New Model fields `login_pending` + `login_status_buf/len` (+ accessors
+  `loginToggleDisabled`/`loginStatusText`/`hasLoginStatus`, and `loginToggleLabel` now
+  returns "…" while pending). Added to `view_unbound` (read by the Zig settings window).
+- The About-pane login button is now `.disabled = loginToggleDisabled()` (unsupported or
+  pending) and a `<statusBar>` under it shows `loginStatusText()`.
+- 205 tests (was 202): optimistic-flip + busy label, failed-set reverts + explains,
+  unsupported explains, boot-status is silent. `native check` clean.
+
+NOTE (runtime caveat, not a code bug): whether SMAppService actually REGISTERS depends on
+the bundle being a valid, Launch-Services-registered app in a stable location (e.g.
+/Applications) with quarantine cleared, on macOS 13+. The bundle is ad-hoc signed; if
+macOS refuses the registration the toggle now honestly reports it instead of looking
+dead. A Developer-ID-signed + notarized build (packaging follow-up) is the way to make it
+register cleanly for all users.
