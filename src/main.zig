@@ -66,9 +66,8 @@ const key_snap_lasthash: u64 = 131; // query a file's last content_hash
 const key_snap_content: u64 = 132; // readFile a changed file's content
 const key_snap_diff: u64 = 133; // spawn `git diff -- <path>`
 const key_snap_write: u64 = 134; // insert the snapshot row
-// Launch-at-login host requests (Task 6). Share the spawn/fetch/file key space.
-const key_login_status: u64 = 140; // query current launch-at-login state
-const key_login_set: u64 = 141; // enable/disable launch-at-login
+// (Keys 140/141 were the launch-at-login host requests — removed. Users who
+// want start-at-login use macOS System Settings > General > Login Items.)
 // Embedding generation (Task 7).
 const key_embed_events: u64 = 150; // query un-embedded events
 const key_embed_snaps: u64 = 151; // query un-embedded file snapshots
@@ -213,9 +212,6 @@ const embed_batch = 16;
 /// Text length embedded per row (subject+body / path+content, truncated).
 const embed_text_bytes = 4096;
 
-// Launch-at-login host-service names (see SDK effects: native host requests).
-const host_login_status = "native-sdk.launch-at-login.status";
-const host_login_set = "native-sdk.launch-at-login.set";
 
 /// The window label the tray "Open Blocks" action reveals. Matches the
 /// `shell_windows` entry below.
@@ -454,24 +450,6 @@ pub const Model = struct {
     /// The last stored hash for the current file ("" when never stored).
     scan_last_hash_buf: [snapshots.hash_hex_len]u8 = undefined,
     scan_last_hash_len: usize = 0,
-
-    // ---- Tray + launch-at-login (Task 6) ----
-    /// Whether "start at login" is currently enabled (drives the tray
-    /// toggle's check mark). Learned from the host on boot.
-    login_enabled: bool = false,
-    /// Whether the platform/build supports launch-at-login at all. When
-    /// false the tray toggle is shown disabled. Assume supported until the
-    /// host says otherwise (a `.set`/`.status` "unsupported" result).
-    login_supported: bool = true,
-    /// True while a launch-at-login `.set` request is in flight (so the
-    /// Settings button can show it's busy and reject a double-click).
-    login_pending: bool = false,
-    /// A short human-readable result of the last login action, shown under
-    /// the Settings toggle so the click always produces visible feedback
-    /// (the host `.set` can fail — e.g. an unsigned/quarantined bundle — and
-    /// silence looked like a dead button).
-    login_status_buf: [96]u8 = undefined,
-    login_status_len: usize = 0,
 
     // ---- Embedding generation (Task 7) ----
     /// True while an embedding pass is running (coalesces triggers).
@@ -964,29 +942,6 @@ pub const Model = struct {
         _ = self;
         return llama_url;
     }
-    /// The launch-at-login toggle label for the Settings row. While a change
-    /// is in flight it reads "…" so the click has an immediate response.
-    pub fn loginToggleLabel(self: *const Model) []const u8 {
-        if (self.login_pending) return "…";
-        return if (self.login_enabled) "On" else "Off";
-    }
-    /// Whether the login toggle should be disabled (unsupported on this Mac,
-    /// or a change is already in flight).
-    pub fn loginToggleDisabled(self: *const Model) bool {
-        return !self.login_supported or self.login_pending;
-    }
-    /// The status/result line under the login toggle (empty = nothing to say).
-    pub fn loginStatusText(self: *const Model) []const u8 {
-        return self.login_status_buf[0..self.login_status_len];
-    }
-    pub fn hasLoginStatus(self: *const Model) bool {
-        return self.login_status_len > 0;
-    }
-    fn setLoginStatus(self: *Model, msg: []const u8) void {
-        self.login_status_len = @min(msg.len, self.login_status_buf.len);
-        @memcpy(self.login_status_buf[0..self.login_status_len], msg[0..self.login_status_len]);
-    }
-
     // ---- Materials / snippets accessors (Task 12) ----
     /// The loaded snippets, further narrowed by the "Find materials…" text
     /// (client-side substring match over title + blurb). The language filter
@@ -1186,9 +1141,6 @@ pub const Model = struct {
         "scan_repo_path_buf", "scan_repo_path_len", "scan_paths",      "scan_path_count",
         "scan_file_idx",      "scan_content_buf",   "scan_content_len", "scan_hash_buf",
         "scan_last_hash_buf", "scan_last_hash_len", "scanRepoPath",
-        // Tray + launch-at-login (Task 6).
-        "login_enabled",      "login_supported",  "login_pending",
-        "login_status_buf",   "login_status_len",
         // Embedding generation (Task 7).
         "embedding",          "embed_phase",       "embed_last_rows",
         // MCP server child process (Task 8).
@@ -1222,8 +1174,7 @@ pub const Model = struct {
         "settings_open_count",  "settings_canvas_buf", "settings_canvas_len",
         "settingsOpen",         "settingsAbout",       "settingsMcp",
         "settingsLocalModel",   "settingsRepos",       "appVersionText",
-        "mcpUrlText",           "llamaUrlText",        "loginToggleLabel",
-        "loginToggleDisabled",  "loginStatusText",     "hasLoginStatus",
+        "mcpUrlText",           "llamaUrlText",
         "dataDirText",          "repoError",           "isAddingRepo",
         "reposSlice",           "canDownload",         "settingsCanvasLabel",
         "refreshSettingsCanvasLabel",
@@ -1287,12 +1238,9 @@ pub const Msg = union(enum) {
     snap_diff_done: native_sdk.EffectExit, // `git diff` output (collected)
     snap_write_done: native_sdk.EffectDbResult, // snapshot insert result
 
-    // Tray + launch-at-login (Task 6)
+    // Tray (Task 6)
     open_window, // tray "Open Blocks" — reveal the main window
     quit_app, // tray "Quit Blocks"
-    toggle_login, // tray "Start at Login" toggle
-    login_status_done: native_sdk.EffectHostResult, // launch-at-login status query
-    login_set_done: native_sdk.EffectHostResult, // launch-at-login set result
 
     // Embedding generation (Task 7)
     embed_events_page: native_sdk.EffectDbResult, // un-embedded events query
@@ -1395,7 +1343,6 @@ pub const Msg = union(enum) {
         "capture_write_done",  "snapshot_tick",      "snap_status_done",
         "snap_lasthash_done",  "snap_content_done",  "snap_diff_done",
         "snap_write_done",     "open_window",        "quit_app",
-        "toggle_login",        "login_status_done",  "login_set_done",
         "embed_events_page",   "embed_snaps_page",   "embed_write_done",
         "mcp_exit",            "mcp_health_tick",    "mcp_health_done",
         // Task 9 effect-delivered arms (download_model/select_model ARE
@@ -1432,11 +1379,10 @@ pub const Msg = union(enum) {
         // Task 13. onboard_next/onboard_finish/open_settings are bound in
         // the main markup; the SETTINGS-window controls (close_settings,
         // settings_all/about/mcp/local_model, copy_*_url, download_model,
-        // toggle_login, and the repos add/remove/input Msgs) are dispatched
-        // from the Zig-built settings window (`window_view`), not markup, so
-        // they're listed here. url_clip_done/config_persisted are effect
-        // results. (toggle_login was already listed above under Task 6;
-        // add_repo_clicked/repo_input_edit/remove_repo move here from Task 3
+        // and the repos add/remove/input Msgs) are dispatched from the
+        // Zig-built settings window (`window_view`), not markup, so they're
+        // listed here. url_clip_done/config_persisted are effect results.
+        // (add_repo_clicked/repo_input_edit/remove_repo live here from Task 3
         // now that Watched Repositories lives only in the settings window.)
         "url_clip_done",   "config_persisted",
         "close_settings",  "settings_all",       "settings_about",
@@ -1503,13 +1449,6 @@ pub fn initFx(model: *Model, fx: *Effects) void {
         .on_result = Effects.fileMsg(.stat_config),
     });
 
-    // Query the current launch-at-login state so the tray toggle reflects
-    // reality (empty payload = a status read).
-    fx.hostRequest(.{
-        .key = key_login_status,
-        .name = host_login_status,
-        .on_result = Effects.hostMsg(.login_status_done),
-    });
 }
 
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
@@ -1916,33 +1855,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             scanNextFile(model, fx);
         },
 
-        // ---- Tray + launch-at-login (Task 6) ----
+        // ---- Tray (Task 6) ----
         .open_window => fx.showWindow(main_window_label),
         .quit_app => fx.quitApp(),
-        .toggle_login => {
-            // Ignore while a change is already in flight (avoids racing two
-            // register/unregister calls).
-            if (model.login_pending) return;
-            if (!model.login_supported) {
-                model.setLoginStatus("Start at login isn't available on this Mac.");
-                return;
-            }
-            // Optimistically flip so the label switches immediately (instant
-            // feedback); the host result confirms or corrects it below.
-            const enable = !model.login_enabled;
-            model.login_enabled = enable;
-            model.login_pending = true;
-            model.setLoginStatus(if (enable) "Enabling start at login…" else "Disabling start at login…");
-            const payload = [_]u8{@intFromBool(enable)};
-            fx.hostRequest(.{
-                .key = key_login_set,
-                .name = host_login_set,
-                .payload = &payload,
-                .on_result = Effects.hostMsg(.login_set_done),
-            });
-        },
-        .login_status_done => |res| applyLoginResult(model, res, false),
-        .login_set_done => |res| applyLoginResult(model, res, true),
 
         // ---- Embedding generation (Task 7) ----
         .embed_events_page => |res| embedEventsPage(model, res, fx),
@@ -3137,53 +3052,12 @@ fn startCopilotChat(model: *Model, fx: *Effects) void {
     sendChat(model, fx);
 }
 
-/// Interpret a launch-at-login host result and update the model's login
-/// flags. The result bytes are the status name on success, or an error tag
-/// on failure. `from_set` is true for the result of a user toggle (a `.set`
-/// request) — that path shows a status message and clears `login_pending`;
-/// the boot status query (`from_set = false`) updates state silently.
-fn applyLoginResult(model: *Model, res: native_sdk.EffectHostResult, from_set: bool) void {
-    if (from_set) model.login_pending = false;
-
-    if (!res.ok) {
-        if (std.mem.eql(u8, res.bytes, "unsupported")) {
-            // The platform/build has no launch-at-login — disable the toggle.
-            model.login_supported = false;
-            if (from_set) {
-                model.login_enabled = false; // undo the optimistic flip
-                model.setLoginStatus("Start at login isn't available on this Mac.");
-            }
-        } else if (from_set) {
-            // A supported service refused (e.g. an unsigned/quarantined bundle,
-            // or macOS denied the registration). Undo the optimistic flip and
-            // tell the user, instead of leaving a dead-looking button.
-            model.login_enabled = !model.login_enabled; // revert the optimistic guess
-            model.setLoginStatus("Couldn't change the login setting. Move Blocks to /Applications and try again.");
-        }
-        return;
-    }
-
-    model.login_supported = true;
-    if (std.mem.eql(u8, res.bytes, "enabled")) {
-        model.login_enabled = true;
-        if (from_set) model.setLoginStatus("Blocks will start at login.");
-    } else if (std.mem.eql(u8, res.bytes, "disabled") or std.mem.eql(u8, res.bytes, "not_found")) {
-        model.login_enabled = false;
-        if (from_set) model.setLoginStatus("Blocks won't start at login.");
-    } else if (std.mem.eql(u8, res.bytes, "requires_approval")) {
-        // macOS SMAppService: registered but pending the user's approval in
-        // System Settings > General > Login Items. Treat as "on" — the item
-        // exists — but tell the user it needs their approval.
-        model.login_enabled = true;
-        if (from_set) model.setLoginStatus("Approve Blocks in System Settings > Login Items.");
-    }
-}
-
 /// Tray menu state, derived from the model each rebuild. The runtime calls
 /// this and applies the returned status item; menu selections come back
 /// through `onTrayCommand`.
 fn statusItem(model: *const Model, scratch: *BlocksApp.StatusItemScratch) BlocksApp.StatusItemState {
-    const items = tray.buildMenu(&scratch.items, model.login_enabled, model.login_supported);
+    _ = model;
+    const items = tray.buildMenu(&scratch.items);
     return .{
         .title = "Blocks",
         .tooltip = "Blocks for Developers",
@@ -3194,7 +3068,6 @@ fn statusItem(model: *const Model, scratch: *BlocksApp.StatusItemScratch) Blocks
 /// Map a tray/menu command name to a Msg (or null to ignore it).
 fn onTrayCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, tray.cmd_open)) return .open_window;
-    if (std.mem.eql(u8, name, tray.cmd_toggle_login)) return .toggle_login;
     if (std.mem.eql(u8, name, tray.cmd_quit)) return .quit_app;
     return null;
 }
@@ -3410,19 +3283,6 @@ fn blocksWindowView(ui: *BlocksApp.Ui, model: *const Model, window_label: []cons
                 ui.statusBar(.{ .grow = 1 }, model.dataDirText()),
                 ui.button(.{ .variant = .ghost, .size = .sm, .on_press = .copy_data_dir }, "Copy"),
             }),
-            ui.spacer(12),
-            ui.row(.{ .cross = .center, .gap = 8 }, .{
-                ui.text(.{ .grow = 1 }, "Start Blocks at login"),
-                ui.button(.{
-                    .variant = .ghost,
-                    .on_press = .toggle_login,
-                    .disabled = model.loginToggleDisabled(),
-                }, model.loginToggleLabel()),
-            }),
-            if (model.hasLoginStatus())
-                ui.statusBar(.{}, model.loginStatusText())
-            else
-                ui.spacer(0),
         });
         pn += 1;
     }

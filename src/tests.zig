@@ -227,7 +227,7 @@ test "the onboarding + settings views build against the model" {
     _ = try buildTree(arena, &settings);
 }
 
-// ---- Tray + launch-at-login (Task 6) ----
+// ---- Tray (Task 6) ----
 
 test "update: tray Open reveals the main window" {
     var m = main.Model{};
@@ -249,114 +249,6 @@ test "update: tray Quit asks the app to quit" {
 
     main.update(&m, .quit_app, &fx);
     try std.testing.expectEqual(@as(u32, 1), fx.windowActionState().quit_count);
-}
-
-test "update: login status result 'enabled' turns the toggle on" {
-    var m = main.Model{};
-    var fx = main.Effects.init(std.testing.allocator);
-    defer fx.deinit();
-    fx.executor = .fake;
-
-    main.update(&m, .{ .login_status_done = .{ .key = 140, .ok = true, .bytes = "enabled" } }, &fx);
-    try std.testing.expect(m.login_enabled);
-    try std.testing.expect(m.login_supported);
-}
-
-test "update: login result 'disabled' turns the toggle off" {
-    var m = main.Model{ .login_enabled = true, .login_pending = true };
-    var fx = main.Effects.init(std.testing.allocator);
-    defer fx.deinit();
-    fx.executor = .fake;
-
-    main.update(&m, .{ .login_set_done = .{ .key = 141, .ok = true, .bytes = "disabled" } }, &fx);
-    try std.testing.expect(!m.login_enabled);
-    // A `.set` result clears the pending flag and shows feedback.
-    try std.testing.expect(!m.login_pending);
-    try std.testing.expect(m.hasLoginStatus());
-}
-
-test "update: toggling login fires the host request, flips optimistically, and shows a busy label" {
-    var m = main.Model{ .login_supported = true, .login_enabled = false };
-    var fx = main.Effects.init(std.testing.allocator);
-    defer fx.deinit();
-    fx.executor = .fake;
-
-    main.update(&m, .toggle_login, &fx);
-    // Optimistic flip + pending state gives instant feedback.
-    try std.testing.expect(m.login_enabled);
-    try std.testing.expect(m.login_pending);
-    try std.testing.expectEqualStrings("…", m.loginToggleLabel());
-    try std.testing.expect(m.loginToggleDisabled()); // disabled while pending
-    try std.testing.expect(m.hasLoginStatus());
-
-    // The host confirms 'enabled' — pending clears, label settles on "On".
-    main.update(&m, .{ .login_set_done = .{ .key = 141, .ok = true, .bytes = "enabled" } }, &fx);
-    try std.testing.expect(m.login_enabled);
-    try std.testing.expect(!m.login_pending);
-    try std.testing.expectEqualStrings("On", m.loginToggleLabel());
-}
-
-test "update: a failed set reverts the optimistic flip and surfaces an error" {
-    // The real bug: an unsigned/quarantined bundle's SMAppService register
-    // returns 'failed' (ok=false, bytes != 'unsupported'). The toggle must
-    // NOT silently stay flipped — it reverts and tells the user.
-    var m = main.Model{ .login_supported = true, .login_enabled = false };
-    var fx = main.Effects.init(std.testing.allocator);
-    defer fx.deinit();
-    fx.executor = .fake;
-
-    main.update(&m, .toggle_login, &fx); // optimistic -> enabled, pending
-    main.update(&m, .{ .login_set_done = .{ .key = 141, .ok = false, .bytes = "failed" } }, &fx);
-    try std.testing.expect(!m.login_enabled); // reverted
-    try std.testing.expect(!m.login_pending);
-    try std.testing.expect(m.login_supported); // 'failed' != 'unsupported'
-    try std.testing.expect(m.hasLoginStatus());
-}
-
-test "update: the boot status query updates state silently (no status text)" {
-    var m = main.Model{};
-    var fx = main.Effects.init(std.testing.allocator);
-    defer fx.deinit();
-    fx.executor = .fake;
-
-    main.update(&m, .{ .login_status_done = .{ .key = 140, .ok = true, .bytes = "disabled" } }, &fx);
-    try std.testing.expect(!m.login_enabled);
-    try std.testing.expect(!m.hasLoginStatus()); // boot query shows no toast
-}
-
-test "update: 'requires_approval' counts as enabled (item registered)" {
-    var m = main.Model{};
-    var fx = main.Effects.init(std.testing.allocator);
-    defer fx.deinit();
-    fx.executor = .fake;
-
-    main.update(&m, .{ .login_status_done = .{ .key = 140, .ok = true, .bytes = "requires_approval" } }, &fx);
-    try std.testing.expect(m.login_enabled);
-}
-
-test "update: an 'unsupported' failure disables the toggle" {
-    var m = main.Model{ .login_supported = true };
-    var fx = main.Effects.init(std.testing.allocator);
-    defer fx.deinit();
-    fx.executor = .fake;
-
-    main.update(&m, .{ .login_set_done = .{ .key = 141, .ok = false, .bytes = "unsupported" } }, &fx);
-    try std.testing.expect(!m.login_supported);
-    try std.testing.expect(m.hasLoginStatus());
-}
-
-test "update: toggling login while unsupported doesn't flip but does explain" {
-    var m = main.Model{ .login_supported = false, .login_enabled = false };
-    var fx = main.Effects.init(std.testing.allocator);
-    defer fx.deinit();
-    fx.executor = .fake;
-
-    // Should not flip the model or crash; the host is never asked — but the
-    // click now produces a visible explanation instead of dead silence.
-    main.update(&m, .toggle_login, &fx);
-    try std.testing.expect(!m.login_enabled);
-    try std.testing.expect(!m.login_pending);
-    try std.testing.expect(m.hasLoginStatus());
 }
 
 // ---- MCP server child process (Task 8) ----

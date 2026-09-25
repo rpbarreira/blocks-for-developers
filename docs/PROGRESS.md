@@ -1779,3 +1779,23 @@ the bundle being a valid, Launch-Services-registered app in a stable location (e
 macOS refuses the registration the toggle now honestly reports it instead of looking
 dead. A Developer-ID-signed + notarized build (packaging follow-up) is the way to make it
 register cleanly for all users.
+
+### Removed launch-at-login entirely (feature cut)
+Per user decision, "Start Blocks at login" was REMOVED from the app — less code to
+maintain; users who want it use macOS System Settings > General > Login Items. This
+supersedes BOTH the Task 6 tray toggle AND the two preceding Post-v1 entries (the
+feedback fix and its prior behavior). Deleted across the codebase:
+- `tray.zig`: dropped the "Start at Login" row + `loginToggleLabel` + `cmd_toggle_login`;
+  `buildMenu(buf)` now takes no login args and lays out Open / sep / Quit (`menu_len` 5 -> 3).
+- `main.zig`: removed the `toggle_login`/`login_status_done`/`login_set_done` Msgs + their
+  update arms, `applyLoginResult`, the boot `native-sdk.launch-at-login.status` hostRequest
+  in `initFx`, the host-service name consts, the effect keys 140/141, the Model fields
+  (`login_enabled`/`login_supported`/`login_pending`/`login_status_buf`+`len`) + accessors
+  (`loginToggleLabel`/`loginToggleDisabled`/`loginStatusText`/`hasLoginStatus`/`setLoginStatus`),
+  the Settings › About toggle row, the tray `onTrayCommand` mapping, and all `view_unbound`
+  entries. `statusItem` no longer reads the model (`_ = model;`).
+- `tests.zig`: removed the 7 launch-at-login update-arm tests + 2 `tray.zig` login tests;
+  kept the tray Open/Quit tests.
+- 195 tests (was 205); `native check` clean. Re-packaged.
+NOTE: this also moots the earlier "packaged-build login item (SMAppService)" follow-ups
+in the Task 6 / Task 9 / Task 13 / Packaging deferrals — there is no login item anymore.
