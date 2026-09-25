@@ -203,6 +203,17 @@ module with tests, then wire the effects in `main.zig`.
 - Keep new logic pure and tested; wire effects in `main.zig` with a fresh, documented
   effect-key block.
 
+## Roadmap
+
+- **v2 — truly cross-platform.** Native builds and installers for Windows and Linux (the
+  Native SDK targets both), so Blocks isn't macOS-only. This means per-platform packaging
+  of the app and its sidecars (the MCP server and the llama.cpp runtime) and platform
+  equivalents for the macOS-specific bits.
+- **Text-expander notes with real expansion.** Each material already carries a
+  "text expander" note; the plan is to wire that into [espanso](https://espanso.org) (and
+  similar tools) so a snippet's trigger actually expands system-wide, turning saved
+  materials into live text-expansion shortcuts.
+
 ## License
 
 To be determined before the public release.
