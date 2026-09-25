@@ -205,6 +205,19 @@ pub const max_chat_id_sql = "SELECT MAX(id) FROM chats;";
 pub const chats_list_sql =
     "SELECT " ++ chat_select_columns ++ " FROM chats ORDER BY updated_at DESC;";
 
+/// Delete one chat by id. `messages.chat_id` is `ON DELETE CASCADE`, so the
+/// chat's messages go with it; `snippets.origin_chat_id` is `ON DELETE SET
+/// NULL`, so any materials saved from the chat survive (their back-link is
+/// cleared). ?1 = chat id.
+pub const chat_delete_sql = "DELETE FROM chats WHERE id = ?1;";
+
+/// Fill a caller-owned 1-element buffer with the delete param and return the
+/// statement (caller-owned buffer must outlive the `dbExec` — lifetime trap).
+pub fn chatDeleteStatement(buf: *[1]db.Value, id: i64) db.Statement {
+    buf.* = .{db.val.int(id)};
+    return .{ .sql = chat_delete_sql, .params = buf };
+}
+
 /// A decoded `chats` row. Slices borrow the page bytes — copy what the model
 /// keeps (see `ChatEntry`).
 pub const Chat = struct {

@@ -90,6 +90,7 @@ const key_chat_rowid: u64 = 183; // SELECT last_insert_rowid() for the new chat
 const key_chat_write: u64 = 184; // INSERT the turn's messages + touch the chat
 const key_messages_list: u64 = 185; // load a chat's messages
 const key_chats_list: u64 = 187; // load the chat-history sidebar list
+const key_chat_delete: u64 = 188; // DELETE a chat (its messages cascade)
 // Single-click summaries (Task 11). Share the spawn/fetch/file key space.
 const key_mcp_activity: u64 = 186; // POST get_activity tools/call for a summary's context
 // Materials / snippets (Task 12). Share the spawn/fetch/file/db key space.
@@ -202,6 +203,10 @@ const welcome_blurb =
 
 /// Which settings section is open in the Settings modal (mockup 3).
 const SettingsSection = enum { all, about, repos, mcp, local_model };
+
+/// What the shared delete-confirmation dialog is deleting. The one dialog
+/// window serves both the Materials screen and the chat-history sidebar.
+const DeleteKind = enum { material, chat };
 /// Whole-exchange timeout for the streamed completion (a long reply on a
 /// small local model can still take a while); the stream lifetime counts.
 const chat_stream_timeout_ms: u32 = 120_000;
@@ -619,6 +624,11 @@ pub const Model = struct {
     confirm_delete_canvas_len: usize = 0,
     confirm_delete_prompt_buf: [snippets.max_title_bytes + 64]u8 = undefined,
     confirm_delete_prompt_len: usize = 0,
+    /// What the delete-confirmation dialog is about (the SAME dialog serves
+    /// both a material and a chat). `.chat` also carries the target id, since
+    /// a chat can be deleted from any row without selecting it first.
+    confirm_delete_kind: DeleteKind = .material,
+    confirm_delete_chat_id: i64 = 0,
     /// True once the snippets list has been loaded on boot (load exactly once).
     snippets_loaded: bool = false,
     /// True while a snippet write (insert/update/delete/setlang) is in flight,
@@ -914,6 +924,13 @@ pub const Model = struct {
     pub fn confirmDeletePrompt(self: *const Model) []const u8 {
         return self.confirm_delete_prompt_buf[0..self.confirm_delete_prompt_len];
     }
+    /// The dialog window's title/heading, matching what's being deleted.
+    pub fn confirmDeleteTitle(self: *const Model) []const u8 {
+        return switch (self.confirm_delete_kind) {
+            .material => "Delete material",
+            .chat => "Delete chat",
+        };
+    }
     pub fn settingsAbout(self: *const Model) bool {
         return self.settings_section == .about or self.settings_section == .all;
     }
@@ -1188,8 +1205,9 @@ pub const Model = struct {
         "confirm_delete_open",  "confirm_delete_open_count",
         "confirm_delete_canvas_buf", "confirm_delete_canvas_len",
         "confirm_delete_prompt_buf", "confirm_delete_prompt_len",
+        "confirm_delete_kind",      "confirm_delete_chat_id",
         "confirmDeleteCanvasLabel", "refreshConfirmDeleteCanvasLabel",
-        "confirmDeletePrompt",
+        "confirmDeletePrompt",      "confirmDeleteTitle",
         // Navigation + Materials / snippets (Task 12). The list/menu/editor
         // accessors are bound in markup; these are the update/effect-only
         // fields + the text-field buffers (driven via on-input, not bound).
@@ -1277,6 +1295,8 @@ pub const Msg = union(enum) {
     chats_listed: native_sdk.EffectDbResult, // the chat-history sidebar list reload
     select_chat: i64, // open a saved chat from the history sidebar
     new_chat, // "+ New chat" — reset to a fresh conversation
+    request_delete_chat: i64, // trash on a chat row — open the confirm dialog for it
+    chat_deleted: native_sdk.EffectDbResult, // a chat DELETE completed — reload the list
 
     // Single-click summaries (Task 11)
     start_summary: chat.SummaryKind, // a summary card was tapped
@@ -1354,7 +1374,7 @@ pub const Msg = union(enum) {
         // bound as markup handlers, so they are intentionally omitted).
         "mcp_search_done",     "chat_line",          "chat_done",
         "chat_inserted",       "chat_rowid_done",    "chat_write_done",
-        "messages_listed",     "chats_listed",
+        "messages_listed",     "chats_listed",       "chat_deleted",
         // Task 11 effect-delivered arm (start_summary IS bound as a markup
         // handler, so it is intentionally omitted).
         "mcp_activity_done",
@@ -1603,6 +1623,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .chats_listed => |res| chatsListed(model, res, fx.wallMs()),
         .select_chat => |id| selectChat(model, id, fx),
         .new_chat => newChat(model),
+        .request_delete_chat => |id| openDeleteChatConfirm(model, id),
+        .chat_deleted => |res| chatDeleted(model, res, fx),
 
         // ---- Single-click summaries (Task 11) ----
         .start_summary => |kind| startSummary(model, kind, fx),
@@ -1728,7 +1750,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .request_delete_snippet => openDeleteConfirm(model),
         .confirm_delete => {
             model.confirm_delete_open = false;
-            deleteSnippet(model, fx);
+            switch (model.confirm_delete_kind) {
+                .material => deleteSnippet(model, fx),
+                .chat => deleteChat(model, fx),
+            }
         },
         .cancel_delete => model.confirm_delete_open = false,
         .copy_snippet => copySnippet(model, fx),
@@ -2956,12 +2981,48 @@ fn snippetRowidDone(model: *Model, res: native_sdk.EffectDbResult, fx: *Effects)
 /// nothing is selected. A fresh canvas label per open (the reopen-blank fix).
 fn openDeleteConfirm(model: *Model) void {
     if (model.selected_snippet_id == 0) return;
+    model.confirm_delete_kind = .material;
     const title = model.selectedTitle();
     const prompt = std.fmt.bufPrint(
         &model.confirm_delete_prompt_buf,
         "Are you sure you want to delete the material '{s}'?",
         .{title},
     ) catch "Are you sure you want to delete this material?";
+    model.confirm_delete_prompt_len = prompt.len;
+    if (!model.confirm_delete_open) {
+        model.confirm_delete_open_count +%= 1;
+        model.refreshConfirmDeleteCanvasLabel();
+    }
+    model.confirm_delete_open = true;
+}
+
+/// Open the SAME delete-confirmation dialog for a chat row (its trash button),
+/// remembering the target id and building a prompt with the chat's title. A
+/// chat can be deleted from any row without opening it first.
+fn openDeleteChatConfirm(model: *Model, id: i64) void {
+    if (id == 0) return;
+    model.confirm_delete_kind = .chat;
+    model.confirm_delete_chat_id = id;
+    // Find the row's title for the prompt (fall back to a generic sentence).
+    var title: []const u8 = "";
+    for (model.chat_list[0..model.chat_count]) |*e| {
+        if (e.id == id) {
+            title = e.title();
+            break;
+        }
+    }
+    const prompt = if (title.len > 0)
+        std.fmt.bufPrint(
+            &model.confirm_delete_prompt_buf,
+            "Are you sure you want to delete the chat '{s}'? This can't be undone.",
+            .{title},
+        ) catch "Are you sure you want to delete this chat? This can't be undone."
+    else
+        std.fmt.bufPrint(
+            &model.confirm_delete_prompt_buf,
+            "Are you sure you want to delete this chat? This can't be undone.",
+            .{},
+        ) catch "Are you sure you want to delete this chat? This can't be undone.";
     model.confirm_delete_prompt_len = prompt.len;
     if (!model.confirm_delete_open) {
         model.confirm_delete_open_count +%= 1;
@@ -2984,6 +3045,37 @@ fn deleteSnippet(model: *Model, fx: *Effects) void {
         .statements = &.{snippets.deleteStatement(&params, id)},
         .on_result = Effects.dbMsg(.snippet_write_done),
     });
+}
+
+/// Delete the chat targeted by the confirmation dialog. Its messages cascade
+/// (FK ON DELETE CASCADE); materials saved from it survive (origin SET NULL).
+/// If it's the chat currently open, reset the transcript to a fresh chat.
+fn deleteChat(model: *Model, fx: *Effects) void {
+    const id = model.confirm_delete_chat_id;
+    model.confirm_delete_chat_id = 0;
+    if (id == 0) return;
+    // If we're deleting the open conversation, clear it (mirror `newChat`,
+    // but that self-gates on `sending`, so reset the fields directly here).
+    if (model.current_chat_id == id) {
+        model.current_chat_id = 0;
+        model.next_seq = 0;
+        model.message_count = 0;
+        model.chat_title_len = 0;
+        model.clearChatError();
+    }
+    var params: [1]db.Value = undefined;
+    fx.dbExec(.{
+        .key = key_chat_delete,
+        .statements = &.{chat.chatDeleteStatement(&params, id)},
+        .on_result = Effects.dbMsg(.chat_deleted),
+    });
+}
+
+/// A chat DELETE finished — reload the history sidebar so the row disappears.
+fn chatDeleted(model: *Model, res: native_sdk.EffectDbResult, fx: *Effects) void {
+    _ = model;
+    if (res.kind != .done and res.kind != .exec) return;
+    loadChats(fx);
 }
 
 /// Copy the selected snippet's content to the system clipboard.
@@ -3128,7 +3220,7 @@ fn blocksWindows(model: *const Model, scratch: *BlocksApp.WindowsScratch) []cons
         scratch.windows[count] = .{
             .label = confirm_delete_window_label,
             .canvas_label = model.confirmDeleteCanvasLabel(),
-            .title = "Delete material",
+            .title = model.confirmDeleteTitle(),
             .width = 460,
             .height = 200,
             .min_width = 360,
@@ -3234,12 +3326,12 @@ fn editorWindowView(ui: *BlocksApp.Ui, model: *const Model) BlocksApp.Ui.Node {
     });
 }
 
-/// Build the delete-confirmation dialog window's tree: the prompt sentence
-/// (with the material's title) + a red "Yes, delete it!" (confirm) and a
-/// Cancel button. Confirm deletes; Cancel (and the native close) dismiss.
+/// Build the delete-confirmation dialog window's tree: a title + prompt (built
+/// for the material or chat being deleted) + a red "Yes, delete it!" (confirm)
+/// and a Cancel button. Confirm deletes; Cancel (and the native close) dismiss.
 fn confirmDeleteWindowView(ui: *BlocksApp.Ui, model: *const Model) BlocksApp.Ui.Node {
     return ui.column(.{ .gap = 16, .padding = 20, .grow = 1 }, .{
-        ui.text(.{ .size = .heading }, "Delete material"),
+        ui.text(.{ .size = .heading }, model.confirmDeleteTitle()),
         ui.text(.{ .wrap = true, .grow = 1 }, model.confirmDeletePrompt()),
         ui.row(.{ .gap = 8, .cross = .center }, .{
             ui.button(.{ .variant = .destructive, .on_press = .confirm_delete }, "Yes, delete it!"),

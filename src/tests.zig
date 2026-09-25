@@ -995,3 +995,70 @@ test "update: snippet_clip_done shows no toast on success, an error on failure" 
 
 // (The set-language modal was removed — language is edited in the material
 // editor window — so its update-arm test is gone with it.)
+
+// ---- Chat deletion (trash on a chat row + shared confirm dialog) ----
+
+test "update: request_delete_chat opens the confirm dialog targeting that chat" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .request_delete_chat = 42 }, &fx);
+    try std.testing.expect(m.confirm_delete_open);
+    try std.testing.expect(m.confirm_delete_kind == .chat);
+    try std.testing.expectEqual(@as(i64, 42), m.confirm_delete_chat_id);
+    try std.testing.expectEqualStrings("Delete chat", m.confirmDeleteTitle());
+    try std.testing.expect(m.confirmDeletePrompt().len > 0);
+}
+
+test "update: confirming a chat delete closes the dialog and resets the open chat" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    // The chat being deleted is the one currently open.
+    m.current_chat_id = 42;
+    m.pushMessage(.user, "hi");
+    main.update(&m, .{ .request_delete_chat = 42 }, &fx);
+    main.update(&m, .confirm_delete, &fx);
+
+    try std.testing.expect(!m.confirm_delete_open);
+    // The open conversation was reset (it was the deleted one), and the target
+    // id was consumed.
+    try std.testing.expectEqual(@as(i64, 0), m.current_chat_id);
+    try std.testing.expectEqual(@as(usize, 0), m.message_count);
+    try std.testing.expectEqual(@as(i64, 0), m.confirm_delete_chat_id);
+
+    // The DELETE completing reloads the list without error.
+    main.update(&m, .{ .chat_deleted = .{ .key = 188, .kind = .exec, .outcome = .ok } }, &fx);
+}
+
+test "update: deleting a NON-open chat leaves the current conversation intact" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    m.current_chat_id = 5; // a different chat is open
+    m.pushMessage(.user, "keep me");
+    main.update(&m, .{ .request_delete_chat = 99 }, &fx); // delete a different row
+    main.update(&m, .confirm_delete, &fx);
+
+    try std.testing.expectEqual(@as(i64, 5), m.current_chat_id); // unchanged
+    try std.testing.expectEqual(@as(usize, 1), m.message_count); // transcript kept
+}
+
+test "update: cancelling the chat delete dialog deletes nothing" {
+    var m = main.initialModel();
+    var fx = main.Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    main.update(&m, .{ .request_delete_chat = 7 }, &fx);
+    main.update(&m, .cancel_delete, &fx);
+    try std.testing.expect(!m.confirm_delete_open);
+    // The target id is still set (cancel doesn't clear it), but no delete ran.
+    try std.testing.expectEqual(@as(i64, 7), m.confirm_delete_chat_id);
+}

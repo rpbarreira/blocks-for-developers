@@ -1799,3 +1799,33 @@ feedback fix and its prior behavior). Deleted across the codebase:
 - 195 tests (was 205); `native check` clean. Re-packaged.
 NOTE: this also moots the earlier "packaged-build login item (SMAppService)" follow-ups
 in the Task 6 / Task 9 / Task 13 / Packaging deferrals — there is no login item anymore.
+
+### Delete a chat from the history sidebar (trash button + confirmation)
+Each chat row in the sidebar now has a trash icon button that opens a confirmation
+dialog (mirroring the Materials delete). Confirming deletes the chat.
+- **`chat.zig`**: added `chat_delete_sql` (`DELETE FROM chats WHERE id = ?1`) +
+  `chatDeleteStatement`. `messages.chat_id` is `ON DELETE CASCADE` (messages go with the
+  chat) and `snippets.origin_chat_id` is `ON DELETE SET NULL` (materials saved from the
+  chat survive, back-link cleared) — verified live.
+- **`main.zig`**: the SHARED delete-confirmation window now serves both materials and
+  chats via a new `DeleteKind{material,chat}` (`confirm_delete_kind`) + a
+  `confirm_delete_chat_id`. `confirmDeleteTitle()` returns "Delete material"/"Delete chat"
+  (window title + heading). New Msgs `request_delete_chat: i64` (markup-bound, from the
+  trash button) and `chat_deleted` (effect result). `openDeleteChatConfirm` builds the
+  prompt from the row's title; `confirm_delete` branches on the kind; `deleteChat` fires
+  the DELETE (key 188) and, if the deleted chat is the OPEN one, resets the transcript;
+  `chatDeleted` reloads the sidebar. `openDeleteConfirm` now sets `confirm_delete_kind =
+  .material`.
+- **`app.native`**: a `<button size="icon" variant="ghost" icon="trash" ...
+  on-press="request_delete_chat:{c.id}">` inside the chat card row. Its own press takes
+  precedence over the card's `select_chat`, so clicking trash opens the dialog WITHOUT
+  navigating to the chat (verified live).
+- 199 tests (was 195): request opens dialog with the right kind/target/prompt/title;
+  confirm closes + resets the open chat + consumes the id; deleting a non-open chat leaves
+  the current conversation intact; cancel deletes nothing. `native check` clean.
+- VERIFIED END-TO-END via automation against the real app.db: seeded two throwaway chats,
+  clicked a row's trash -> the "Delete chat" dialog opened as a second OS window with the
+  chat's title in the prompt (and did NOT select the chat); "Yes, delete it!" removed the
+  row + the DB chat + its message (cascade) while the others survived; reopening the dialog
+  worked (fresh `confirm-delete-canvas-<n>` label); Cancel dismissed without deleting. Test
+  chats cleared from app.db afterward.

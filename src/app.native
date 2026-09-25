@@ -127,6 +127,10 @@
                               <text size="sm" foreground="text_muted" wrap="true">{c.preview}</text>
                             </if>
                           </column>
+                          <!-- Delete this chat (opens the confirmation dialog).
+                               Its own on-press takes precedence over the card's
+                               select handler. -->
+                          <button size="icon" variant="ghost" icon="trash" label="Delete chat" on-press="request_delete_chat:{c.id}" />
                         </row>
                       </card>
                     </column>
