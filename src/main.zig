@@ -2642,18 +2642,23 @@ fn chatsListed(model: *Model, res: native_sdk.EffectDbResult, now_ms: i64) void 
         .page => {
             var reader = db.PageReader.init(res.bytes) catch return;
             model.chat_count = 0;
-            var last_group: ?chat.DateGroup = null;
+            var last_key: ?[]const u8 = null;
             var row: [6]db.ColumnValue = undefined;
             while (reader.next(&row) catch null) |cols| {
                 if (model.chat_count >= chat.max_chats) break;
                 const c = chat.Chat.fromRow(cols) orelse continue;
                 var entry = chat.ChatEntry.fromChat(c, now_ms);
-                // The list is ordered newest-first, so a bucket change marks
-                // the head row — the only row that prints the group header.
-                entry.group_head = (last_group == null or last_group.? != entry.group);
+                // The list is ordered newest-first, so a header-key change marks
+                // the head row — the only row that prints the group header. The
+                // "earlier" bucket keys on the `dd-MM-yyyy` creation date, so
+                // each distinct earlier day gets its own date header.
+                const key = entry.headerKey();
+                entry.group_head = (last_key == null or !std.mem.eql(u8, last_key.?, key));
                 entry.active = (entry.id == model.current_chat_id and entry.id != 0);
-                last_group = entry.group;
+                // `key` borrows `entry.date_buf`; store the entry FIRST, then
+                // point `last_key` at the stored copy so it stays valid.
                 model.chat_list[model.chat_count] = entry;
+                last_key = model.chat_list[model.chat_count].headerKey();
                 model.chat_count += 1;
             }
         },

@@ -1718,3 +1718,26 @@ by `blocksWindows` (`windows_fn`) and routed by window label inside `blocksWindo
 reopen-blank-canvas reconcile bug (the same fix Settings uses — see the Task 13 Settings
 window section). `app.native` now only `<if>`-gates the onboarding overlay + the Materials
 sort/language-filter dropdown menus.
+
+### Chat history "EARLIER" header → the chat's creation date (`dd-MM-yyyy`)
+The chat-history sidebar groups rows by a coarse `DateGroup` (TODAY / YESTERDAY /
+EARLIER) and prints a header on the first row of each bucket. Per user request, the
+EARLIER bucket now shows the chat's LAST-ACTIVITY date (`updated_at`) formatted
+`dd-MM-yyyy` instead of the word "EARLIER" (TODAY / YESTERDAY keep their words). Using
+`updated_at` keeps the header consistent with the list's `updated_at DESC` ordering.
+Changes, all in `src/chat.zig` (PURE) except the load loop:
+- `dateGroup` classifies by `updated_at`; `ChatEntry.fromChat` fills a `date_buf[dmy_len]`
+  via the new `formatDmy(buf, ts_ms)`
+  (`dd-MM-yyyy`, UTC civil day) built on a new `civilFromDays` (inverse of `git.zig`'s
+  `daysFromCivil`). The year is cast to unsigned so `{d}` emits no leading `+` (which also
+  kept the exact-width 10-byte buffer from overflowing).
+- `ChatEntry.groupLabel()` returns the `dd-MM-yyyy` date for the `.earlier` bucket, else
+  the bucket word. New `ChatEntry.headerKey()` returns the would-be header key regardless
+  of `group_head`.
+- `main.zig` `chatsListed` now marks a new header whenever `headerKey()` CHANGES (was: on
+  a `DateGroup` change), so two "earlier" chats created on different days each get their
+  own date header. `last_key` is pointed at the STORED entry's buffer (not the local), a
+  borrow-lifetime detail.
+- The `app.native` binding is unchanged (`<status-bar>{c.groupLabel}</status-bar>` under
+  `<if test="{c.groupHead}">`). 202 tests (was 200): added `formatDmy` +
+  earlier-bucket `groupLabel` tests. `native check` clean.

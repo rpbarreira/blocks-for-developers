@@ -264,6 +264,40 @@ pub fn dateGroup(ts_ms: i64, now_ms: i64) DateGroup {
     return .earlier;
 }
 
+/// A civil Y-M-D triple decoded from a day count.
+const CivilDate = struct { year: i64, month: u32, day: u32 };
+
+/// Inverse of Howard Hinnant's `daysFromCivil`: convert days-since-epoch
+/// (1970-01-01) back to a civil Y-M-D. Public-domain algorithm.
+fn civilFromDays(z_in: i64) CivilDate {
+    const z = z_in + 719468;
+    const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const doe = z - era * 146097; // [0, 146096]
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365); // [0, 399]
+    const y = yoe + era * 400;
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100)); // [0, 365]
+    const mp = @divFloor(5 * doy + 2, 153); // [0, 11]
+    const d: u32 = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1); // [1, 31]
+    const m: u32 = @intCast(if (mp < 10) mp + 3 else mp - 9); // [1, 12]
+    return .{ .year = if (m <= 2) y + 1 else y, .month = m, .day = d };
+}
+
+/// The number of bytes a `dd-MM-yyyy` date string occupies.
+pub const dmy_len = 10;
+
+/// Format a Unix-ms timestamp as `dd-MM-yyyy` (UTC civil day) into `buf`,
+/// returning the written slice. `buf` must hold at least `dmy_len` bytes.
+pub fn formatDmy(buf: []u8, ts_ms: i64) []const u8 {
+    const day_ms: i64 = 24 * 60 * 60 * 1000;
+    const days = @divFloor(ts_ms, day_ms);
+    const c = civilFromDays(days);
+    // Cast the year to unsigned so `{d}` doesn't emit a leading '+' sign
+    // (which would also overflow the exact-width `dmy_len` buffer). Years are
+    // always positive for any real chat timestamp.
+    const year: u32 = if (c.year < 0) 0 else @intCast(c.year);
+    return std.fmt.bufPrint(buf, "{d:0>2}-{d:0>2}-{d:0>4}", .{ c.day, c.month, year }) catch buf[0..0];
+}
+
 /// A model-owned copy of a chat-history row with inline storage, so the
 /// loaded sidebar list survives across updates without an allocator.
 pub const ChatEntry = struct {
@@ -279,6 +313,12 @@ pub const ChatEntry = struct {
     /// the group header only for these (the list is newest-first).
     group_head: bool = false,
     updated_at: i64 = 0,
+    /// The chat's creation time (Unix-ms), used for the date-group header.
+    created_at: i64 = 0,
+    /// The `dd-MM-yyyy` creation date, shown as the header for the "earlier"
+    /// bucket (in place of the "EARLIER" label). Filled in `fromChat`.
+    date_buf: [dmy_len]u8 = undefined,
+    date_len: usize = 0,
     title_buf: [chat_title_bytes]u8 = undefined,
     title_len: usize = 0,
     preview_buf: [chat_preview_bytes]u8 = undefined,
@@ -291,13 +331,24 @@ pub const ChatEntry = struct {
         return self.preview_buf[0..self.preview_len];
     }
     /// The date-group header label to show above this row (empty unless this
-    /// row is the head of its bucket).
+    /// row is the head of its bucket). TODAY / YESTERDAY keep their words; the
+    /// "earlier" bucket shows the chat's creation date as `dd-MM-yyyy`.
     pub fn groupLabel(self: *const ChatEntry) []const u8 {
-        return if (self.group_head) self.group.label() else "";
+        if (!self.group_head) return "";
+        if (self.group == .earlier) return self.date_buf[0..self.date_len];
+        return self.group.label();
     }
     /// Whether this row is the head of its date bucket (prints a header).
     pub fn groupHead(self: *const ChatEntry) bool {
         return self.group_head;
+    }
+    /// The header key this row would print regardless of `group_head`: the
+    /// bucket label for today/yesterday, or the `dd-MM-yyyy` date for the
+    /// "earlier" bucket. Used to decide where a new header starts (so two
+    /// "earlier" chats from different days each get their own date header).
+    pub fn headerKey(self: *const ChatEntry) []const u8 {
+        if (self.group == .earlier) return self.date_buf[0..self.date_len];
+        return self.group.label();
     }
     /// Whether this row has a non-empty preview line.
     pub fn hasPreview(self: *const ChatEntry) bool {
@@ -308,8 +359,13 @@ pub const ChatEntry = struct {
         var e = ChatEntry{
             .id = c.id,
             .updated_at = c.updated_at,
+            .created_at = c.created_at,
+            // The date header reflects the chat's LAST-ACTIVITY time, matching
+            // the list's `updated_at DESC` ordering.
             .group = dateGroup(c.updated_at, now_ms),
         };
+        const dmy = formatDmy(&e.date_buf, c.updated_at);
+        e.date_len = dmy.len;
         e.kind_is_summary = !std.mem.eql(u8, c.kind, "chat");
         const t = if (c.title.len > 0) c.title else "Untitled chat";
         e.title_len = @min(t.len, chat_title_bytes);
@@ -1032,6 +1088,41 @@ test "dateGroup buckets by local-day delta from now" {
     try testing.expectEqual(DateGroup.yesterday, dateGroup(99 * day + 10, now));
     try testing.expectEqual(DateGroup.earlier, dateGroup(98 * day + 10, now));
     try testing.expectEqual(DateGroup.earlier, dateGroup(0, now));
+}
+
+test "formatDmy renders a timestamp as dd-MM-yyyy (UTC civil day)" {
+    var buf: [dmy_len]u8 = undefined;
+    // 1970-01-01 (epoch).
+    try testing.expectEqualStrings("01-01-1970", formatDmy(&buf, 0));
+    // 2026-01-01T00:00:00Z = 1767225600 s.
+    try testing.expectEqualStrings("01-01-2026", formatDmy(&buf, 1767225600 * 1000));
+    // A day+time within 2026-09-24.
+    try testing.expectEqualStrings("24-09-2026", formatDmy(&buf, 1790208000 * 1000));
+}
+
+test "ChatEntry.groupLabel shows the creation date for the earlier bucket" {
+    const day: i64 = 24 * 60 * 60 * 1000;
+    const now: i64 = 20500 * day; // some day well past epoch
+    // A chat last active several days ago falls in the "earlier" bucket and
+    // its header is the dd-MM-yyyy last-activity date, not the word "EARLIER".
+    const c = Chat{
+        .id = 1,
+        .title = "old chat",
+        .preview = "",
+        .kind = "chat",
+        .created_at = 19000 * day, // older still — NOT what the header uses
+        .updated_at = 20000 * day, // 20000 days after epoch = 2024-10-04
+    };
+    var e = ChatEntry.fromChat(c, now);
+    try testing.expectEqual(DateGroup.earlier, e.group);
+    e.group_head = true;
+    var buf: [dmy_len]u8 = undefined;
+    try testing.expectEqualStrings(formatDmy(&buf, 20000 * day), e.groupLabel());
+    // TODAY / YESTERDAY keep their words.
+    const t = Chat{ .id = 2, .title = "t", .preview = "", .kind = "chat", .created_at = now, .updated_at = now };
+    var te = ChatEntry.fromChat(t, now);
+    te.group_head = true;
+    try testing.expectEqualStrings("TODAY", te.groupLabel());
 }
 
 test "ChatEntry.fromChat copies title/preview, flags summaries, computes group" {
