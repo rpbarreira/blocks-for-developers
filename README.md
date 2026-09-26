@@ -13,6 +13,31 @@ the LLM all run locally.
 > want to fork and extend it. The detailed engineering log lives in
 > [`docs/PROGRESS.md`](docs/PROGRESS.md) — read it first when picking up the code.
 
+## Install
+
+Requires **macOS on Apple Silicon**.
+
+1. Download `Blocks.for.Developers.zip` from the
+   [latest release](../../releases/latest) and unzip it.
+2. Drag `Blocks for Developers.app` into `/Applications`.
+3. Remove the download quarantine flag so macOS will run it:
+   ```sh
+   xattr -dr com.apple.quarantine "/Applications/Blocks for Developers.app"
+   ```
+4. Open it (double-click, or right-click → **Open**).
+
+**Why step 3?** macOS tags downloaded files with a `com.apple.quarantine` flag, and
+Gatekeeper blocks apps that aren't notarized by Apple. This build is ad-hoc signed but
+not notarized (notarization needs a paid Apple Developer account), so removing the flag
+tells macOS you trust the app and lets it launch — the same trust decision as
+right-click → **Open** → **Open**, done in one reliable step.
+
+On first launch the app onboards you, creates its data folder at
+`~/Library/Application Support/dev.blocks.app/`, and lets you pick and download a local
+model. The MCP server and llama.cpp runtime are bundled — no Homebrew needed.
+
+To build from source instead, see [Getting started](#getting-started).
+
 ## Features
 
 - **Memory capture** — git commits (indexed incrementally) plus working-tree
