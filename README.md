@@ -216,4 +216,4 @@ module with tests, then wire the effects in `main.zig`.
 
 ## License
 
-To be determined before the public release.
+See [LICENSE](LICENSE) for details.
