@@ -102,8 +102,6 @@ All data lives in one folder: `~/Library/Application Support/dev.blocks.app/`
   index never needs re-embedding. A neural embedder can be added later under a new model
   id (the schema allows both to coexist).
 
-macOS-only, Apple Silicon focus.
-
 ## Getting started
 
 ### Prerequisites
