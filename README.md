@@ -13,6 +13,8 @@ the LLM all run locally.
 > want to fork and extend it. The detailed engineering log lives in
 > [`docs/PROGRESS.md`](docs/PROGRESS.md) — read it first when picking up the code.
 
+![Screenshot](screenshot.png)
+
 ## Install
 
 Requires **macOS on Apple Silicon**.
