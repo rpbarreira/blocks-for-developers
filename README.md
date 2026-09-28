@@ -10,7 +10,7 @@ the LLM all run locally.
 
 > Status: all v1 functionality is implemented and the app is packaged into a
 > self-contained macOS `.app`. This repo is meant to be a solid starting point if you
-> want to fork and extend it. The detailed engineering log lives in
+> want to use it as a template for your own Blocks. The detailed engineering log lives in
 > [`docs/PROGRESS.md`](docs/PROGRESS.md) — read it first when picking up the code.
 
 ![Screenshot](screenshot.png)
